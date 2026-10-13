@@ -5,23 +5,30 @@
 // 节点参数
 //
 // 2026-10-01 按实测场地更新：网格不再均匀，坐标单位为 m。
-// 注意两条斜边：N2-N3（dx=1.05, dy=-0.20）、N3-N6（dx=-0.125, dy=1.05），
-// 其余边仍为纯正交方向。
-// MapGraph_Build() 中的边代价 = 按坐标计算的欧氏距离（mm）。
+// N3/N9 是右侧车道的拐角，不是蓝色启停区的中心。
+// 启停区坐标仅在任务出发和最终返回时使用，不参与路网寻路。
 //====================================================
 MapNode_t g_nodes[NODE_NUM + 1] =
 {
     {0},
-    {0.35f,  0.35f, 0},  /* N1 */
-    {1.20f,  0.35f, 0},  /* N2 */
-    {2.25f,  0.15f, 0},  /* N3 */
-    {0.35f,  1.20f, 0},  /* N4 */
-    {1.20f,  1.20f, 0},  /* N5 */
-    {2.10f, 1.20f, 0},  /* N6 */
-    {0.35f,  2.25f, 0},  /* N7 */
-    {1.20f,  2.00f, 0},  /* N8 */
-    {2.25f,  2.25f, 0}   /* N9 */
+    {0.35f, 0.35f, MAP_TASK_NONE,    0U,   0.0f},  /* N1 */
+    {1.20f, 0.35f, MAP_TASK_ROUGH,   1U,  90.0f},  /* N2 粗加工：车头向右 */
+    {2.10f, 0.35f, MAP_TASK_NONE,    0U,   0.0f},  /* N3 右下车道交点 */
+    {0.35f, 1.20f, MAP_TASK_STORAGE, 1U, 180.0f},  /* N4 暂存区：车头向下，右侧机械臂朝左 */
+    {1.20f, 1.20f, MAP_TASK_NONE,    0U,   0.0f},  /* N5 */
+    {2.10f, 1.20f, MAP_TASK_QR,      1U,   0.0f},  /* N6 扫码区：暂定车头向上 */
+    {0.35f, 2.25f, MAP_TASK_NONE,    0U,   0.0f},  /* N7 */
+    {1.20f, 2.00f, MAP_TASK_RAW,     1U, -90.0f},  /* N8 原料区：车头向左，右侧机械臂朝上 */
+    {2.10f, 2.00f, MAP_TASK_NONE,    0U,   0.0f}   /* N9 右上车道交点 */
 };
+
+uint8_t MapGraph_GetParkingPose(uint8_t corner_node, float *x, float *y)
+{
+    if (!x || !y) return 0U;
+    if (corner_node == 3U) { *x = 2.25f; *y = 0.15f; return 1U; }
+    if (corner_node == 9U) { *x = 2.25f; *y = 2.25f; return 1U; }
+    return 0U;
+}
 
 
 //====================================================
@@ -121,31 +128,31 @@ void MapGraph_Build(uint32_t obstacle_mask)
     //------------------------------------------------
     // 2. 先建立完整拓扑
     //
-    // 边代价 = 按实测节点坐标计算的欧氏距离（mm）：
-    //   1-2 850    2-3 1069(斜)    4-5 850    5-6 925
-    //   7-8 850    8-9 1050        1-4 850    4-7 1050
-    //   2-5 850    5-8 1050        3-6 1057(斜)  6-9 1050
+    // 边代价 = 对应两个车道交点之间的距离（mm）：
+    //   1-2 850    2-3 900     4-5 850    5-6 900
+    //   7-8 886    8-9 900     1-4 850    4-7 1050
+    //   2-5 850    5-8 800     3-6 850    6-9 800
     //------------------------------------------------
 
     // 水平边
     MapGraph_AddEdge(1, 2, 850);
-    MapGraph_AddEdge(2, 3, 1069);
+    MapGraph_AddEdge(2, 3, 900);
 
     MapGraph_AddEdge(4, 5, 850);
-    MapGraph_AddEdge(5, 6, 925);
+    MapGraph_AddEdge(5, 6, 900);
 
-    MapGraph_AddEdge(7, 8, 850);
-    MapGraph_AddEdge(8, 9, 1050);
+    MapGraph_AddEdge(7, 8, 886);
+    MapGraph_AddEdge(8, 9, 900);
 
     // 垂直边
     MapGraph_AddEdge(1, 4, 850);
     MapGraph_AddEdge(4, 7, 1050);
 
     MapGraph_AddEdge(2, 5, 850);
-    MapGraph_AddEdge(5, 8, 1050);
+    MapGraph_AddEdge(5, 8, 800);
 
-    MapGraph_AddEdge(3, 6, 1057);
-    MapGraph_AddEdge(6, 9, 1050);
+    MapGraph_AddEdge(3, 6, 850);
+    MapGraph_AddEdge(6, 9, 800);
 
 
     //------------------------------------------------

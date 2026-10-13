@@ -11,10 +11,12 @@
 #include "navigation.h"
 #include "map_graph.h"
 #include "robot_config.h"
+#include "robot_app.h"
+#include "k230.h"
 
 #define RX_LEN 7U
-#define MANIP_TEST_RPM 30U
-#define MANIP_TEST_ACC 20U
+#define MANIP_TEST_RPM 3000U
+#define MANIP_TEST_ACC 200U
 
 typedef union {
     struct {
@@ -31,6 +33,7 @@ static volatile uint8_t cmd_v, p1_v, p2_v, p3_v, p4_v;
 static uint8_t last_cmd, last_result;
 static uint32_t last_tx_ms;
 static VofaPacket txp;
+static uint8_t k230_telemetry_enable;
 
 /* Independent chassis object used only by this bench/debug build.
  * It validates the same chassis_motion -> chassis -> mecanum stack
@@ -65,6 +68,18 @@ static uint8_t debug_yaw_velocity_active;
 static uint8_t valid_id(uint8_t id)
 {
     return (id >= 1U && id <= 6U) ? 1U : 0U;
+}
+
+static uint8_t k230_direction_code(char direction)
+{
+    switch (direction)
+    {
+        case 'a': return 1U;
+        case 'd': return 2U;
+        case 'w': return 3U;
+        case 's': return 4U;
+        default:  return 0U;
+    }
 }
 
 static void stop_all(void)
@@ -480,6 +495,7 @@ void VofaDebug_Init(void)
     last_cmd = 0U;
     last_result = 0U;
     last_tx_ms = 0U;
+    k230_telemetry_enable = 0U;
     formal_motion_active = 0U;
     debug_nav_initialized = 0U;
     debug_edge_active = 0U;
@@ -529,6 +545,19 @@ void VofaDebug_FeedByte(uint8_t b)
     }
 }
 
+/*
+ * 10.7.2 RobotApp + VOFA coexistence diagnostics.
+ * Only commands that can change actuators require manual takeover.
+ * 0x02 only changes the IMU software zero and is left available.
+ */
+static uint8_t vofa_cmd_needs_manual_override(uint8_t cmd)
+{
+    if (cmd == 0x01U) return 1U;
+    if (cmd >= 0x10U && cmd <= 0x23U) return 1U;
+    if (cmd >= 0x30U && cmd <= 0x60U) return 1U;
+    return 0U;
+}
+
 static void process_cmd(void)
 {
     uint8_t c, p1, p2, p3, p4;
@@ -545,6 +574,34 @@ static void process_cmd(void)
 
     last_cmd = c;
     last_result = 1U;
+
+    /*
+     * 0x70 is the only control-owner switch in this diagnostic build.
+     * RobotApp stops first and then remains suspended until MCU reset.
+     */
+    if (c == 0x70U)
+    {
+        RobotApp_EnterVofaOverride();
+        last_result = 1U;
+        return;
+    }
+
+    /* Reject actuator commands until the user explicitly takes control. */
+    if (vofa_cmd_needs_manual_override(c))
+    {
+        if (!RobotApp_IsVofaOverride())
+        {
+            last_result = 14U;
+            return;
+        }
+
+        /* RobotApp is still flushing its four-wheel STOP sequence. */
+        if (!RobotApp_IsVofaOverrideReady())
+        {
+            last_result = 15U;
+            return;
+        }
+    }
 
     switch (c) {
     case 0x01U:
@@ -594,33 +651,57 @@ static void process_cmd(void)
         break;
 
     case 0x20U:
-        if (p1 == 0U) GripperServo_Open();
+        if (p1 == 0U) GripperServo_Open_Small();
         else if (p1 == 1U) GripperServo_Mid();
         else if (p1 == 2U) GripperServo_Close();
         else last_result = 2U;
         break;
 
     case 0x21U:
-        if (p1 > 2U) { last_result = 2U; break; }
-        CarouselServo_GotoSlot(p1);
-        break;
+    if (p1 == 0U)
+    {
+        CarouselServo_ToPickup();
+    }
+    else if (p1 == 1U)
+    {
+        CarouselServo_ToPlace();
+    }
+    else if (p1 == 2U)
+    {
+        CarouselServo_ToMid();
+    }
+    else
+    {
+        last_result = 2U;
+    }
+    break;
 
     case 0x22U:
     us = (uint16_t)(((uint16_t)p2 << 8) | p3);
 
     if (p1 == 0U) {
-        GripperServo_SetUs(us);
+        Pwm1Servo_SetUs(us);
     } else if (p1 == 1U) {
         CarouselServo_SetUs(us);
     } else if (p1 == 2U) {
         TraySelectorServo_SetUs(us);
     } else if (p1 == 3U) {
-        Pwm4Servo_SetUs(us);
+        GripperServo_SetUs(us);
     } else {
         last_result = 2U;
     }
     break;
 
+		case 0x23U:
+    if (p1 >= TRAY_SELECTOR_SLOT_COUNT)
+    {
+        last_result = 2U;
+        break;
+    }
+
+    TraySelectorServo_GotoSlot(p1);
+    break;
+		
     case 0x30U: /* chassis enable/disable */
         if (p1 > 1U) { last_result = 2U; break; }
         chassis_enable(p1);
@@ -829,6 +910,49 @@ static void process_cmd(void)
     case 0x60U: /* motor 1 one-revolution CAN smoke test (direct emm layer) */
         last_result = Motor1_RevTest() ? 1U : 13U;
         break;
+		
+		//k230测试
+		case 0x71U: /* Start K230 color detection. */
+    if ((p1 < 1U) || (p1 > 6U))
+    {
+        last_result = 2U;
+        break;
+    }
+
+    if (K230_StartDetect(p1) != HAL_OK)
+    {
+        last_result = 16U;
+    }
+    break;
+
+		case 0x72U: /* Start K230 placement alignment. */
+				if ((p1 < 1U) || (p1 > 3U))
+				{
+						last_result = 2U;
+						break;
+				}
+		
+				if (K230_StartPlace(p1) != HAL_OK)
+				{
+						last_result = 16U;
+				}
+				break;
+		
+		case 0x73U: /* Stop current K230 task. */
+				if (K230_Stop() != HAL_OK)
+				{
+						last_result = 16U;
+				}
+				break;
+
+        case 0x74U: /* Select telemetry: P1=1 K230, P1=0 normal. */
+            if (p1 > 1U)
+            {
+                last_result = 2U;
+                break;
+            }
+            k230_telemetry_enable = p1;
+            break;
 
     default:
         last_result = 3U;
@@ -845,14 +969,28 @@ static void send_telemetry(uint32_t now_ms)
 
     imu = AppUart_GetImu();
 
-    txp.p.ch[0] = imu->roll_deg;
-    txp.p.ch[1] = imu->pitch_deg;
-    txp.p.ch[2] = hwt101_yaw_relative_deg(imu);
-    txp.p.ch[3] = hwt101_is_fresh(imu, now_ms, 500U) ? 1.0f : 0.0f;
-    txp.p.ch[4] = (float)can_error_step;
-    txp.p.ch[5] = (float)can_error_count;
-    txp.p.ch[6] = (float)can_busoff_cnt;
-    txp.p.ch[7] = can_rx_flag ? 1.0f : 0.0f;
+    if (k230_telemetry_enable)
+    {
+        txp.p.ch[0] = (float)g_k230_status.color_id;
+        txp.p.ch[1] = (float)k230_direction_code(g_k230_status.direction);
+        txp.p.ch[2] = (float)g_k230_status.offset_px;
+        txp.p.ch[3] = K230_IsOnline(now_ms) ? 1.0f : 0.0f;
+        txp.p.ch[4] = (float)g_k230_status.last_event;
+        txp.p.ch[5] = (float)k230_rx_byte_count;
+        txp.p.ch[6] = (float)k230_valid_line_count;
+        txp.p.ch[7] = (float)k230_invalid_line_count;
+    }
+    else
+    {
+        txp.p.ch[0] = imu->roll_deg;
+        txp.p.ch[1] = imu->pitch_deg;
+        txp.p.ch[2] = hwt101_yaw_relative_deg(imu);
+        txp.p.ch[3] = hwt101_is_fresh(imu, now_ms, 500U) ? 1.0f : 0.0f;
+        txp.p.ch[4] = (float)can_error_step;
+        txp.p.ch[5] = (float)can_error_count;
+        txp.p.ch[6] = (float)can_busoff_cnt;
+        txp.p.ch[7] = can_rx_flag ? 1.0f : 0.0f;
+    }
     txp.p.ch[8] = (float)last_cmd;
     txp.p.ch[9] = (float)last_result;
 

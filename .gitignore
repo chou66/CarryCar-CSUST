@@ -29,3 +29,6 @@ MDK-ARM/build_*.log
 
 # PC test binaries
 *.exe
+
+# 本机构建日志(2026-10-13 排除)
+*.log

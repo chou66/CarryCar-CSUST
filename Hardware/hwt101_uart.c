@@ -50,6 +50,32 @@ float hwt101_yaw_relative_deg(const Hwt101 *imu)
     return wrap_deg(imu->yaw_deg - imu->yaw_zero_deg);
 }
 
+void hwt101_set_world_zero(Hwt101 *imu)
+{
+    if (!imu || !imu->has_angle) return;
+    imu->world_zero_raw_deg = imu->yaw_deg;
+    imu->world_zero_ready = true;
+}
+
+void hwt101_clear_world_zero(Hwt101 *imu)
+{
+    if (!imu) return;
+    imu->world_zero_raw_deg = 0.0f;
+    imu->world_zero_ready = false;
+}
+
+float hwt101_world_yaw_deg(const Hwt101 *imu)
+{
+    if (!imu || !imu->world_zero_ready) return 0.0f;
+    return wrap_deg(HWT101_WORLD_YAW_SIGN *
+                    (imu->yaw_deg - imu->world_zero_raw_deg));
+}
+
+bool hwt101_world_zero_ready(const Hwt101 *imu)
+{
+    return (imu && imu->world_zero_ready) ? true : false;
+}
+
 bool hwt101_is_fresh(const Hwt101 *imu, uint32_t now_ms, uint32_t timeout_ms)
 {
     return imu->has_angle && (uint32_t)(now_ms - imu->last_update_ms) <= timeout_ms;

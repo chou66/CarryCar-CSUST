@@ -186,10 +186,11 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
                 s_motor_status[id].tick_ms = HAL_GetTick();
                 s_motor_status[id].valid = 1U;
             }
+
         }
     }
 }
-
+  
 uint8_t Emm_V5_Read_Status(uint8_t id, uint8_t *status, uint32_t timeout_ms)
 {
     uint32_t start;

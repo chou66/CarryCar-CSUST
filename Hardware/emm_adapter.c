@@ -57,7 +57,7 @@ bool emm_all_position_reached_after(uint8_t mask, uint32_t start_ms)
 {
     uint8_t id;
 
-    for (id = 1U; id <= 4U; ++id)
+    for (id = 1U; id <= CAN_MOTOR_MAX_ID; ++id)
     {
         uint8_t bit = (uint8_t)(1U << (id - 1U));
         uint8_t status;
@@ -88,7 +88,7 @@ bool emm_any_position_fault_after(uint8_t mask, uint32_t start_ms)
      *   bit2 0x04 = Cgi_TF, stall detected
      *   bit3 0x08 = Cgp_TF, stall protection triggered
      */
-    for (id = 1U; id <= 4U; ++id)
+    for (id = 1U; id <= CAN_MOTOR_MAX_ID; ++id)
     {
         uint8_t bit = (uint8_t)(1U << (id - 1U));
         uint8_t status;
@@ -109,3 +109,85 @@ bool emm_any_position_fault_after(uint8_t mask, uint32_t start_ms)
 
     return false;
 }
+
+bool emm_any_stall_protect_after(uint8_t mask, uint32_t start_ms)
+{
+    uint8_t id;
+
+    /*
+     * 与底盘 emm_any_position_fault_after 的差别仅在判据：
+     * 只认 0x08(Cgp_TF 堵转保护锁存)。0x04(Cgi_TF 堵转检测)是夹爪
+     * 落座压料瞬间的正常警告，不得抢占到位确认。
+     */
+    for (id = 1U; id <= CAN_MOTOR_MAX_ID; ++id)
+    {
+        uint8_t bit = (uint8_t)(1U << (id - 1U));
+        uint8_t status;
+        uint32_t tick;
+
+        if ((mask & bit) == 0U)
+            continue;
+
+        if (!can_motor_status_get(id, &status, &tick))
+            continue;
+
+        if ((int32_t)(tick - start_ms) < 0)
+            continue;
+
+        if ((status & 0x08U) != 0U)
+            return true;
+    }
+
+    return false;
+}
+
+uint8_t emm_reached_mask_after(uint8_t mask, uint32_t start_ms)
+{
+    uint8_t id;
+    uint8_t result = 0U;
+
+    for (id = 1U; id <= CAN_MOTOR_MAX_ID; ++id)
+    {
+        uint8_t bit = (uint8_t)(1U << (id - 1U));
+        uint8_t status;
+        uint32_t tick;
+
+        if ((mask & bit) == 0U)
+            continue;
+
+        if (can_motor_status_get(id, &status, &tick) &&
+            ((int32_t)(tick - start_ms) >= 0) &&
+            ((status & 0x02U) != 0U))
+        {
+            result |= bit;
+        }
+    }
+
+    return result;
+}
+
+uint8_t emm_faulted_mask_after(uint8_t mask, uint32_t start_ms)
+{
+    uint8_t id;
+    uint8_t result = 0U;
+
+    for (id = 1U; id <= CAN_MOTOR_MAX_ID; ++id)
+    {
+        uint8_t bit = (uint8_t)(1U << (id - 1U));
+        uint8_t status;
+        uint32_t tick;
+
+        if ((mask & bit) == 0U)
+            continue;
+
+        if (can_motor_status_get(id, &status, &tick) &&
+            ((int32_t)(tick - start_ms) >= 0) &&
+            ((status & 0x08U) != 0U))
+        {
+            result |= bit;
+        }
+    }
+
+    return result;
+}
+

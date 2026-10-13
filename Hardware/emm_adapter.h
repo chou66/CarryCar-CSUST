@@ -56,4 +56,25 @@ bool emm_any_position_fault_after(
 );
 
 
+/* 机械臂专用：仅堵转保护锁存(0x08)算致命故障；落座压料瞬间的堵转检测警告(0x04)不算。 */
+bool emm_any_stall_protect_after(
+    uint8_t mask,
+    uint32_t start_ms
+);
+
+
+/* mask 内 start_ms 之后已上报到位(0x02)的电机位集合。 */
+uint8_t emm_reached_mask_after(
+    uint8_t mask,
+    uint32_t start_ms
+);
+
+
+/* mask 内 start_ms 之后上报堵转保护锁存位(0x08)的电机位集合。 */
+uint8_t emm_faulted_mask_after(
+    uint8_t mask,
+    uint32_t start_ms
+);
+
+
 #endif

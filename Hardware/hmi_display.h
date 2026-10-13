@@ -104,7 +104,7 @@ void HMI_Race_SetTaskCode(const char *code);
  * "二维码区"
  * "原料区"
  * "粗加工区"
- * "细加工区"
+ * "暂存区"
  * "返回"
  */
 void HMI_Race_SetStage(const char *stage);

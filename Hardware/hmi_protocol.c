@@ -34,6 +34,30 @@ HMI_ModeState_t g_hmi_mode;
 
 
 //====================================================
+// 10.7.3 HMI协议层诊断
+//
+// 与 g_hmi_map 分开：
+// - app_uart.c 的 hmi_usart2_* 判断“PA3 / USART2是否收到原始字节”；
+// - 这里的 hmi_proto_* 判断“原始字节是否组成了合法协议帧”。
+//====================================================
+
+volatile uint32_t hmi_proto_byte_count = 0U;
+volatile uint32_t hmi_proto_head1_count = 0U;
+volatile uint32_t hmi_proto_head2_count = 0U;
+volatile uint32_t hmi_proto_complete_count = 0U;
+volatile uint32_t hmi_proto_map_ok_count = 0U;
+volatile uint32_t hmi_proto_map_reject_count = 0U;
+volatile uint32_t hmi_proto_unknown_cmd_count = 0U;
+
+volatile uint8_t hmi_proto_last_byte = 0U;
+volatile uint8_t hmi_proto_last_cmd = 0U;
+volatile uint8_t hmi_proto_last_reject_reason = 0U;
+volatile uint8_t hmi_proto_debug_rx_index = 0U;
+volatile uint8_t hmi_proto_debug_expected_len = 0U;
+
+
+
+//====================================================
 // 协议接收缓冲区
 //====================================================
 
@@ -79,6 +103,20 @@ static void HMI_ParseModeFrame(const uint8_t *frame);
 //====================================================
 void HMI_Protocol_Init(void)
 {
+    /* 协议诊断计数器随协议初始化一起清零。 */
+    hmi_proto_byte_count = 0U;
+    hmi_proto_head1_count = 0U;
+    hmi_proto_head2_count = 0U;
+    hmi_proto_complete_count = 0U;
+    hmi_proto_map_ok_count = 0U;
+    hmi_proto_map_reject_count = 0U;
+    hmi_proto_unknown_cmd_count = 0U;
+    hmi_proto_last_byte = 0U;
+    hmi_proto_last_cmd = 0U;
+    hmi_proto_last_reject_reason = 0U;
+    hmi_proto_debug_rx_index = 0U;
+    hmi_proto_debug_expected_len = 0U;
+
     // 清空地图状态
     memset(&g_hmi_map, 0, sizeof(g_hmi_map));
 
@@ -104,6 +142,9 @@ static void HMI_ResetReceiver(void)
 {
     hmi_rx_index = 0;
     hmi_expected_len = 0;
+
+    hmi_proto_debug_rx_index = 0U;
+    hmi_proto_debug_expected_len = 0U;
 }
 
 
@@ -114,6 +155,9 @@ static void HMI_ResetReceiver(void)
 //====================================================
 void HMI_Protocol_RxByte(uint8_t data)
 {
+    hmi_proto_byte_count++;
+    hmi_proto_last_byte = data;
+
     //------------------------------------------------
     // 状态0：
     // 等待第一个帧头 0xAA
@@ -122,8 +166,10 @@ void HMI_Protocol_RxByte(uint8_t data)
     {
         if(data == HMI_HEAD_1)
         {
+            hmi_proto_head1_count++;
             hmi_frame[0] = data;
             hmi_rx_index = 1;
+            hmi_proto_debug_rx_index = hmi_rx_index;
         }
 
         return;
@@ -138,8 +184,10 @@ void HMI_Protocol_RxByte(uint8_t data)
     {
         if(data == HMI_HEAD_2)
         {
+            hmi_proto_head2_count++;
             hmi_frame[1] = data;
             hmi_rx_index = 2;
+            hmi_proto_debug_rx_index = hmi_rx_index;
         }
         else if(data == HMI_HEAD_1)
         {
@@ -171,6 +219,8 @@ void HMI_Protocol_RxByte(uint8_t data)
     {
         hmi_frame[2] = data;
         hmi_rx_index = 3;
+        hmi_proto_last_cmd = data;
+        hmi_proto_debug_rx_index = hmi_rx_index;
 
 
         //------------------------------------------------
@@ -202,9 +252,12 @@ void HMI_Protocol_RxByte(uint8_t data)
         //------------------------------------------------
         else
         {
+            hmi_proto_unknown_cmd_count++;
+            hmi_proto_last_reject_reason = 8U;
             HMI_ResetReceiver();
         }
 
+        hmi_proto_debug_expected_len = hmi_expected_len;
         return;
     }
 
@@ -216,12 +269,15 @@ void HMI_Protocol_RxByte(uint8_t data)
     // 防止数组越界
     if(hmi_rx_index >= HMI_MAX_FRAME_LEN)
     {
+        hmi_proto_last_reject_reason = 7U;
         HMI_ResetReceiver();
         return;
     }
 
     hmi_frame[hmi_rx_index] = data;
     hmi_rx_index++;
+    hmi_proto_debug_rx_index = hmi_rx_index;
+    hmi_proto_debug_expected_len = hmi_expected_len;
 
 
     //------------------------------------------------
@@ -235,9 +291,17 @@ void HMI_Protocol_RxByte(uint8_t data)
         //--------------------------------------------
         if(hmi_frame[2] == HMI_CMD_MAP_CONFIG)
         {
+            hmi_proto_complete_count++;
+
             if(HMI_CheckMapFrame(hmi_frame))
             {
+                hmi_proto_map_ok_count++;
+                hmi_proto_last_reject_reason = 0U;
                 HMI_ParseMapFrame(hmi_frame);
+            }
+            else
+            {
+                hmi_proto_map_reject_count++;
             }
         }
 
@@ -288,6 +352,7 @@ static uint8_t HMI_CheckMapFrame(const uint8_t *frame)
     if(frame[0] != HMI_HEAD_1 ||
        frame[1] != HMI_HEAD_2)
     {
+        hmi_proto_last_reject_reason = 1U;
         return 0;
     }
 
@@ -297,6 +362,7 @@ static uint8_t HMI_CheckMapFrame(const uint8_t *frame)
     //------------------------------------------------
     if(frame[2] != HMI_CMD_MAP_CONFIG)
     {
+        hmi_proto_last_reject_reason = 2U;
         return 0;
     }
 
@@ -307,6 +373,7 @@ static uint8_t HMI_CheckMapFrame(const uint8_t *frame)
     if(frame[26] != HMI_TAIL_1 ||
        frame[27] != HMI_TAIL_2)
     {
+        hmi_proto_last_reject_reason = 3U;
         return 0;
     }
 
@@ -321,6 +388,7 @@ static uint8_t HMI_CheckMapFrame(const uint8_t *frame)
     if((frame[3] != 3) &&
        (frame[3] != 9))
     {
+        hmi_proto_last_reject_reason = 4U;
         return 0;
     }
 
@@ -331,6 +399,7 @@ static uint8_t HMI_CheckMapFrame(const uint8_t *frame)
     if((frame[4] != 3) &&
        (frame[4] != 9))
     {
+        hmi_proto_last_reject_reason = 5U;
         return 0;
     }
 
@@ -342,6 +411,7 @@ static uint8_t HMI_CheckMapFrame(const uint8_t *frame)
     {
         if(frame[5 + i] > 1)
         {
+            hmi_proto_last_reject_reason = 6U;
             return 0;
         }
     }

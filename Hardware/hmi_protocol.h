@@ -296,4 +296,38 @@ uint8_t HMI_Mode_IsUpdated(void);
 void HMI_Mode_ClearUpdated(void);
 
 
+
+//====================================================
+// 10.7.3 HMI协议诊断变量
+//
+// 只用于 Keil Watch，不参与控制逻辑。
+//====================================================
+
+extern volatile uint32_t hmi_proto_byte_count;
+extern volatile uint32_t hmi_proto_head1_count;
+extern volatile uint32_t hmi_proto_head2_count;
+extern volatile uint32_t hmi_proto_complete_count;
+extern volatile uint32_t hmi_proto_map_ok_count;
+extern volatile uint32_t hmi_proto_map_reject_count;
+extern volatile uint32_t hmi_proto_unknown_cmd_count;
+
+extern volatile uint8_t hmi_proto_last_byte;
+extern volatile uint8_t hmi_proto_last_cmd;
+extern volatile uint8_t hmi_proto_last_reject_reason;
+extern volatile uint8_t hmi_proto_debug_rx_index;
+extern volatile uint8_t hmi_proto_debug_expected_len;
+
+/*
+ * hmi_proto_last_reject_reason:
+ *   0 = 无拒绝 / 最近地图帧合法
+ *   1 = 帧头错误
+ *   2 = CMD错误
+ *   3 = 帧尾错误
+ *   4 = start_node 非 3/9
+ *   5 = return_node 非 3/9
+ *   6 = 某个 obstacle 字节不是 0/1
+ *   7 = 接收缓存越界
+ *   8 = 未知 CMD
+ */
+
 #endif

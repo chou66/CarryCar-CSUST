@@ -10,13 +10,29 @@
 // 节点定义
 // 节点编号使用 1~9
 //====================================================
+typedef enum
+{
+    MAP_TASK_NONE = 0,
+    MAP_TASK_PARK,
+    MAP_TASK_QR,
+    MAP_TASK_RAW,
+    MAP_TASK_ROUGH,
+    MAP_TASK_STORAGE
+} MapTaskId_t;
+
 typedef struct
 {
     float x;
     float y;
 
-    // 后续可扩展：任务类型、朝向、动作参数等
+    /* 固定功能区的标准作业属性。
+     * task_yaw_deg 使用世界坐标航向：0=上，+90=右，-90=左，180=下。
+     * 注意：仅当该节点是 Mission 当前真正目标时才执行此航向；
+     * Dijkstra 中途经过节点时绝不自动转向。
+     */
     uint8_t task_id;
+    uint8_t task_yaw_valid;
+    float task_yaw_deg;
 
 } MapNode_t;
 
@@ -27,6 +43,10 @@ typedef struct
 
 // 节点数组
 extern MapNode_t g_nodes[NODE_NUM + 1];
+
+/* N3/N9 are road intersections. Parking bays have separate physical poses;
+ * HMI and Dijkstra still use only the original 1..9 road-node protocol. */
+uint8_t MapGraph_GetParkingPose(uint8_t corner_node, float *x, float *y);
 
 // 邻接矩阵
 // 下标仍然使用 1~9

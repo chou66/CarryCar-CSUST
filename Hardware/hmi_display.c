@@ -88,8 +88,14 @@ void HMI_SendCommand(const char *cmd)
     uint16_t len = 0U;
     if (!cmd) return;
     while (cmd[len] != '\0') ++len;
-    (void)HAL_UART_Transmit(&huart3, (uint8_t *)cmd, len, HMI_TX_TIMEOUT_MS);
-    (void)HAL_UART_Transmit(&huart3, (uint8_t *)end, 3U, HMI_TX_TIMEOUT_MS);
+
+    /*
+     * 当前链路验证端口：USART2。
+     * PA2 / USART2_TX -> HMI RX；接收方向见 app_uart.c 的 PA3 / USART2_RX。
+     * 本测试版 USART2 暂时由 HMI 独占。
+     */
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)cmd, len, HMI_TX_TIMEOUT_MS);
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)end, 3U, HMI_TX_TIMEOUT_MS);
 }
 
 void HMI_Display_Init(void)

@@ -107,7 +107,7 @@ void chassis_motion_move(Chassis *chassis,
     /*
      * Cross-axis compensation is added after the normal Y scale.
      * Most map edges are pure X or pure Y, where this only cancels the
-     * measured strafe drift. The two diagonal edges (N2-N3, N3-N6) also
+     * measured strafe drift. Bay entry/exit and N7-N8 also
      * pass through here: the compensation stays proportional to |dx|,
      * which is how the physical coupling behaves, but its magnitude was
      * calibrated on pure strafe moves only.

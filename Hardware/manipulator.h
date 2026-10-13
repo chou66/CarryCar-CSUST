@@ -13,7 +13,7 @@ HAL_StatusTypeDef Manipulator_Gimbal_MovePulses(uint8_t dir, uint16_t rpm,
 HAL_StatusTypeDef Manipulator_Slide_MovePulses(uint8_t dir, uint16_t rpm,
                                                uint8_t acc, uint32_t pulses);
 
-bool Manipulator_Gimbal_RotateDeg(float degree, uint16_t rpm, uint8_t acc);
+bool Manipulator_Gimbal_MoveMm(float mm, uint16_t rpm, uint8_t acc);
 bool Manipulator_Slide_MoveMm(float mm, uint16_t rpm, uint8_t acc);
 
 void Manipulator_StopAll(void);

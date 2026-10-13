@@ -79,6 +79,13 @@
  * Direct CAN smoke test (bypasses chassis/kinematics entirely):
  * 60 motor 1 rotates one revolution; ch9: 1=commanded+bus alive,
  *    13=no CAN reply from the driver (bus still broken)
+ * 61 motor 5 (gimbal) reply probe, read-only S_FLAG query, no actuation
+ * 62 motor 6 (slide) reply probe, same contract as 61
+ *    ch9: 1=answered, 13=no reply in 60 ms
+ *
+ * Combined RobotApp diagnostic build:
+ * 70 enter VOFA manual override. This E-stops/suspends RobotApp permanently
+ *    until MCU reset. Motion commands are rejected before 0x70.
  *
  * Map orientation:
  *   7 -- 8 -- 9
@@ -100,7 +107,9 @@
  * 10=automatic edge-end yaw correction is running,
  * 11=yaw error too large to auto-correct safely,
  * 12=yaw correction timeout,
- * 13=motor1 one-rev test failed: no CAN reply.
+ * 13=motor1 one-rev test failed: no CAN reply,
+ * 14=VOFA motion command rejected: send 0x70 first,
+ * 15=VOFA takeover is stopping RobotApp; wait briefly and retry.
  */
 void VofaDebug_Init(void);
 void VofaDebug_FeedByte(uint8_t byte);

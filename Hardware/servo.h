@@ -3,26 +3,36 @@
 
 #include "main.h"
 #include <stdint.h>
+#include <stdbool.h>
+
+void CarouselServo_Update(uint32_t now_ms);
+bool CarouselServo_IsBusy(void);
+bool CarouselServo_IsDone(void);
 
 void Servo_Init(void);
 
+/*GripperServo*/
 void GripperServo_SetUs(uint16_t us);
-void GripperServo_Open(void);
+void GripperServo_Open_Small(void);
+void GripperServo_Open_Large(void);
 void GripperServo_Close(void);
 void GripperServo_Mid(void);
 
+void GripperServo_Update(uint32_t now_ms);
+bool GripperServo_IsBusy(void);
+bool GripperServo_IsDone(void);
+/*CarouselServo*/
 void CarouselServo_SetUs(uint16_t us);
-void CarouselServo_SetAngle(uint16_t angle_deg);
-void CarouselServo_GotoSlot(uint8_t slot);
+void CarouselServo_ToPickupPos1(void);
+void CarouselServo_ToPickup(void);       /* 原函数继续代表夹取位2 */
+void CarouselServo_ToPickupPos3(void);
+void CarouselServo_ToPlace(void);
+void CarouselServo_ToMid(void);
 
-/* Legacy aliases for old competition code */
-void Servo_SetUs(uint16_t us);
-void Servo_Open(void);
-void Servo_Close(void);
-void Servo_Mid(void);
-
-
+/*TraySelectorServo*/
 void TraySelectorServo_SetUs(uint16_t us);
-void Pwm4Servo_SetUs(uint16_t us);
+void TraySelectorServo_GotoSlot(uint8_t slot);
+
+void Pwm1Servo_SetUs(uint16_t us);
 
 #endif
