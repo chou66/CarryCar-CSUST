@@ -422,10 +422,14 @@ void ManipulatorAction_Init(void)
 }
 
 /*
- * 外部 -> 料盘：把外部端位姿参数化后的启动入口。
- * 参数非法或动作未结束时返回 false，且不改变任何状态。
+ * TO_TRAY 两类入口共用的参数校验与准备：
+ *   StartToTrayAtPose             —— 从原点出发，云台转位 + 滑台伸出
+ *   StartToTrayFromAlignedPose    —— 视觉已对准，直接下降
+ *
+ * 返回 false 时不得改动任何动作状态；active_pickup_* 只在参数全部合法后
+ * 才写入，保证“失败不改变状态”的既有约定。
  */
-bool ManipulatorAction_StartToTrayAtPose(const ManipPose_t *pickup_pose)
+static bool prepare_to_tray_start(const ManipPose_t *pickup_pose)
 {
     float effective_mm;
 
@@ -481,8 +485,73 @@ bool ManipulatorAction_StartToTrayAtPose(const ManipPose_t *pickup_pose)
         true,
         false);
 
+    return true;
+}
+
+/*
+ * 外部 -> 料盘：把外部端位姿参数化后的启动入口。
+ * 参数非法或动作未结束时返回 false，且不改变任何状态。
+ */
+bool ManipulatorAction_StartToTrayAtPose(const ManipPose_t *pickup_pose)
+{
+    if (!prepare_to_tray_start(pickup_pose))
+    {
+        return false;
+    }
+
     action_state =
         MANIP_GROUND_TO_TRAY_PREPARE;
+    active_flow = MANIP_FLOW_TO_TRAY;
+
+    return true;
+}
+
+/*
+ * 原料区专用：视觉已经对准，直接从当前姿态下降抓取。
+ *
+ * 这里不再动云台和滑台：视觉预置已经把云台转到识别姿态并张开夹爪，
+ * RawMaterialAlign 又把云台/滑台调到相机验证过的二维位置。因此本入口
+ * 只校验“滑台位置确实等于传入位姿”，然后从直接下降状态开始。
+ */
+bool ManipulatorAction_StartToTrayFromAlignedPose(const ManipPose_t *pickup_pose)
+{
+    float current_mm;
+    float target_mm;
+
+    if (pickup_pose == NULL)
+    {
+        return false;
+    }
+
+    /* 没有可信的滑台绝对位置时不能走这条捷径。 */
+    if (!ManipulatorAction_SlideJogPositionKnown())
+    {
+        return false;
+    }
+
+    current_mm = ManipulatorAction_SlideJogGetPositionMm();
+    target_mm = pickup_pose->slide_extend_mm;
+
+    if ((current_mm > (target_mm + 0.5f)) ||
+        (current_mm < (target_mm - 0.5f)))
+    {
+        return false;
+    }
+
+    if (!prepare_to_tray_start(pickup_pose))
+    {
+        return false;
+    }
+
+    /*
+     * 滑台已经停在识别/对准位。回程量必须按实测当前位置计算，
+     * 这样夹取后的 RETRACT_SLIDE 才能准确回到 0 mm。
+     */
+    active_pickup_slide_mm = current_mm;
+    active_pickup_slide_return_mm = -current_mm;
+
+    action_state =
+        MANIP_GROUND_TO_TRAY_DIRECT_DESCEND;
     active_flow = MANIP_FLOW_TO_TRAY;
 
     return true;
@@ -654,6 +723,23 @@ bool ManipulatorAction_StartTrayToGround(void)
 {
     return ManipulatorAction_StartTrayToGroundAt(
         MANIP_PICKUP_POSITION_2);
+}
+
+/*
+ * 主动作或点动把滑台成功退回机械原点后，统一同步：
+ *   - Manipulator 层的 HOME 基准（供 ZoneTask 判断下一段能否启动）；
+ *   - 点动模块的绝对位置与有效性（供下一次视觉预置继续累计）。
+ * 只在“确实收到到位反馈”后调用；中途失败/急停仍走 UNKNOWN。
+ */
+static void commit_slide_home_position(void)
+{
+    Manipulator_Slide_SetHome();
+
+    jog_current_position_mm = 0.0f;
+    jog_target_position_mm = 0.0f;
+    jog_position_valid = true;
+    robot_manip_slide_position_mm = 0.0f;
+    robot_manip_slide_position_valid = 1U;
 }
 
 static void update_to_tray(uint32_t now_ms)
@@ -850,9 +936,15 @@ static void update_to_tray(uint32_t now_ms)
 						motor_result = wait_motor_position(
 								MOTOR_SLIDE_MASK,
 								now_ms);
-				
+
 						if (motor_result == MOTOR_REACHED)
 						{
+								/*
+								 * 无论本次动作从原点出发还是从视觉对准位
+								 * 出发，滑台回程量都等于去程伸出量，因此
+								 * 到位后确实回到机械原点，同步位置基准。
+								 */
+								commit_slide_home_position();
 								enter_state(
 										MANIP_GROUND_TO_TRAY_ROTATE_TO_PLACE,
 										now_ms);
@@ -863,6 +955,60 @@ static void update_to_tray(uint32_t now_ms)
 						}
 						break;						
 				
+        /*
+         * 视觉对准后直接抓取：云台/滑台/夹爪已经由预置和视觉闭环摆好，
+         * 这里只等舵机就绪，然后仅下降电机5。滑台不再先回零再重伸。
+         */
+        case MANIP_GROUND_TO_TRAY_DIRECT_DESCEND:
+            if (!CarouselServo_IsDone() || !GripperServo_IsDone())
+            {
+                if ((now_ms - state_start_ms) >=
+                    MANIP_PLACE_MOTOR_TIMEOUT_MS)
+                {
+                    record_pending_fail(MANIP_FAIL_SERVO, 0U);
+                    action_fail(now_ms);
+                }
+                break;
+            }
+
+            prepare_motor_feedback(MOTOR_GIMBAL_MASK);
+
+            motor_start_ms = now_ms;
+            last_status_query_ms = now_ms;
+
+            if (!Manipulator_Gimbal_MoveMm(
+                    active_pickup_gimbal_mm,
+                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_ACC))
+            {
+                record_pending_fail(MANIP_FAIL_SEND,
+                                    MOTOR_GIMBAL_MASK);
+                action_fail(now_ms);
+                break;
+            }
+
+            enter_state(
+                MANIP_GROUND_TO_TRAY_WAIT_DIRECT_DESCEND,
+                now_ms);
+            break;
+
+        case MANIP_GROUND_TO_TRAY_WAIT_DIRECT_DESCEND:
+            motor_result = wait_motor_position(
+                MOTOR_GIMBAL_MASK,
+                now_ms);
+
+            if (motor_result == MOTOR_REACHED)
+            {
+                enter_state(
+                    MANIP_GROUND_TO_TRAY_CLOSE,
+                    now_ms);
+            }
+            else if (motor_wait_failed(motor_result))
+            {
+                action_fail(now_ms);
+            }
+            break;
+
         /* 夹爪旋转到物料盘放置方向。 */
         case MANIP_GROUND_TO_TRAY_ROTATE_TO_PLACE:
             CarouselServo_ToPlace();
@@ -1373,16 +1519,15 @@ static bool slide_jog_send_move(float delta_mm)
          * 预伸量被标定成 0（滑台本来就该停在识别位）时不用发电机命令，
          * 否则 0 脉冲下等不到新的到位标志，会一直挂到超时。
          */
-        jog_current_position_mm = jog_target_position_mm;
-        robot_manip_slide_position_mm = jog_current_position_mm;
-        robot_manip_slide_position_valid = 1U;
-
         if (jog_to_home)
         {
-            Manipulator_Slide_SetHome();
+            commit_slide_home_position();
         }
         else
         {
+            jog_current_position_mm = jog_target_position_mm;
+            robot_manip_slide_position_mm = jog_current_position_mm;
+            robot_manip_slide_position_valid = 1U;
             Manipulator_Slide_SetAlign();
         }
 
@@ -1482,17 +1627,16 @@ static void update_slide_jog(uint32_t now_ms)
                 /* 到位即更新位置基准：退回原点 => HOME，预伸 => ALIGN。 */
                 if (jog_to_home)
                 {
-                    Manipulator_Slide_SetHome();
+                    commit_slide_home_position();
                 }
                 else
                 {
                     Manipulator_Slide_SetAlign();
+                    jog_current_position_mm = jog_target_position_mm;
+                    jog_position_valid = true;
+                    robot_manip_slide_position_mm = jog_current_position_mm;
+                    robot_manip_slide_position_valid = 1U;
                 }
-
-                jog_current_position_mm = jog_target_position_mm;
-                jog_position_valid = true;
-                robot_manip_slide_position_mm = jog_current_position_mm;
-                robot_manip_slide_position_valid = 1U;
 
                 enter_jog_state(MANIP_JOG_DONE, now_ms);
             }

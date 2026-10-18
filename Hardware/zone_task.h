@@ -23,11 +23,13 @@
  *
  * 原料区三步的 align_color 非 0：每步在夹取之前先做一轮 K230 视觉对位
  * （转夹爪到统一识别位 POS2 + 张开 -> 滑台前伸到识别位 -> 发 detect,<颜色号>
- * -> 云台与滑台二维位置闭环 -> 滑台退回原点），识别到对应颜色才夹取。
+ * -> 云台与滑台二维位置闭环），识别到对应颜色才夹取。
  * 注意识别前那两件事的顺序是固定的「云台先转、滑台后伸」：夹爪在缩回
  * 状态下回转更不容易和外围干涉；两件都就位后才发 detect。
  * 原料区三步的表内 pose 以 ZONE_RAW_POS2_POSE 为初值；对准完成后会把
- * 实际云台角度与滑台位置一起写入本步夹取 pose，从原点重放同一位姿。
+ * 实际云台角度与滑台位置一起写入本步抓取 pose。抓取不再先退回原点、
+ * 再重新伸出，而是直接从当前对准位下降电机5，见
+ * ManipulatorAction_StartToTrayFromAlignedPose()。
  * 底盘在三块料之间保持不动。
  * 对位失败则整个区域任务失败停车；此时滑台可能停在半路，位置基准作废，
  * 需人工把滑台推回原点并调用 Manipulator_Slide_SetHome() 才能重新启动。
@@ -62,7 +64,7 @@ typedef enum
     /* 追加在末尾，保持前面所有枚举值不变。 */
     ZONE_TASK_SLIDE_OUT,       /* 识别前：云台先转到识别位并张开，滑台再前伸 */
     ZONE_TASK_WAIT_SLIDE_OUT,
-    ZONE_TASK_SLIDE_HOME,      /* 识别后：滑台退回原点，夹取仍从原点出发 */
+    ZONE_TASK_SLIDE_HOME,      /* 保留状态值；原料视觉对准后已改为直接抓取 */
     ZONE_TASK_WAIT_SLIDE_HOME
 } ZoneTaskState_t;
 

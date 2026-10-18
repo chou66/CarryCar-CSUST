@@ -179,7 +179,16 @@ typedef enum
 		MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETRACT_SLIDE,
 
     MANIP_ACTION_DONE,
-    MANIP_ACTION_ERROR
+    MANIP_ACTION_ERROR,
+
+    /*
+     * 追加在末尾，保持前面所有枚举值不变。
+     *
+     * 视觉已经完成、滑台停在相机验证过的伸出量、云台已在对准角度且夹爪
+     * 保持张开时，不再退回原点重新伸出，直接下降电机5抓取。
+     */
+    MANIP_GROUND_TO_TRAY_DIRECT_DESCEND,
+    MANIP_GROUND_TO_TRAY_WAIT_DIRECT_DESCEND
 } ManipulatorActionState_t;
 
 /*
@@ -278,6 +287,27 @@ bool ManipulatorAction_StartTableToTrayAt(
  * 旧接口全部保留，内部按原标定值组装 pose 后转发到这两个函数。
  */
 bool ManipulatorAction_StartToTrayAtPose(const ManipPose_t *pickup_pose);
+
+/*
+ * 原料区专用：从“视觉已经对准的当前位置”直接取料。
+ *
+ * 与 StartToTrayAtPose 的区别：
+ *   - 不重新发送云台角度、不重新张开夹爪（视觉预置已经完成）；
+ *   - 不发送滑台伸出指令（滑台已经停在相机验证过的位置）；
+ *   - 直接从当前姿态下降电机5 -> 闭合夹爪，然后沿用 TO_TRAY 后半段：
+ *     抬升 -> 滑台退回原点 -> 转料盘 -> 下降放料 -> 回原点。
+ *
+ * 调用前提：
+ *   - 主动作空闲，滑台点动不在忙；
+ *   - 滑台位置基准可信，且当前位置与 pickup_pose->slide_extend_mm 一致
+ *     （容差 0.5 mm）；
+ *   - 电机5位于最高原点，夹爪已张开。
+ *
+ * 返回值 false 表示前提不满足或参数非法；此时不改变任何动作状态。
+ * 回程滑台位移按“实测当前位置”计算，确保夹取后能准确退回 0 mm。
+ */
+bool ManipulatorAction_StartToTrayFromAlignedPose(const ManipPose_t *pickup_pose);
+
 bool ManipulatorAction_StartTrayToGroundAtPose(const ManipPose_t *place_pose);
 
 void ManipulatorAction_Update(uint32_t now_ms);
@@ -294,8 +324,11 @@ void ManipulatorAction_Abort(void);
  *      RAW_VISION_SLIDE_START_MM（已扣除底盘靠近量），
  *      让取像距离与识别姿态自洽。
  * 两件都就位后才由上层发 detect/place（见 K230Align_StartPreset）。
- * 识别结束后再按同一值退回机械原点，让夹取动作组仍从原点出发——动作
- * 引擎里「伸出=发绝对目标值、回程=发负值」的假设因此一个字都不用改。
+ * 识别结束后：
+ *   - 原料区由 RawMaterialAlign 动态调整云台/滑台，对准完成后调用
+ *     StartToTrayFromAlignedPose() 直接从当前姿态下降抓取，不再退回原点；
+ *   - 粗加工区/暂存区仍由调用方退回原点，再从原点执行固定位姿动作。
+ * 动作引擎里「伸出=发相对位移、回程=发负值」的假设因此保持不变。
  *
  * 模块会在每次电机到位确认后记录滑台绝对位置。原料视觉位置环可反复调用
  * SlideJogToPositionStart(target_mm)；它把绝对目标换算成相对位移。中途失败

@@ -269,10 +269,15 @@ static bool start_step_action(void)
         (step->align_color != 0U) &&
         raw_aligned_pose_valid)
     {
-        /* 二维视觉闭环已经把相机中心对准目标；退回滑台后必须按同一
-         * 云台角度 + 滑台位置重放抓取位姿。 */
+        /* 二维视觉闭环已经把相机中心对准目标；滑台和云台仍停在
+         * 对准位，直接从这里下降抓取，不再回零后重新伸出。 */
         pose.carousel_deg = raw_aligned_carousel_deg;
         pose.slide_extend_mm = raw_aligned_slide_mm;
+
+        if (step->flow == ZONE_STEP_TO_TRAY)
+        {
+            return ManipulatorAction_StartToTrayFromAlignedPose(&pose);
+        }
     }
 
     if (step->flow == ZONE_STEP_TO_TRAY)
@@ -421,8 +426,13 @@ void ZoneTask_Update(uint32_t now_ms)
                 raw_aligned_slide_mm =
                     RawMaterialAlign_GetSlideMm();
                 raw_aligned_pose_valid = true;
-                /* 对位完成，滑台先退回原点，夹取动作组才能照原样从原点出发。 */
-                enter_state(ZONE_TASK_SLIDE_HOME, now_ms);
+                /*
+                 * 对位完成时滑台已经停在相机验证过的伸出量上，云台也已经
+                 * 在对准角度、夹爪保持张开。原料区不再先退回原点再重新
+                 * 伸出，直接进入抓取动作，由 StartToTrayFromAlignedPose
+                 * 从当前姿态下降电机5。
+                 */
+                enter_state(ZONE_TASK_START_ACTION, now_ms);
             }
             break;
 
