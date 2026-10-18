@@ -23,6 +23,23 @@ uint8_t RobotApp_IsVofaOverrideReady(void);
 extern volatile uint8_t robot_app_vofa_override;
 extern volatile uint8_t robot_app_vofa_override_ready;
 
+/* 正式任务诊断：供Keil Watch观察航向确认和“圆心+航向”联合锁定。 */
+extern volatile uint8_t robot_mission_state;
+extern volatile uint8_t robot_mission_stage;
+extern volatile uint8_t robot_mission_target;
+extern volatile uint8_t robot_mission_error;
+extern volatile float robot_world_yaw_deg;
+extern volatile float robot_mission_target_yaw_deg;
+extern volatile float robot_mission_yaw_error_deg;
+extern volatile float robot_mission_align_wz_radps;
+extern volatile uint8_t robot_mission_align_attempt;
+extern volatile uint8_t robot_mission_align_stable_samples;
+extern volatile uint8_t robot_mission_pose_lock_active;
+extern volatile uint8_t robot_mission_pose_lock_yaw_changed;
+extern volatile uint8_t robot_mission_task_step;
+extern volatile uint8_t robot_mission_task_steps;
+extern volatile uint8_t robot_mission_vision_iteration;
+
 Chassis *RobotApp_GetChassis(void);
 HMI_Navigation_t *RobotApp_GetNavigation(void);
 

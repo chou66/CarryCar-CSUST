@@ -111,6 +111,18 @@ static void process_line(const char *line)
 
         event = K230_EVENT_COLOR;
     }
+    /*
+     * 第二轮叠放的身份确认：target,2。
+     * 这不是圆心坐标，只表示K230已用第一层物料颜色确认当前锁定的是2号位；
+     * 后续a/d/w/s仍来自2号位外层圆环。
+     */
+    else if ((strncmp(line, "target,", 7U) == 0) &&
+             parse_unsigned(&line[7], &value) &&
+             (value >= 1U) && (value <= 3U))
+    {
+        g_k230_status.target_id = (uint8_t)value;
+        event = K230_EVENT_TARGET;
+    }
     /* 方向偏差：a,18 / d,7 / w,6 / s,10。 */
     else if (((line[0] == 'a') ||
               (line[0] == 'd') ||
@@ -150,6 +162,17 @@ static void process_line(const char *line)
     {
         event = K230_EVENT_PLACE;
     }
+    /*
+     * stack任务的最终确认带位置号。TARGET与PLACE在同一行同时置位，
+     * 上层会先校验编号，再接受“已经对准”，也能兜底前一条target,n丢包。
+     */
+    else if ((strncmp(line, "place,", 6U) == 0) &&
+             parse_unsigned(&line[6], &value) &&
+             (value >= 1U) && (value <= 3U))
+    {
+        g_k230_status.target_id = (uint8_t)value;
+        event = K230_EVENT_TARGET | K230_EVENT_PLACE;
+    }
     else if (strncmp(line, "error,", 6U) == 0)
     {
         save_error_text(&line[6]);
@@ -158,6 +181,15 @@ static void process_line(const char *line)
     else if (strcmp(line, "heartbeat,1") == 0)
     {
         event = K230_EVENT_HEARTBEAT;
+    }
+    /*
+     * stop 的确认帧。旧协议只管发送 stop，不知道 K230 是否真正收到；若该帧
+     * 丢失，K230 会继续保留上一块物料任务，下一次 detect 就可能返回 busy。
+     * 上层现在会等待本事件并按周期重发 stop，直到双方状态真正同步。
+     */
+    else if (strcmp(line, "stopped") == 0)
+    {
+        event = K230_EVENT_STOPPED;
     }
     else
     {
@@ -337,6 +369,24 @@ HAL_StatusTypeDef K230_StartPlace(
 
     command[6] =
         (char)('0' + position_id);
+
+    return K230_SendString(command);
+}
+
+HAL_StatusTypeDef K230_StartStack(
+    uint8_t position_id,
+    uint8_t anchor_color_id)
+{
+    char command[] = "stack,0,0\n";
+
+    if ((position_id < 1U) || (position_id > 3U) ||
+        (anchor_color_id < 1U) || (anchor_color_id > 6U))
+    {
+        return HAL_ERROR;
+    }
+
+    command[6] = (char)('0' + position_id);
+    command[8] = (char)('0' + anchor_color_id);
 
     return K230_SendString(command);
 }

@@ -220,7 +220,7 @@ void chassis_init(Chassis *chassis, const MecanumConfig *config)
 {
     *chassis = (Chassis){
         .config = *config,
-        .acceleration = 200U,
+        .acceleration = 100U,
         .watchdog_ms = 150U,
         .position_timeout_ms = 0U, /* 0 = 动态超时 */
         .mode = CHASSIS_MODE_VELOCITY,

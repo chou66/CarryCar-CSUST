@@ -53,4 +53,6 @@ HAL_StatusTypeDef HAL_UART_Transmit(
     uint32_t Timeout
 );
 
+uint32_t HAL_GetTick(void);
+
 #endif

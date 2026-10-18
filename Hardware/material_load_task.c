@@ -1,5 +1,6 @@
 #include "material_load_task.h"
 
+#include "manipulator.h"
 #include "manipulator_action.h"
 #include "robot_config.h"
 #include "servo.h"
@@ -46,7 +47,14 @@ static bool task_can_start(void)
     }
 
     if (ManipulatorAction_IsBusy() ||
-        ManipulatorAction_HasError())
+        ManipulatorAction_HasError() ||
+        ManipulatorAction_SlideJogIsBusy())
+    {
+        return false;
+    }
+
+    /* 动作组假定滑台从机械原点出发；基准无效（急停/上次失败）时拒绝启动。 */
+    if (!Manipulator_Slide_AtHome())
     {
         return false;
     }

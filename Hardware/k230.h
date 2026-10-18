@@ -16,6 +16,8 @@
 #define K230_EVENT_PLACE      0x00000008UL
 #define K230_EVENT_ERROR      0x00000010UL
 #define K230_EVENT_HEARTBEAT  0x00000020UL
+#define K230_EVENT_TARGET     0x00000040UL
+#define K230_EVENT_STOPPED    0x00000080UL
 
 typedef struct
 {
@@ -23,6 +25,9 @@ typedef struct
 
     /* 最近一次识别到的颜色，范围1～6。 */
     uint8_t color_id;
+
+    /* 第二轮叠放时K230确认锁定的位置号，范围1～3。 */
+    uint8_t target_id;
 
     /* a、d、w、s。只保留最近解析到的那一行。 */
     char direction;
@@ -141,6 +146,8 @@ HAL_StatusTypeDef K230_SendString(const char *text);
 /* 正式协议命令。 */
 HAL_StatusTypeDef K230_StartDetect(uint8_t color_id);
 HAL_StatusTypeDef K230_StartPlace(uint8_t position_id);
+/* 第二轮暂存区：用第一层anchor_color_id物料确认position_id身份，再找外圆。 */
+HAL_StatusTypeDef K230_StartStack(uint8_t position_id, uint8_t anchor_color_id);
 HAL_StatusTypeDef K230_Stop(void);
 
 /* 一次非阻塞视觉任务：Start只调用一次，Update需要在主循环持续调用。 */

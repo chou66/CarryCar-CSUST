@@ -1,5 +1,6 @@
 #include "path_planner.h"
 #include "map_graph.h"
+#include "robot_config.h"
 
 
 //====================================================
@@ -11,6 +12,7 @@ PathResult_t PathPlanner_Dijkstra(uint8_t start_node,
     uint16_t dist[NODE_NUM + 1];
     uint8_t visited[NODE_NUM + 1];
     uint8_t prev[NODE_NUM + 1];
+    uint8_t center_count[NODE_NUM + 1];
 
     uint8_t reverse_path[PATH_MAX_LEN];
 
@@ -22,6 +24,8 @@ PathResult_t PathPlanner_Dijkstra(uint8_t start_node,
 
     uint16_t min_dist;
     uint16_t new_dist;
+    uint8_t min_center_count;
+    uint8_t new_center_count;
 
     PathResult_t result;
 
@@ -75,6 +79,7 @@ PathResult_t PathPlanner_Dijkstra(uint8_t start_node,
         dist[i] = INF_COST;
         visited[i] = 0;
         prev[i] = 0;
+        center_count[i] = 0U;
     }
 
     dist[start_node] = 0;
@@ -86,6 +91,7 @@ PathResult_t PathPlanner_Dijkstra(uint8_t start_node,
     for(i = 1; i <= NODE_NUM; i++)
     {
         min_dist = INF_COST;
+        min_center_count = 0U;
         u = 0;
 
 
@@ -94,9 +100,13 @@ PathResult_t PathPlanner_Dijkstra(uint8_t start_node,
         //------------------------------------------------
         for(j = 1; j <= NODE_NUM; j++)
         {
-            if(!visited[j] && dist[j] < min_dist)
+            if(!visited[j] &&
+               ((dist[j] < min_dist) ||
+                ((dist[j] == min_dist) &&
+                 (center_count[j] > min_center_count))))
             {
                 min_dist = dist[j];
+                min_center_count = center_count[j];
                 u = j;
             }
         }
@@ -133,9 +143,19 @@ PathResult_t PathPlanner_Dijkstra(uint8_t start_node,
             {
                 new_dist = dist[u] + g_graph[u][j];
 
-                if(new_dist < dist[j])
+#if ROUTE_CENTER_TIE_BREAK
+                new_center_count = (uint8_t)(center_count[u] +
+                    ((j == ROUTE_CENTER_NODE) ? 1U : 0U));
+#else
+                new_center_count = center_count[u];
+#endif
+
+                if((new_dist < dist[j]) ||
+                   ((new_dist == dist[j]) &&
+                    (new_center_count > center_count[j])))
                 {
                     dist[j] = new_dist;
+                    center_count[j] = new_center_count;
                     prev[j] = u;
                 }
             }

@@ -5,8 +5,7 @@
   * @brief          : Main program body
   ******************************************************************************
   * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
+  * +Copyright (c) 2026 STMicroelectronics.
   * All rights reserved.
   *
   * This software is licensed under terms that can be found in the LICENSE file
@@ -87,6 +86,7 @@ void SystemClock_Config(void);
   * @retval int
   */
 int main(void)
+
 {
 
   /* USER CODE BEGIN 1 */

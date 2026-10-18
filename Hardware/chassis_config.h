@@ -56,7 +56,7 @@
  * 左移 45.2 cm、右移 44.9 cm，左右差异很小，因此当前不拆分左右标定。
  * ============================================================ */
 #define CHASSIS_FORWARD_PULSES_PER_M       12998.0f  /* 5849 pulse / 0.45 m */
-#define CHASSIS_STRAFE_PULSES_PER_M        13400.0f  /* 6030 pulse / 0.45 m */
+#define CHASSIS_STRAFE_PULSES_PER_M        13437.0f  /* 6030 pulse / 0.45 m */
 #define CHASSIS_ROTATE_PULSES_PER_RAD      2451.0f   /* about 3850 pulse / 90 deg */
 
 /* ============================================================
@@ -98,9 +98,13 @@
  * 这里修正的是车体中心的前后漂移；左右差值对应的偏航由下面
  * MOTION_CAL_X_*_TO_THETA 单独补偿。
  */
-#define MOTION_CAL_X_POS_TO_Y      (0.0057f)
-#define MOTION_CAL_X_NEG_TO_Y              (0.0f)
+//#define MOTION_CAL_X_POS_TO_Y      (0.0057f)
+//#define MOTION_CAL_X_NEG_TO_Y              (0.0f)
 
+//////////////////////////////////////////////
+#define MOTION_CAL_X_POS_TO_Y      (-0.029f)			//10.15改
+#define MOTION_CAL_X_NEG_TO_Y      (-0.0230f)
+///////////////////////////////////////////////
 /*
  * 前后 -> 横向串扰补偿，单位 m(X correction) / m(move command)。
  *
@@ -112,9 +116,10 @@
  * 填数前先用 VOFA ch2 确认后退过程 ch2 偏航没有明显漂移，
  * 否则偏左可能是偏航造成的，先修航向再补位置。
  */
+//#define MOTION_CAL_Y_POS_TO_X      (0.0f)
+//#define MOTION_CAL_Y_NEG_TO_X      (0.0222f)
 #define MOTION_CAL_Y_POS_TO_X      (0.0f)
-#define MOTION_CAL_Y_NEG_TO_X      (0.0222f)
-
+#define MOTION_CAL_Y_NEG_TO_X      (0.0f)
 /*
  * 前后 -> 偏航串扰补偿，单位 rad(theta correction) / m(move command)。
  *
@@ -128,9 +133,10 @@
  *
  * 车体坐标约定：+theta = CCW，-theta = CW。
  */
-#define MOTION_CAL_Y_POS_TO_THETA          (-0.0349f)
-#define MOTION_CAL_Y_NEG_TO_THETA          (0.0194f)
-
+//#define MOTION_CAL_Y_POS_TO_THETA          (-0.0349f)
+//#define MOTION_CAL_Y_NEG_TO_THETA          (0.0194f)
+#define MOTION_CAL_Y_POS_TO_THETA  (0.0f)
+#define MOTION_CAL_Y_NEG_TO_THETA  (0.0f)
 /*
  * 横移 -> 偏航串扰补偿，单位 rad(theta correction) / m(strafe command)。
  *
@@ -146,9 +152,10 @@
  *
  * 车体坐标约定：+theta = CCW，-theta = CW。
  */
-#define MOTION_CAL_X_POS_TO_THETA          (-0.0349f)
-#define MOTION_CAL_X_NEG_TO_THETA          (0.0f)
-
+//#define MOTION_CAL_X_POS_TO_THETA          (-0.0349f)
+//#define MOTION_CAL_X_NEG_TO_THETA          (0.0f)
+#define MOTION_CAL_X_POS_TO_THETA  (-0.0f)
+#define MOTION_CAL_X_NEG_TO_THETA  (-0.0602f)
 /*
  * 把本文件真正接入 MecanumConfig。
  * 方向数组预留到 ID6，未使用位置保持 0。

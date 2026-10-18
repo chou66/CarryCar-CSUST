@@ -27,8 +27,9 @@ typedef struct
 
     /* 固定功能区的标准作业属性。
      * task_yaw_deg 使用世界坐标航向：0=上，+90=右，-90=左，180=下。
-     * 注意：仅当该节点是 Mission 当前真正目标时才执行此航向；
-     * Dijkstra 中途经过节点时绝不自动转向。
+     * 注意：仅当该节点是 Mission 当前真正目标时才执行此作业航向。
+     * 普通行驶航向不存放在节点中，而由 edge_turn 根据当前拓扑边的
+     * from/to 坐标实时计算；普通节点因此无需配置航向参数。
      */
     uint8_t task_id;
     uint8_t task_yaw_valid;

@@ -32,3 +32,12 @@ MDK-ARM/build_*.log
 
 # 本机构建日志(2026-10-13 排除)
 *.log
+
+# Codex/local verification workspaces
+.codex_build/
+
+# Root Keil build output
+/27_carrycar/
+
+# Keil-generated RTE files inside bundled CMSIS examples
+Drivers/CMSIS/DSP/Examples/**/RTE/

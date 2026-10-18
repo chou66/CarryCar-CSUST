@@ -30,7 +30,8 @@
    170 MHz / 17 / (1+15+4) = 500 kbit/s。
 2. main 中补上 fdcan2_UserInit()，真正配置 filter/start/interrupt。
 3. FDCAN PB12/PB13 GPIO speed 改为 VERY_HIGH。
-4. 当前为链路验证临时将串口屏切到 USART2：PA3 RX / PA2 TX；HMI 应用层统一使用 huart2。
+4. 串口屏已从 USART2 迁到 USART3：PE15 RX / PB10 TX；HMI 应用层统一使用 huart3。
+   （此前"链路验证临时切到 USART2"那一步已经作废，USART2 与应用层解耦，空闲可留给扫码模块。）
 5. 新增 UART4 PC10/PC11、UART5 PC12/PD2。
 6. 舵机从旧 TIM4/PD12~15 改为 PCB：
    PB4 TIM3_CH1 抓夹、PE3 TIM3_CH2 圆盘。

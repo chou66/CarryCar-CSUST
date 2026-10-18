@@ -37,7 +37,7 @@ HMI_ModeState_t g_hmi_mode;
 // 10.7.3 HMI协议层诊断
 //
 // 与 g_hmi_map 分开：
-// - app_uart.c 的 hmi_usart2_* 判断“PA3 / USART2是否收到原始字节”；
+// - app_uart.c 的 hmi_usart3_* 判断“PE15 / USART3是否收到原始字节”；
 // - 这里的 hmi_proto_* 判断“原始字节是否组成了合法协议帧”。
 //====================================================
 

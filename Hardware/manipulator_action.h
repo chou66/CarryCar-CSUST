@@ -82,8 +82,8 @@ typedef enum
  * 机械臂“外部目标位姿”：一次动作在外部端（取料点或放置点）的参数。
  * 上层按区域填表，引擎按此参数执行，不再依赖硬编码距离。
  *
- *   carousel_us     —— 夹爪旋转舵机目标脉宽（外部取料/放置方向），
- *                      直接来自 robot_config.h 的 CAROUSEL_*_US 标定宏
+ *   carousel_deg    —— 夹爪旋转舵机目标角度（外部取料/放置方向），
+ *                      直接来自 robot_config.h 的 CAROUSEL_*_DEG 标定宏
  *   slide_extend_mm —— 电机6 前伸距离，正数=前伸
  *   gimbal_drop_mm  —— 电机5 下降深度，负数=下降
  *   layer           —— 叠放层号：0=第一层（不叠放），1=叠到第一层上；
@@ -93,7 +93,7 @@ typedef enum
  */
 typedef struct
 {
-    uint16_t carousel_us;
+    float    carousel_deg;
     float    slide_extend_mm;
     float    gimbal_drop_mm;
     uint8_t  layer;
@@ -183,6 +183,30 @@ typedef enum
 } ManipulatorActionState_t;
 
 /*
+ * 视觉预置/点动子状态机：视觉识别前后各一段机械预置动作。
+ *
+ *   MANIP_JOG_IDLE   未在动作
+ *   MANIP_JOG_ROTATE 先转云台：夹爪转到识别姿态并张开，等舵机到位
+ *   MANIP_JOG_MOVE   滑台指令已发出（等下一个 Update 切进 WAIT）
+ *   MANIP_JOG_WAIT   等滑台到位
+ *   MANIP_JOG_DONE   到位
+ *   MANIP_JOG_ERROR  发送失败 / 超时 / 堵转保护
+ *
+ * 只有「伸到识别位」那一段会先走 ROTATE（云台先转、滑台后伸）；
+ * 「退回原点」不动云台，直接从 MOVE 开始。
+ */
+typedef enum
+{
+    MANIP_JOG_IDLE = 0,
+    MANIP_JOG_MOVE,
+    MANIP_JOG_WAIT,
+    MANIP_JOG_DONE,
+    MANIP_JOG_ERROR,
+    /* 追加在末尾，保持前面所有枚举值不变。 */
+    MANIP_JOG_ROTATE
+} ManipulatorSlideJogState_t;
+
+/*
  * 夹取失败现场记录，全局可见，Keil Watch 直接观察。
  *   manip_debug_fail_state  = 失败时刻的 action_state；
  *   manip_debug_fail_reason = MANIP_FAIL_xxx；
@@ -258,6 +282,74 @@ bool ManipulatorAction_StartTrayToGroundAtPose(const ManipPose_t *place_pose);
 
 void ManipulatorAction_Update(uint32_t now_ms);
 void ManipulatorAction_Abort(void);
+
+/*
+ * 视觉预置、位置点动与回退：给视觉识别腾出取像位姿与取像距离。
+ *
+ * 相机装在夹爪上，识别统一在取料位2(POS2)姿态下做，所以识别之前要先把
+ * 两件事按顺序做完（顺序不能换）：
+ *   1) 云台先转——夹爪转到识别姿态 POS2 并张开。夹爪在缩回状态下回转，
+ *      比在伸出 95mm 后再转更不容易和外围干涉。
+ *   2) 滑台后伸——通用识别伸到 POS2 的伸出量；原料区停靠后使用
+ *      RAW_VISION_SLIDE_START_MM（已扣除底盘靠近量），
+ *      让取像距离与识别姿态自洽。
+ * 两件都就位后才由上层发 detect/place（见 K230Align_StartPreset）。
+ * 识别结束后再按同一值退回机械原点，让夹取动作组仍从原点出发——动作
+ * 引擎里「伸出=发绝对目标值、回程=发负值」的假设因此一个字都不用改。
+ *
+ * 模块会在每次电机到位确认后记录滑台绝对位置。原料视觉位置环可反复调用
+ * SlideJogToPositionStart(target_mm)；它把绝对目标换算成相对位移。中途失败
+ * 或急停后位置会标成未知，拒绝继续累计，必须人工回零并重新上电/立基准。
+ *
+ * 用法与主动作相同：Start 一次，主循环持续调用 ManipulatorAction_Update()。
+ * 启动条件不满足时返回 false 且不改变任何状态：
+ *   SlideJogToAlignStart —— 暂存区通用识别预置
+ *   SlideJogToRoughAlignStart —— 粗加工区2号参考环预置，使用实车标定的
+ *                                ROUGH_SLIDE_POS2_MM
+ *   SlideJogToStorageAlignStart —— 暂存区2号参考环预置，使用独立的
+ *                                  STORAGE_SLIDE_POS2_MM
+ *   SlideJogToRawAlignStart —— 原料停靠后的补偿预伸
+ *   SlideJogToPositionStart —— 当前位置可信，走到新的绝对目标
+ *   SlideJogHomeStart       —— 从当前可信的非零位置回原点
+ *
+ * 名字里的 "Jog" 是沿用旧的滑台点动叫法：这两个入口都以「滑台挪一段」
+ * 为目的，ToAlignStart 额外承担了上面第 1 步的云台预转。
+ *
+ * 到位后由本模块调用 Manipulator_Slide_SetAlign()/SetHome() 更新基准；
+ * 预置/点动失败会 Manipulator_StopAll()，位置基准随之作废（须人工归零）。
+ * 主动作与本状态机互斥：预置进行中 start 主动作会返回 false，反之亦然。
+ */
+bool ManipulatorAction_SlideJogToAlignStart(void);
+bool ManipulatorAction_SlideJogToRoughAlignStart(void);
+bool ManipulatorAction_SlideJogToStorageAlignStart(void);
+bool ManipulatorAction_SlideJogToRawAlignStart(void);
+bool ManipulatorAction_SlideJogToPositionStart(float target_mm);
+bool ManipulatorAction_SlideJogHomeStart(void);
+
+/*
+ * 人工确认滑台已在机械原点后，重建 0 mm 软件坐标。
+ * 本函数绝不会主动回零；滑台不在机械原点时禁止调用，否则后续绝对距离会
+ * 整体偏移。主要供带确认口令的 VOFA 标定状态机使用。
+ */
+bool ManipulatorAction_SlideJogRebaseHome(void);
+
+float ManipulatorAction_SlideJogGetPositionMm(void);
+bool ManipulatorAction_SlideJogPositionKnown(void);
+
+bool ManipulatorAction_SlideJogIsBusy(void);
+bool ManipulatorAction_SlideJogIsDone(void);
+bool ManipulatorAction_SlideJogHasError(void);
+
+/*
+ * 点动状态镜像（非 static 全局，Keil Watch 直接输名字即可）：
+ *   robot_manip_jog_state       ManipulatorSlideJogState_t 当前值
+ *                               （=5 是 MANIP_JOG_ROTATE，即云台预转中）
+ *   manip_debug_jog_fail_reason 点动失败原因（MANIP_FAIL_xxx），成功/Init 清零
+ */
+extern volatile uint8_t robot_manip_jog_state;
+extern volatile uint8_t manip_debug_jog_fail_reason;
+extern volatile float robot_manip_slide_position_mm;
+extern volatile uint8_t robot_manip_slide_position_valid;
 
 bool ManipulatorAction_IsBusy(void);
 bool ManipulatorAction_IsDone(void);

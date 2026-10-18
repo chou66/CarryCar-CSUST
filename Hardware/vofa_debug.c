@@ -13,6 +13,9 @@
 #include "robot_config.h"
 #include "robot_app.h"
 #include "k230.h"
+#include "manipulator_action.h"
+#include "rough_calibration.h"
+#include "storage_calibration.h"
 
 #define RX_LEN 7U
 #define MANIP_TEST_RPM 3000U
@@ -513,6 +516,13 @@ void VofaDebug_Init(void)
     chassis_config_init_mecanum(&cfg);
     chassis_init(&s_debug_chassis, &cfg);
     s_debug_chassis.acceleration = VOFA_FORMAL_MOVE_ACC;
+
+    /*
+     * 粗加工/暂存区标定共享这一个VOFA底盘对象，但各自复用正式EdgeMotion。
+     * 这里只绑定对象，不会在上电时产生任何底盘或机械臂动作。
+     */
+    RoughCalibration_Init(&s_debug_chassis);
+    StorageCalibration_Init(&s_debug_chassis);
 }
 
 void VofaDebug_FeedByte(uint8_t b)
@@ -555,6 +565,7 @@ static uint8_t vofa_cmd_needs_manual_override(uint8_t cmd)
     if (cmd == 0x01U) return 1U;
     if (cmd >= 0x10U && cmd <= 0x23U) return 1U;
     if (cmd >= 0x30U && cmd <= 0x60U) return 1U;
+    if (cmd >= 0x80U && cmd <= 0x88U) return 1U;
     return 0U;
 }
 
@@ -586,6 +597,28 @@ static void process_cmd(void)
         return;
     }
 
+    /*
+     * 任一工位标定启动后，底盘/云台/滑台都归标定状态机独占。只放行：
+     *   0x01       全局急停；
+     *   0x72/0x73  K230观察命令（暂存流程到N4前均禁止，避免干扰自动对准）；
+     *   0x74       切换遥测页；
+     *   0x81~0x86  标定状态机自己的控制命令。
+     *   0x88       仅暂存区N4手动调参态可用的二号环底盘位置锁定。
+     * 这样可避免旧的直接电机命令和状态机同时向同一执行器下发动作。
+     */
+    if ((RoughCalibration_IsActive() || StorageCalibration_IsActive()) &&
+        c != 0x01U &&
+        c != 0x74U &&
+        !((c == 0x72U || c == 0x73U) &&
+          (RoughCalibration_IsActive() ||
+           StorageCalibration_AllowsManualVision())) &&
+        !(c == 0x88U && StorageCalibration_AllowsManualVision()) &&
+        (c < 0x81U || c > 0x86U))
+    {
+        last_result = 17U;
+        return;
+    }
+
     /* Reject actuator commands until the user explicitly takes control. */
     if (vofa_cmd_needs_manual_override(c))
     {
@@ -605,6 +638,8 @@ static void process_cmd(void)
 
     switch (c) {
     case 0x01U:
+        RoughCalibration_Abort();
+        StorageCalibration_Abort();
         chassis_motion_stop(&s_debug_chassis);
         formal_motion_active = 0U;
         debug_nav_abort();
@@ -752,7 +787,7 @@ static void process_cmd(void)
         break;
 
 
-    case 0x40U: /* formal forward 450 mm */
+    case 0x40U: /* formal forward by VOFA_FORMAL_DISTANCE_M */
         if (chassis_motion_busy(&s_debug_chassis) || debug_nav_is_running()) {
             last_result = 2U;
             break;
@@ -765,7 +800,7 @@ static void process_cmd(void)
         formal_motion_active = 1U;
         break;
 
-    case 0x41U: /* formal backward 450 mm */
+    case 0x41U: /* formal backward by VOFA_FORMAL_DISTANCE_M */
         if (chassis_motion_busy(&s_debug_chassis) || debug_nav_is_running()) {
             last_result = 2U;
             break;
@@ -778,7 +813,7 @@ static void process_cmd(void)
         formal_motion_active = 1U;
         break;
 
-    case 0x42U: /* formal strafe left 450 mm */
+    case 0x42U: /* formal strafe left by VOFA_FORMAL_DISTANCE_M */
         if (chassis_motion_busy(&s_debug_chassis) || debug_nav_is_running()) {
             last_result = 2U;
             break;
@@ -791,7 +826,7 @@ static void process_cmd(void)
         formal_motion_active = 1U;
         break;
 
-    case 0x43U: /* formal strafe right 450 mm */
+    case 0x43U: /* formal strafe right by VOFA_FORMAL_DISTANCE_M */
         if (chassis_motion_busy(&s_debug_chassis) || debug_nav_is_running()) {
             last_result = 2U;
             break;
@@ -945,13 +980,127 @@ static void process_cmd(void)
 				}
 				break;
 
-        case 0x74U: /* Select telemetry: P1=1 K230, P1=0 normal. */
-            if (p1 > 1U)
+        case 0x74U: /* 0=常规，1=K230，2=粗加工标定，3=暂存区标定。 */
+            if (p1 > 3U)
             {
                 last_result = 2U;
                 break;
             }
             k230_telemetry_enable = p1;
+            break;
+
+        case 0x80U: /* 粗加工标定：P1=节点1..9，A1/A2=对应启停区，自动到 N2。 */
+            if (formal_motion_active ||
+                debug_nav_is_running() ||
+                debug_edge_active ||
+                chassis_motion_busy(&s_debug_chassis))
+            {
+                last_result = 2U;
+                break;
+            }
+
+            if (!RoughCalibration_Start(p1, HAL_GetTick()))
+                last_result = 18U;
+            break;
+
+        case 0x81U: /* 人工已把滑台缩到机械原点；P1 必须为确认口令 0xA5。 */
+            if (!RoughCalibration_IsActive() ||
+                !RoughCalibration_ConfirmSlideHome(p1))
+                last_result = 18U;
+            break;
+
+        case 0x82U: /* 选择当前标定区的1/2/3号圆环，在0 mm安全位转云台。 */
+            if (StorageCalibration_IsActive())
+            {
+                if (!StorageCalibration_SelectRing(p1, HAL_GetTick()))
+                    last_result = 18U;
+            }
+            else if (!RoughCalibration_IsActive() ||
+                     !RoughCalibration_SelectRing(p1, HAL_GetTick()))
+            {
+                last_result = 18U;
+            }
+            break;
+
+        case 0x83U: /* 滑台绝对位置：P1:P2 为 0.1 mm，例 1250 => 125.0 mm。 */
+            {
+                uint16_t target_deci_mm =
+                    (uint16_t)(((uint16_t)p1 << 8) | p2);
+
+                if (StorageCalibration_IsActive())
+                {
+                    if (!StorageCalibration_MoveSlideDeciMm(target_deci_mm))
+                        last_result = 18U;
+                }
+                else if (!RoughCalibration_IsActive() ||
+                         !RoughCalibration_MoveSlideDeciMm(target_deci_mm))
+                {
+                    last_result = 18U;
+                }
+            }
+            break;
+
+        case 0x84U: /* 从当前可信位置退回滑台软件原点 0 mm。 */
+            if (StorageCalibration_IsActive())
+            {
+                if (!StorageCalibration_RetractSlide())
+                    last_result = 18U;
+            }
+            else if (!RoughCalibration_IsActive() ||
+                     !RoughCalibration_RetractSlide())
+            {
+                last_result = 18U;
+            }
+            break;
+
+        case 0x85U: /* 终止当前工位标定；下次必须重新确认机械原点。 */
+            if (StorageCalibration_IsActive())
+                StorageCalibration_Abort();
+            else
+                RoughCalibration_Abort();
+            break;
+
+        case 0x86U: /* 当前标定区云台绝对角：P1:P2为0.1 deg。 */
+            {
+                uint16_t target_deci_deg =
+                    (uint16_t)(((uint16_t)p1 << 8) | p2);
+
+                if (StorageCalibration_IsActive())
+                {
+                    if (!StorageCalibration_MoveCarouselDeciDeg(target_deci_deg,
+                                                                 HAL_GetTick()))
+                        last_result = 18U;
+                }
+                else if (!RoughCalibration_IsActive() ||
+                         !RoughCalibration_MoveCarouselDeciDeg(target_deci_deg,
+                                                               HAL_GetTick()))
+                {
+                    last_result = 18U;
+                }
+            }
+            break;
+
+        case 0x87U: /* 暂存区标定全流程；P1=A5确认齿条已在机械原点。 */
+            if (formal_motion_active ||
+                debug_nav_is_running() ||
+                debug_edge_active ||
+                RoughCalibration_IsActive() ||
+                chassis_motion_busy(&s_debug_chassis))
+            {
+                last_result = 2U;
+                break;
+            }
+
+            if (!StorageCalibration_StartFromBay2(p1, HAL_GetTick()))
+                last_result = 18U;
+            break;
+
+        case 0x88U: /* N4二号环：保持当前机械位姿，K230平移底盘并复核180°。 */
+            if (!StorageCalibration_IsActive() ||
+                !StorageCalibration_StartStorageVisionAlign(HAL_GetTick()))
+            {
+                last_result = 18U;
+            }
             break;
 
     default:
@@ -969,7 +1118,7 @@ static void send_telemetry(uint32_t now_ms)
 
     imu = AppUart_GetImu();
 
-    if (k230_telemetry_enable)
+    if (k230_telemetry_enable == 1U)
     {
         txp.p.ch[0] = (float)g_k230_status.color_id;
         txp.p.ch[1] = (float)k230_direction_code(g_k230_status.direction);
@@ -979,6 +1128,52 @@ static void send_telemetry(uint32_t now_ms)
         txp.p.ch[5] = (float)k230_rx_byte_count;
         txp.p.ch[6] = (float)k230_valid_line_count;
         txp.p.ch[7] = (float)k230_invalid_line_count;
+    }
+    else if (k230_telemetry_enable == 2U)
+    {
+        /*
+         * 粗加工标定页：前 8 路集中显示“车到哪、朝向多少、滑台到哪”。
+         * ch4=-1 表示滑台软件位置已失效，必须人工回机械原点后发 0x81。
+         */
+        txp.p.ch[0] = (float)RoughCalibration_GetState();
+        txp.p.ch[1] = (float)RoughCalibration_GetError();
+        txp.p.ch[2] = (float)RoughCalibration_GetCurrentNode();
+        txp.p.ch[3] = rough_cal_world_yaw_deg;
+        txp.p.ch[4] = ManipulatorAction_SlideJogPositionKnown() ?
+                      ManipulatorAction_SlideJogGetPositionMm() : -1.0f;
+        txp.p.ch[5] = RoughCalibration_GetSlideTargetMm();
+        /* 任意角标定后操作者必须能直接读回目标角；当前圆环号仍可在
+         * rough_cal_selected_ring / Keil Watch 中查看。 */
+        txp.p.ch[6] = RoughCalibration_GetCarouselTargetDeg();
+        /*
+         * 标定齿条长度只关心 K230 的 w/s 径向轴：w 记正、s 记负。
+         * 不再使用“最后一行 offset”，否则 K230 两轴报文的 a/d 行可能覆盖
+         * w/s，操作者会误把云台切向误差当成齿条距离误差。
+         */
+        txp.p.ch[7] = (g_k230_status.axis_x_dir == 'w') ?
+                      (float)g_k230_status.axis_x_px :
+                      ((g_k230_status.axis_x_dir == 's') ?
+                       -(float)g_k230_status.axis_x_px : 0.0f);
+    }
+    else if (k230_telemetry_enable == 3U)
+    {
+        /*
+         * 暂存区标定页与粗加工页保持相同通道含义，方便直接复用VOFA曲线：
+         * ch0状态，ch1错误，ch2节点，ch3世界航向，ch4实际齿条位置，
+         * ch5目标齿条，ch6目标云台角，ch7 K230径向偏差(w正/s负)。
+         */
+        txp.p.ch[0] = (float)StorageCalibration_GetState();
+        txp.p.ch[1] = (float)StorageCalibration_GetError();
+        txp.p.ch[2] = (float)StorageCalibration_GetCurrentNode();
+        txp.p.ch[3] = storage_cal_world_yaw_deg;
+        txp.p.ch[4] = ManipulatorAction_SlideJogPositionKnown() ?
+                      ManipulatorAction_SlideJogGetPositionMm() : -1.0f;
+        txp.p.ch[5] = StorageCalibration_GetSlideTargetMm();
+        txp.p.ch[6] = StorageCalibration_GetCarouselTargetDeg();
+        txp.p.ch[7] = (g_k230_status.axis_x_dir == 'w') ?
+                      (float)g_k230_status.axis_x_px :
+                      ((g_k230_status.axis_x_dir == 's') ?
+                       -(float)g_k230_status.axis_x_px : 0.0f);
     }
     else
     {
@@ -1002,6 +1197,10 @@ void VofaDebug_Update(uint32_t now_ms)
 {
     process_cmd();
 
+    /* 标定状态机先生成本周期的新指令，下面统一调用一次chassis_update()。 */
+    RoughCalibration_Update(now_ms);
+    StorageCalibration_Update(now_ms);
+
     /*
      * Required by the non-blocking chassis state machine.
      * Keep calling this every main-loop iteration.
@@ -1019,7 +1218,8 @@ void VofaDebug_Update(uint32_t now_ms)
         }
     }
 
-    debug_navigation_update(now_ms);
+    if (!RoughCalibration_IsActive() && !StorageCalibration_IsActive())
+        debug_navigation_update(now_ms);
 
     send_telemetry(now_ms);
 }

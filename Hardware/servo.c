@@ -9,9 +9,34 @@ static uint16_t clamp_us(uint16_t us)
     return us;
 }
 
-#define CAROUSEL_STEP_PERIOD_MS     20U  //¶à¾Ã¸Ä±äÒ»´ÎÂö¿í
-#define CAROUSEL_STEP_US            10U  //Ã¿´Î¸Ä±ä¶àÉÙÂö¿í
-#define CAROUSEL_SETTLE_MS          150U //Êä³öµ½´ïÄ¿±êºóµÄÎÈ¶¨Ê±¼ä
+uint16_t Servo_AngleToUs(float angle_deg, float travel_deg)
+{
+    float pulse_us;
+
+    if (travel_deg <= 0.0f)
+    {
+        return SERVO_CENTER_US;
+    }
+
+    if (angle_deg < 0.0f)
+    {
+        angle_deg = 0.0f;
+    }
+    else if (angle_deg > travel_deg)
+    {
+        angle_deg = travel_deg;
+    }
+
+    pulse_us = (float)SERVO_MIN_US +
+               (angle_deg / travel_deg) *
+               (float)(SERVO_MAX_US - SERVO_MIN_US);
+
+    return clamp_us((uint16_t)(pulse_us + 0.5f));
+}
+
+#define CAROUSEL_STEP_PERIOD_MS     20U  //å¤šä¹…æ”¹å˜ä¸€æ¬¡è„‰å®½
+#define CAROUSEL_STEP_US            10U  //æ¯æ¬¡æ”¹å˜å¤šå°‘è„‰å®½
+#define CAROUSEL_SETTLE_MS          150U //è¾“å‡ºåˆ°è¾¾ç›®æ ‡åçš„ç¨³å®šæ—¶é—´
 
 #define GRIPPER_STEP_PERIOD_MS      20U
 #define GRIPPER_STEP_US             15U
@@ -33,24 +58,27 @@ typedef enum
     GRIPPER_STATE_DONE
 } GripperServoState_t;
 
-static uint16_t carousel_current_us = SERVO_SAFE_US;
-static uint16_t carousel_target_us = SERVO_SAFE_US;
+static uint16_t carousel_current_us = SERVO_CENTER_US;
+static uint16_t carousel_target_us = SERVO_CENTER_US;
 static uint32_t carousel_last_step_ms = 0U;
 static uint32_t carousel_settle_start_ms = 0U;
 static CarouselServoState_t carousel_state =CAROUSEL_STATE_IDLE;
 
-static uint16_t gripper_current_us =SERVO_SAFE_US;
-static uint16_t gripper_target_us =SERVO_SAFE_US;
+static uint16_t gripper_current_us = SERVO_CENTER_US;
+static uint16_t gripper_target_us = SERVO_CENTER_US;
 static uint32_t gripper_last_step_ms = 0U;
 static uint32_t gripper_settle_start_ms = 0U;
 static GripperServoState_t gripper_state =GRIPPER_STATE_IDLE;
 
 void Servo_Init(void)
 {
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, SERVO_SAFE_US);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, SERVO_SAFE_US);
-	  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, SERVO_SAFE_US);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, SERVO_SAFE_US);
+    uint16_t carousel_poweron_us =
+        Servo_AngleToUs(CAROUSEL_POWERON_DEG, CAROUSEL_TRAVEL_DEG);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, SERVO_CENTER_US);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, carousel_poweron_us);
+	  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, SERVO_CENTER_US);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, SERVO_CENTER_US);
 	
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
@@ -58,31 +86,31 @@ void Servo_Init(void)
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
 	
 	
-		carousel_current_us = SERVO_SAFE_US;
-		carousel_target_us = SERVO_SAFE_US;
+		carousel_current_us = carousel_poweron_us;
+		carousel_target_us = carousel_poweron_us;
 		carousel_last_step_ms = HAL_GetTick();
 		carousel_settle_start_ms = 0U;
 		carousel_state = CAROUSEL_STATE_IDLE;
 	
-		gripper_current_us = SERVO_SAFE_US;
-		gripper_target_us = SERVO_SAFE_US;
+		gripper_current_us = SERVO_CENTER_US;
+		gripper_target_us = SERVO_CENTER_US;
 		gripper_last_step_ms = HAL_GetTick();
 		gripper_settle_start_ms = 0U;
 		gripper_state = GRIPPER_STATE_IDLE;
 
 }
 
-/*Pwm1Servo_SetUs()       ¡ú TIM3_CH1 ¡ú °åÔØPWM1
-CarouselServo_SetUs()     ¡ú TIM3_CH2 ¡ú °åÔØPWM2
-TraySelectorServo_SetUs() ¡ú TIM3_CH4 ¡ú °åÔØPWM3
-GripperServo_SetUs()      ¡ú TIM3_CH3 ¡ú °åÔØPWM4*/
+/*Pwm1Servo_SetUs()       â†’ TIM3_CH1 â†’ æ¿è½½PWM1
+CarouselServo_SetUs()     â†’ TIM3_CH2 â†’ æ¿è½½PWM2
+TraySelectorServo_SetUs() â†’ TIM3_CH4 â†’ æ¿è½½PWM3
+GripperServo_SetUs()      â†’ TIM3_CH3 â†’ æ¿è½½PWM4*/
 
 void Pwm1Servo_SetUs(uint16_t us)
 {
     __HAL_TIM_SET_COMPARE(&htim3,TIM_CHANNEL_1,clamp_us(us));
 }
 
-/*¼Ğ×¦¿ªºÏ*/
+/*å¤¹çˆªå¼€åˆ*/
 void GripperServo_SetUs(uint16_t us)
 {
     gripper_target_us = clamp_us(us);
@@ -103,10 +131,17 @@ void GripperServo_SetUs(uint16_t us)
             GRIPPER_STATE_MOVING;
     }
 }
-void GripperServo_Open_Small(void)  { GripperServo_SetUs(GRIPPER_OPEN_US_Small); }
-void GripperServo_Open_Large(void)  { GripperServo_SetUs(GRIPPER_OPEN_US_Large); }
-void GripperServo_Close(void) { GripperServo_SetUs(GRIPPER_CLOSE_US); }
-void GripperServo_Mid(void)   { GripperServo_SetUs(GRIPPER_MID_US); }
+
+void GripperServo_SetAngle(float angle_deg)
+{
+    GripperServo_SetUs(
+        Servo_AngleToUs(angle_deg, GRIPPER_TRAVEL_DEG));
+}
+
+void GripperServo_Open_Small(void) { GripperServo_SetAngle(GRIPPER_OPEN_SMALL_DEG); }
+void GripperServo_Open_Large(void) { GripperServo_SetAngle(GRIPPER_OPEN_LARGE_DEG); }
+void GripperServo_Close(void)      { GripperServo_SetAngle(GRIPPER_CLOSE_DEG); }
+void GripperServo_Mid(void)        { GripperServo_SetAngle(GRIPPER_MID_DEG); }
 
 void GripperServo_Update(uint32_t now_ms)
 {
@@ -222,19 +257,25 @@ bool GripperServo_IsDone(void)
          GRIPPER_STATE_DONE);
 }
 
-/*ÎïÁÏÑ¡Ôñ*/
+/*ç‰©æ–™é€‰æ‹©*/
 void TraySelectorServo_SetUs(uint16_t us)
 {
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, clamp_us(us));
 }
 
+void TraySelectorServo_SetAngle(float angle_deg)
+{
+    TraySelectorServo_SetUs(
+        Servo_AngleToUs(angle_deg, TRAY_SELECTOR_TRAVEL_DEG));
+}
+
 void TraySelectorServo_GotoSlot(uint8_t slot)
 {
-    static const uint16_t slot_us[TRAY_SELECTOR_SLOT_COUNT] =
+    static const float slot_deg[TRAY_SELECTOR_SLOT_COUNT] =
     {
-        TRAY_SELECTOR_SLOT0_US,
-        TRAY_SELECTOR_SLOT1_US,
-        TRAY_SELECTOR_SLOT2_US
+        TRAY_SELECTOR_SLOT0_DEG,
+        TRAY_SELECTOR_SLOT1_DEG,
+        TRAY_SELECTOR_SLOT2_DEG
     };
 
     if (slot >= TRAY_SELECTOR_SLOT_COUNT)
@@ -242,10 +283,10 @@ void TraySelectorServo_GotoSlot(uint8_t slot)
         return;
     }
 
-    TraySelectorServo_SetUs(slot_us[slot]);
+    TraySelectorServo_SetAngle(slot_deg[slot]);
 }
 
-/*¼Ğ×¦Ğı×ª*/
+/*å¤¹çˆªæ—‹è½¬*/
 void CarouselServo_SetUs(uint16_t us)
 {
     carousel_target_us = clamp_us(us);
@@ -260,6 +301,12 @@ void CarouselServo_SetUs(uint16_t us)
     {
         carousel_state = CAROUSEL_STATE_MOVING;
     }
+}
+
+void CarouselServo_SetAngle(float angle_deg)
+{
+    CarouselServo_SetUs(
+        Servo_AngleToUs(angle_deg, CAROUSEL_TRAVEL_DEG));
 }
 
 void CarouselServo_Update(uint32_t now_ms)
@@ -355,29 +402,29 @@ bool CarouselServo_IsDone(void)
 }
 
 
-//Èı¸ö¹Ì¶¨Î»ÖÃ(¼ĞÈ¡Î»¡¢·ÅÖÃÎ»¡¢»ØÖĞÎ»£©
+//ä¸‰ä¸ªå›ºå®šä½ç½®(å¤¹å–ä½ã€æ”¾ç½®ä½ã€å›ä¸­ä½ï¼‰
 void CarouselServo_ToPickupPos1(void)
 {
-    CarouselServo_SetUs(CAROUSEL_PICKUP_POS1_US);
+    CarouselServo_SetAngle(CAROUSEL_PICKUP_POS1_DEG);
 }
 
 void CarouselServo_ToPickup(void)
 {
-    CarouselServo_SetUs(CAROUSEL_PICKUP_POS2_US);
+    CarouselServo_SetAngle(CAROUSEL_PICKUP_POS2_DEG);
 }
 
 void CarouselServo_ToPickupPos3(void)
 {
-    CarouselServo_SetUs(CAROUSEL_PICKUP_POS3_US);
+    CarouselServo_SetAngle(CAROUSEL_PICKUP_POS3_DEG);
 }
 
 void CarouselServo_ToPlace(void)
 {
-    CarouselServo_SetUs(CAROUSEL_PLACE_US);
+    CarouselServo_SetAngle(CAROUSEL_PLACE_DEG);
 }
 
 void CarouselServo_ToMid(void)
 {
-    CarouselServo_SetUs(CAROUSEL_MID_US);
+    CarouselServo_SetAngle(CAROUSEL_MID_DEG);
 }
 

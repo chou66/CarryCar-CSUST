@@ -17,9 +17,9 @@ MapNode_t g_nodes[NODE_NUM + 1] =
     {0.35f, 1.20f, MAP_TASK_STORAGE, 1U, 180.0f},  /* N4 暂存区：车头向下，右侧机械臂朝左 */
     {1.20f, 1.20f, MAP_TASK_NONE,    0U,   0.0f},  /* N5 */
     {2.10f, 1.20f, MAP_TASK_QR,      1U,   0.0f},  /* N6 扫码区：暂定车头向上 */
-    {0.35f, 2.25f, MAP_TASK_NONE,    0U,   0.0f},  /* N7 */
-    {1.20f, 2.00f, MAP_TASK_RAW,     1U, -90.0f},  /* N8 原料区：车头向左，右侧机械臂朝上 */
-    {2.10f, 2.00f, MAP_TASK_NONE,    0U,   0.0f}   /* N9 右上车道交点 */
+    {0.35f, 2.10f, MAP_TASK_NONE,    0U,   0.0f},  /* N7 */
+    {1.20f, 2.10f, MAP_TASK_RAW,     1U, -90.0f},  /* N8 原料区：车头向左，右侧机械臂朝上 */
+    {2.10f, 2.10f, MAP_TASK_NONE,    0U,   0.0f}   /* N9 右上车道交点 */
 };
 
 uint8_t MapGraph_GetParkingPose(uint8_t corner_node, float *x, float *y)
@@ -128,10 +128,12 @@ void MapGraph_Build(uint32_t obstacle_mask)
     //------------------------------------------------
     // 2. 先建立完整拓扑
     //
-    // 边代价 = 对应两个车道交点之间的距离（mm）：
+    // 边代价 = 对应两个车道交点之间的欧氏距离（mm），直接由 g_nodes 坐标推算。
+    // 改 g_nodes 的 x/y 之后必须回来重算这里，两处不会自动同步。
+    // 当前间距：0.35->1.20 为 850，1.20->2.10 为 900。
     //   1-2 850    2-3 900     4-5 850    5-6 900
-    //   7-8 886    8-9 900     1-4 850    4-7 1050
-    //   2-5 850    5-8 800     3-6 850    6-9 800
+    //   7-8 850    8-9 900     1-4 850    4-7 900
+    //   2-5 850    5-8 900     3-6 850    6-9 900
     //------------------------------------------------
 
     // 水平边
@@ -141,18 +143,18 @@ void MapGraph_Build(uint32_t obstacle_mask)
     MapGraph_AddEdge(4, 5, 850);
     MapGraph_AddEdge(5, 6, 900);
 
-    MapGraph_AddEdge(7, 8, 886);
+    MapGraph_AddEdge(7, 8, 850);
     MapGraph_AddEdge(8, 9, 900);
 
     // 垂直边
     MapGraph_AddEdge(1, 4, 850);
-    MapGraph_AddEdge(4, 7, 1050);
+    MapGraph_AddEdge(4, 7, 900);
 
     MapGraph_AddEdge(2, 5, 850);
-    MapGraph_AddEdge(5, 8, 800);
+    MapGraph_AddEdge(5, 8, 900);
 
     MapGraph_AddEdge(3, 6, 850);
-    MapGraph_AddEdge(6, 9, 800);
+    MapGraph_AddEdge(6, 9, 900);
 
 
     //------------------------------------------------

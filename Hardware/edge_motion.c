@@ -1,41 +1,44 @@
 #include "edge_motion.h"
 #include "app_uart.h"
 #include "chassis_motion.h"
+#include "edge_turn.h"
 #include "hwt101_uart.h"
-#include "map_graph.h"
 #include "navigation.h"
 #include "robot_config.h"
-#include <math.h>
 
 /*
- * 下列参数直接继承 10.4 VOFA 导航实车调试值。
- * 这次只把“已验证逻辑”迁入正式 EdgeMotion，不趁机重新调参。
- * 后续若实车需要修改，请 VOFA 回归值和正式 EdgeMotion 同步复测。
+ * 平移加速度、死区和稳停时间继承 VOFA 导航实车调试值；
+ * 航向纠偏已升级为独立 PD 控制层，不再使用固定 20 RPM。
  */
-#define EDGE_MOTION_MOVE_ACC                   150U
+#define EDGE_MOTION_MOVE_ACC                   100U
 #define EDGE_MOTION_YAW_DEADBAND_DEG          0.50f
-#define EDGE_MOTION_YAW_MAX_START_DEG         8.00f
-#define EDGE_MOTION_YAW_CORRECT_RPM             20U
+#define EDGE_MOTION_YAW_CORRECT_MAX_RPM         80U
+#define EDGE_MOTION_YAW_CORRECT_MIN_RPM          8U
 #define EDGE_MOTION_YAW_CORRECT_ACC             10U
 #define EDGE_MOTION_YAW_SETTLE_MS              150U
 #define EDGE_MOTION_IMU_TIMEOUT_MS             300U
-#define EDGE_MOTION_YAW_CORRECT_TIMEOUT_MS    1800U
+
+/*
+ * 世界角误差 -> 角速度的 PD 参数。
+ * kp 单位约为 (deg/s)/deg；kd 用世界角速度抑制接近目标时的惯性超调。
+ */
+#define EDGE_MOTION_YAW_KP                     1.80f
+#define EDGE_MOTION_YAW_KD                     0.35f
+
+/* 大角度允许更长纠偏时间，但仍保留失控/机械卡死保护。 */
+#define EDGE_MOTION_YAW_TIMEOUT_BASE_MS       1500U
+#define EDGE_MOTION_YAW_TIMEOUT_PER_DEG_MS      35U
+#define EDGE_MOTION_YAW_TIMEOUT_MAX_MS        9000U
 
 /*
  * Chassis 速度模式带 150 ms 软件看门狗。
- * 航向修正期间每 80 ms 刷新一次速度命令：
+ * 航向修正期间每 40 ms 刷新一次速度命令并重新计算 PD 输出：
  *   - 正常运行时不会触发看门狗；
  *   - 如果 EdgeMotion_Update() 因程序异常停止执行，底盘仍会在约 150 ms 后自行停车。
  */
-#define EDGE_MOTION_YAW_REFRESH_MS               80U
+#define EDGE_MOTION_YAW_REFRESH_MS               40U
 
 #define EDGE_MOTION_TWO_PI_F 6.28318530717958647692f
-#define EDGE_MOTION_DEG_TO_RAD_F 0.01745329251994329577f
-
-static uint8_t node_ok(uint8_t n)
-{
-    return (n >= 1U && n <= NODE_NUM) ? 1U : 0U;
-}
 
 static float edge_absf(float x)
 {
@@ -47,33 +50,6 @@ static int8_t edge_signf(float x)
     if (x > 0.0f) return 1;
     if (x < 0.0f) return -1;
     return 0;
-}
-
-static float edge_wrap_deg(float x)
-{
-    while (x > 180.0f) x -= 360.0f;
-    while (x < -180.0f) x += 360.0f;
-    return x;
-}
-
-/*
- * 世界 -> 车身二维旋转。
- * 世界：+X=右，+Y=上；航向 0=上、顺时针为正。
- * 车身：+X=右，+Y=前。
- *
- * 例：yaw=-90 deg（车头向左）且世界要求向下 (0,-D)，
- * 结果为车身 (-D,0)，即小车左移。
- */
-static void edge_world_to_body(float dx_world, float dy_world,
-                               float world_yaw_deg,
-                               float *dx_body, float *dy_body)
-{
-    float a = world_yaw_deg * EDGE_MOTION_DEG_TO_RAD_F;
-    float c = cosf(a);
-    float sn = sinf(a);
-
-    if (dx_body) *dx_body = dx_world * c - dy_world * sn;
-    if (dy_body) *dy_body = dx_world * sn + dy_world * c;
 }
 
 static void edge_save_acceleration(EdgeMotion_t *em)
@@ -134,9 +110,12 @@ static void edge_clear_runtime(EdgeMotion_t *em)
     em->to_node = 0U;
     em->settle_until_ms = 0U;
     em->yaw_correct_start_ms = 0U;
+    em->yaw_correct_deadline_ms = 0U;
     em->next_yaw_refresh_ms = 0U;
     em->yaw_start_sign = 0;
     em->yaw_velocity_active = 0U;
+    em->yaw_command_wz_radps = 0.0f;
+    em->turn_attempt = 0U;
 }
 
 /*
@@ -151,6 +130,7 @@ static void edge_stop_yaw_velocity(EdgeMotion_t *em)
 
     chassis_motion_stop(em->chassis);
     em->yaw_velocity_active = 0U;
+    em->yaw_command_wz_radps = 0.0f;
 }
 
 /*
@@ -193,37 +173,141 @@ static uint8_t edge_commit(EdgeMotion_t *em)
     return 1U;
 }
 
+static uint32_t edge_yaw_timeout_ms(float yaw_error_deg)
+{
+    uint32_t timeout_ms = EDGE_MOTION_YAW_TIMEOUT_BASE_MS +
+        (uint32_t)(edge_absf(yaw_error_deg) *
+                   (float)EDGE_MOTION_YAW_TIMEOUT_PER_DEG_MS);
+
+    if (timeout_ms > EDGE_MOTION_YAW_TIMEOUT_MAX_MS)
+        timeout_ms = EDGE_MOTION_YAW_TIMEOUT_MAX_MS;
+    return timeout_ms;
+}
+
 /*
- * 启动边末航向修正。
+ * 启动/重新启动边末航向修正。
  *
- * world yaw 采用“顺时针为正”。
- * yaw_error > 0：实车相对边起点向 CW 漂，故命令 CCW（Chassis wz > 0）。
- * yaw_error < 0：实车相对边起点向 CCW 漂，故命令 CW（Chassis wz < 0）。
+ * 不再用固定 RPM。heading_control 根据角度误差和世界角速度生成本周期 wz：
+ * 大误差时最高 80 RPM，接近目标后逐步降到 8 RPM，并用 gyro 项提前制动。
  */
 static uint8_t edge_start_yaw_correction(EdgeMotion_t *em,
-                                         float yaw_error_deg,
+                                         const Hwt101 *imu,
                                          uint32_t now_ms)
 {
-    float wz_mag;
+    float current_yaw_deg;
+    float yaw_error_deg;
+    float world_gyro_dps;
     float wz_cmd;
 
-    if (!em || !em->chassis)
+    if (!em || !em->chassis || !imu)
         return 0U;
 
-    wz_mag = edge_yaw_wz_for_rpm(em->chassis, EDGE_MOTION_YAW_CORRECT_RPM);
-    if (wz_mag <= 0.0f)
+    current_yaw_deg = hwt101_world_yaw_deg(imu);
+    yaw_error_deg = EdgeTurn_WrapDeg(current_yaw_deg -
+                                     em->edge_heading_ref_deg);
+    world_gyro_dps = HWT101_WORLD_YAW_SIGN * imu->gyro_z_dps;
+
+    heading_set_target(&em->yaw_controller, em->edge_heading_ref_deg);
+    wz_cmd = heading_update_world_cw(&em->yaw_controller,
+                                     current_yaw_deg,
+                                     world_gyro_dps,
+                                     (float)EDGE_MOTION_YAW_REFRESH_MS / 1000.0f);
+    if (wz_cmd == 0.0f)
         return 0U;
 
     em->chassis->acceleration = EDGE_MOTION_YAW_CORRECT_ACC;
-
-    wz_cmd = (yaw_error_deg > 0.0f) ? wz_mag : -wz_mag;
     chassis_set_velocity(em->chassis, 0.0f, 0.0f, wz_cmd, now_ms);
 
     em->yaw_start_sign = edge_signf(yaw_error_deg);
-    em->yaw_correct_start_ms = now_ms;
+    if (em->yaw_correct_deadline_ms == 0U)
+    {
+        em->yaw_correct_start_ms = now_ms;
+        em->yaw_correct_deadline_ms =
+            now_ms + edge_yaw_timeout_ms(yaw_error_deg);
+    }
     em->next_yaw_refresh_ms = now_ms + EDGE_MOTION_YAW_REFRESH_MS;
     em->yaw_velocity_active = 1U;
+    em->yaw_command_wz_radps = wz_cmd;
     em->state = EDGE_MOTION_YAW_CORRECTING;
+    return 1U;
+}
+
+/*
+ * 根据 edge_turn 的纯计算结果启动下一动作。
+ *
+ * 需要转向：下发最短位置转角，等待状态机复查 IMU。
+ * 已对准：不再做世界->车身横移换算，固定 dx=0；dy由决策层选择
+ *         +边长（前进）或-边长（后退），从执行层保证整条拓扑边只沿
+ *         车身Y轴行驶，既杜绝大距离横移，也避免不必要的180°转向。
+ */
+static uint8_t edge_apply_turn_plan(EdgeMotion_t *em,
+                                    float current_world_yaw_deg,
+                                    uint32_t now_ms)
+{
+    EdgeTurnPlan_t plan;
+    EdgeTurnOptions_t options;
+    uint8_t navigation_target;
+
+    if (!em || !em->chassis || !em->hmi_nav)
+        return 0U;
+
+    options.allow_reverse = ROUTE_ALLOW_REVERSE;
+    options.reverse_min_turn_saving_deg = ROUTE_REVERSE_MIN_TURN_SAVING_DEG;
+    options.arrival_yaw_valid = 0U;
+    options.arrival_world_yaw_deg = 0.0f;
+
+    /*
+     * 只有to_node恰好是本次导航最终目标时，task_yaw才属于这一次到站动作。
+     * 路径只是经过某个功能节点时不能套用其任务航向，否则会平白多转一次。
+     */
+    navigation_target = Navigation_GetTargetNode(&em->hmi_nav->nav);
+    if (em->to_node == navigation_target &&
+        navigation_target >= 1U && navigation_target <= NODE_NUM &&
+        g_nodes[navigation_target].task_yaw_valid)
+    {
+        options.arrival_yaw_valid = 1U;
+        options.arrival_world_yaw_deg = g_nodes[navigation_target].task_yaw_deg;
+    }
+
+    if (!EdgeTurn_Plan(em->from_node,
+                       em->to_node,
+                       current_world_yaw_deg,
+                       ROUTE_TURN_TOLERANCE_DEG,
+                       &options,
+                       &plan))
+        return 0U;
+
+    em->world_dx_m = plan.world_dx_m;
+    em->world_dy_m = plan.world_dy_m;
+    em->body_dx_m = 0.0f;
+    em->body_dy_m = plan.body_dy_m;
+    em->edge_heading_ref_deg = plan.target_world_yaw_deg;
+    em->turn_world_error_deg = plan.world_yaw_error_deg;
+    em->turn_chassis_command_deg = plan.chassis_turn_deg;
+    em->drive_backward = plan.drive_backward;
+
+    if (plan.turn_required)
+    {
+        if (em->turn_attempt >= ROUTE_TURN_MAX_ATTEMPTS)
+            return 0U;
+
+        em->chassis->acceleration = ROUTE_TURN_ACC;
+        chassis_motion_rotate_deg(em->chassis,
+                                  plan.chassis_turn_deg,
+                                  ROUTE_TURN_SPEED_MPS,
+                                  now_ms);
+        em->turn_attempt++;
+        em->state = EDGE_MOTION_TURNING_TO_EDGE;
+        return 1U;
+    }
+
+    em->chassis->acceleration = EDGE_MOTION_MOVE_ACC;
+    chassis_motion_translate(em->chassis,
+                             0.0f,
+                             plan.body_dy_m,
+                             ROUTE_EDGE_SPEED_MPS,
+                             now_ms);
+    em->state = EDGE_MOTION_TRANSLATING;
     return 1U;
 }
 
@@ -241,7 +325,33 @@ void EdgeMotion_Init(EdgeMotion_t *em, Chassis *chassis, HMI_Navigation_t *hmi_n
     em->body_dx_m = 0.0f;
     em->body_dy_m = 0.0f;
     em->edge_heading_ref_deg = 0.0f;
+    em->turn_world_error_deg = 0.0f;
+    em->turn_chassis_command_deg = 0.0f;
+    em->drive_backward = 0U;
+    em->turn_attempt = 0U;
+    heading_init(&em->yaw_controller,
+                 EDGE_MOTION_YAW_KP,
+                 EDGE_MOTION_YAW_KD,
+                 edge_yaw_wz_for_rpm(chassis,
+                                     EDGE_MOTION_YAW_CORRECT_MAX_RPM),
+                 EDGE_MOTION_YAW_DEADBAND_DEG);
+    heading_set_min_output(&em->yaw_controller,
+                           edge_yaw_wz_for_rpm(chassis,
+                                               EDGE_MOTION_YAW_CORRECT_MIN_RPM));
     edge_clear_runtime(em);
+}
+
+void EdgeMotion_BeginRoute(EdgeMotion_t *em)
+{
+    if (!em)
+        return;
+
+    /* 每条边领取时都会重新计算；这里只清理上一路线的观察值。 */
+    em->edge_heading_ref_deg = 0.0f;
+    em->turn_world_error_deg = 0.0f;
+    em->turn_chassis_command_deg = 0.0f;
+    em->drive_backward = 0U;
+    em->turn_attempt = 0U;
 }
 
 void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
@@ -279,7 +389,39 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
         em->state == EDGE_MOTION_ERROR)
         return;
 
-    /* 1) 正在执行当前拓扑边的平移位置运动。 */
+    /* 1) 正在把车头转到当前拓扑边方向。 */
+    if (em->state == EDGE_MOTION_TURNING_TO_EDGE)
+    {
+        if (chassis_motion_failed(em->chassis))
+        {
+            edge_fail(em);
+            return;
+        }
+
+        if (chassis_motion_done(em->chassis))
+        {
+            em->state = EDGE_MOTION_SETTLE_AFTER_TURN;
+            em->settle_until_ms = now_ms + ROUTE_TURN_SETTLE_MS;
+        }
+        return;
+    }
+
+    /* 2) 转向后稳停并复查；有残差则最多补转 ROUTE_TURN_MAX_ATTEMPTS 次。 */
+    if (em->state == EDGE_MOTION_SETTLE_AFTER_TURN)
+    {
+        if ((int32_t)(now_ms - em->settle_until_ms) < 0)
+            return;
+
+        if (!hwt101_is_fresh(imu, now_ms, EDGE_MOTION_IMU_TIMEOUT_MS) ||
+            !hwt101_world_zero_ready(imu))
+            return;
+
+        if (!edge_apply_turn_plan(em, hwt101_world_yaw_deg(imu), now_ms))
+            edge_fail(em);
+        return;
+    }
+
+    /* 3) 正在执行当前拓扑边的纯纵向位置运动（可能前进，也可能后退）。 */
     if (em->state == EDGE_MOTION_TRANSLATING)
     {
         if (chassis_motion_failed(em->chassis))
@@ -296,7 +438,7 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
         return;
     }
 
-    /* 2) 平移完成后先等车体/IMU 稳定，再读取边末 yaw。 */
+    /* 4) 纵向平移完成后先等车体/IMU稳定，再读取边末yaw。 */
     if (em->state == EDGE_MOTION_SETTLE_AFTER_TRANSLATE)
     {
         if ((int32_t)(now_ms - em->settle_until_ms) < 0)
@@ -309,8 +451,8 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
         if (!hwt101_is_fresh(imu, now_ms, EDGE_MOTION_IMU_TIMEOUT_MS))
             return;
 
-        yaw_error_deg = edge_wrap_deg(hwt101_world_yaw_deg(imu) -
-                                      em->edge_heading_ref_deg);
+        yaw_error_deg = EdgeTurn_WrapDeg(hwt101_world_yaw_deg(imu) -
+                                         em->edge_heading_ref_deg);
 
         if (edge_absf(yaw_error_deg) <= EDGE_MOTION_YAW_DEADBAND_DEG)
         {
@@ -318,22 +460,13 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
             return;
         }
 
-        /*
-         * 大角度通常不是普通轮间误差，而是车辆被碰动、地图方向错误或 IMU 异常。
-         * 此时拒绝自动原地旋转，避免在未知姿态下继续扩大错误。
-         */
-        if (edge_absf(yaw_error_deg) > EDGE_MOTION_YAW_MAX_START_DEG)
-        {
-            edge_fail(em);
-            return;
-        }
-
-        if (!edge_start_yaw_correction(em, yaw_error_deg, now_ms))
+        /* 任意角度都进入闭环纠偏；机械卡死仍由动态超时保护。 */
+        if (!edge_start_yaw_correction(em, imu, now_ms))
             edge_fail(em);
         return;
     }
 
-    /* 3) 低速闭环纠偏：达到死区或穿过 0 度立即停车。 */
+    /* 5) 自适应闭环纠偏：远处高速、近处降速，达到死区/穿零立即停车。 */
     if (em->state == EDGE_MOTION_YAW_CORRECTING)
     {
         if (!hwt101_is_fresh(imu, now_ms, EDGE_MOTION_IMU_TIMEOUT_MS))
@@ -342,8 +475,8 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
             return;
         }
 
-        yaw_error_deg = edge_wrap_deg(hwt101_world_yaw_deg(imu) -
-                                      em->edge_heading_ref_deg);
+        yaw_error_deg = EdgeTurn_WrapDeg(hwt101_world_yaw_deg(imu) -
+                                         em->edge_heading_ref_deg);
         yaw_sign = edge_signf(yaw_error_deg);
 
         if (edge_absf(yaw_error_deg) <= EDGE_MOTION_YAW_DEADBAND_DEG ||
@@ -355,8 +488,7 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
             return;
         }
 
-        if ((uint32_t)(now_ms - em->yaw_correct_start_ms) >
-            EDGE_MOTION_YAW_CORRECT_TIMEOUT_MS)
+        if ((int32_t)(now_ms - em->yaw_correct_deadline_ms) >= 0)
         {
             edge_fail(em);
             return;
@@ -367,17 +499,21 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
          */
         if ((int32_t)(now_ms - em->next_yaw_refresh_ms) >= 0)
         {
-            float wz_mag = edge_yaw_wz_for_rpm(em->chassis,
-                                               EDGE_MOTION_YAW_CORRECT_RPM);
-            float wz_cmd = (em->yaw_start_sign > 0) ? wz_mag : -wz_mag;
+            float world_gyro_dps = HWT101_WORLD_YAW_SIGN * imu->gyro_z_dps;
+            float wz_cmd = heading_update_world_cw(
+                &em->yaw_controller,
+                hwt101_world_yaw_deg(imu),
+                world_gyro_dps,
+                (float)EDGE_MOTION_YAW_REFRESH_MS / 1000.0f);
 
             chassis_set_velocity(em->chassis, 0.0f, 0.0f, wz_cmd, now_ms);
+            em->yaw_command_wz_radps = wz_cmd;
             em->next_yaw_refresh_ms = now_ms + EDGE_MOTION_YAW_REFRESH_MS;
         }
         return;
     }
 
-    /* 4) 纠偏停车完成后再稳定一次，随后才真正提交当前节点。 */
+    /* 6) 纠偏停车完成后再稳定一次，随后才真正提交当前节点。 */
     if (em->state == EDGE_MOTION_SETTLE_AFTER_YAW)
     {
         if (chassis_motion_busy(em->chassis))
@@ -395,54 +531,44 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
         if (!hwt101_is_fresh(imu, now_ms, EDGE_MOTION_IMU_TIMEOUT_MS))
             return;
 
-        (void)edge_commit(em);
+        /*
+         * STOP 后必须重新验角。若惯性造成超调，不提交节点，而是反向小速补偿；
+         * 只有真正落入死区才允许 Navigation 前进。
+         */
+        yaw_error_deg = EdgeTurn_WrapDeg(hwt101_world_yaw_deg(imu) -
+                                         em->edge_heading_ref_deg);
+        if (edge_absf(yaw_error_deg) <= EDGE_MOTION_YAW_DEADBAND_DEG)
+        {
+            (void)edge_commit(em);
+            return;
+        }
+
+        if ((int32_t)(now_ms - em->yaw_correct_deadline_ms) >= 0 ||
+            !edge_start_yaw_correction(em, imu, now_ms))
+            edge_fail(em);
         return;
     }
 
-    /* 5) IDLE：Navigation 处于 RUNNING 时领取下一条待执行拓扑边。 */
+    /* 7) IDLE：Navigation 处于 RUNNING 时领取下一条待执行拓扑边。 */
     if (em->state != EDGE_MOTION_IDLE || nav_state != NAV_STATE_RUNNING)
         return;
 
     if (HMI_Navigation_GetCurrentEdge(em->hmi_nav,
                                       &em->from_node, &em->to_node))
     {
-        float dx;
-        float dy;
+        float current_yaw_deg;
 
-        if (!node_ok(em->from_node) || !node_ok(em->to_node) ||
-            !MapGraph_IsConnected(em->from_node, em->to_node))
-        {
-            edge_fail(em);
-            return;
-        }
-
-        /*
-         * 正式 Mission 使用整场唯一世界零点，绝不在每条边重新清零 HWT101。
-         * 本条边只记录“开始时的世界航向”作为保持参考。
-         */
+        /* 正式 Mission 使用整场唯一世界零点，绝不在每条边重新清零 HWT101。 */
         if (!hwt101_is_fresh(imu, now_ms, EDGE_MOTION_IMU_TIMEOUT_MS) ||
             !hwt101_world_zero_ready(imu))
             return;
 
-        em->edge_heading_ref_deg = hwt101_world_yaw_deg(imu);
-
-        dx = g_nodes[em->to_node].x - g_nodes[em->from_node].x;
-        dy = g_nodes[em->to_node].y - g_nodes[em->from_node].y;
-        em->world_dx_m = dx;
-        em->world_dy_m = dy;
-
-        edge_world_to_body(dx, dy, em->edge_heading_ref_deg,
-                           &em->body_dx_m, &em->body_dy_m);
-
+        current_yaw_deg = hwt101_world_yaw_deg(imu);
         edge_save_acceleration(em);
-        em->chassis->acceleration = EDGE_MOTION_MOVE_ACC;
+        em->turn_attempt = 0U;
 
-        chassis_motion_translate(em->chassis,
-                                 em->body_dx_m,
-                                 em->body_dy_m,
-                                 ROUTE_EDGE_SPEED_MPS,
-                                 now_ms);
-        em->state = EDGE_MOTION_TRANSLATING;
+        if (!edge_apply_turn_plan(em, current_yaw_deg, now_ms))
+            edge_fail(em);
     }
 }
 
@@ -465,7 +591,9 @@ uint8_t EdgeMotion_IsActive(const EdgeMotion_t *em)
 {
     if (!em) return 0U;
 
-    return (em->state == EDGE_MOTION_TRANSLATING ||
+    return (em->state == EDGE_MOTION_TURNING_TO_EDGE ||
+            em->state == EDGE_MOTION_SETTLE_AFTER_TURN ||
+            em->state == EDGE_MOTION_TRANSLATING ||
             em->state == EDGE_MOTION_SETTLE_AFTER_TRANSLATE ||
             em->state == EDGE_MOTION_YAW_CORRECTING ||
             em->state == EDGE_MOTION_SETTLE_AFTER_YAW) ? 1U : 0U;

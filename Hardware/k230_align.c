@@ -22,7 +22,7 @@
  *  grab 之后就不再消费新事件，拿不到后续的偏差帧。）
  */
 
-float K230_ALIGN_MM_PER_PX = 1.0f;
+float K230_ALIGN_MM_PER_PX = 0.5f;
 
 static Chassis *s_chassis = NULL;
 
@@ -31,11 +31,23 @@ static uint32_t s_state_start_ms = 0U;
 
 static K230AlignMode_t s_mode = K230_ALIGN_MODE_DETECT;
 static uint8_t s_target_id = 0U;
-static uint16_t s_carousel_us = K230_ALIGN_CAROUSEL_POS_US; /* 对位时的夹爪朝向 */
+static uint8_t s_anchor_color_id = 0U; /* STACK：目标位第一层物料的颜色号 */
+static float s_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG; /* 对位时的夹爪朝向 */
 static uint8_t s_iteration = 0U;
 static uint8_t s_color_ok = 0U;   /* DETECT：已确认 K230 识别到目标颜色 */
 static uint8_t s_grab_seen = 0U;  /* DETECT：已收到 K230 的 grab（识别成功可直接夹） */
 static uint8_t s_place_seen = 0U; /* PLACE：已收到 K230 的 place（已对准放置位） */
+static uint8_t s_target_ok = 0U;  /* STACK：K230锁定的位置号与s_target_id一致 */
+static uint8_t s_pending_exit_reason = K230_ALIGN_EXIT_NONE;
+static uint32_t s_stop_last_tx_ms = 0U;
+
+/*
+ * 本次对位是不是「云台已由上层摆好」（K230Align_StartPreset 入口）。
+ * 为真时 ROTATE 不再等舵机——舵机没被本模块碰过，等它等于白等一个
+ * 稳定期；但要走的「清残帧 -> 发命令」一步不能省，所以还是过一下
+ * ROTATE 状态。
+ */
+static bool s_servo_preset = false;
 
 /*
  * 本轮偏差的收集起点（HAL_GetTick()）。
@@ -55,10 +67,16 @@ volatile uint8_t robot_k230_align_exit = K230_ALIGN_EXIT_NONE;
 volatile uint8_t robot_k230_align_color_ok = 0U;
 volatile uint8_t robot_k230_align_grab = 0U;
 volatile uint8_t robot_k230_align_place = 0U;
+volatile uint8_t robot_k230_align_target_ok = 0U;
 volatile char    robot_k230_align_last_dir = '\0';
 volatile int32_t robot_k230_align_last_px = 0;
 volatile int32_t robot_k230_align_px_x = 0;  /* 本轮合成用的 ±X 像素偏差，带符号 */
 volatile int32_t robot_k230_align_px_y = 0;  /* 本轮合成用的 ±Y 像素偏差，带符号 */
+volatile uint16_t robot_k230_align_stop_requests = 0U;
+volatile uint16_t robot_k230_align_stop_tx_failures = 0U;
+volatile uint32_t robot_k230_align_stop_wait_ms = 0U;
+volatile uint32_t robot_k230_align_stop_ack_ms = 0U;
+volatile uint8_t robot_k230_align_stop_ack_received = 0U;
 
 static void enter_state(K230AlignState_t new_state, uint32_t now_ms)
 {
@@ -101,11 +119,17 @@ static bool align_can_start(void)
 /*
  * 按当前模式发出启动命令：
  *   DETECT -> detect,<颜色号>   原料区去原料台找料
- *   PLACE  -> place,<位置号>    粗加工区/暂存区对准放置位
+ *   PLACE  -> place,<位置号>    粗加工区/第一轮暂存区对准放置位
+ *   STACK  -> stack,<位置号>,<第一层颜色号>  第二轮暂存区身份锚定
  * 只在 ROTATE 状态确认夹爪已就位之后调用，保证图像朝向已固定。
  */
 static HAL_StatusTypeDef send_align_command(void)
 {
+    if (s_mode == K230_ALIGN_MODE_STACK)
+    {
+        return K230_StartStack(s_target_id, s_anchor_color_id);
+    }
+
     if (s_mode == K230_ALIGN_MODE_PLACE)
     {
         return K230_StartPlace(s_target_id);
@@ -114,10 +138,11 @@ static HAL_StatusTypeDef send_align_command(void)
     return K230_StartDetect(s_target_id);
 }
 
-/* DETECT 用颜色号 1~6；PLACE 用位置号 1~3。 */
+/* DETECT 用颜色号 1~6；PLACE/STACK 用位置号 1~3。 */
 static bool target_id_valid(K230AlignMode_t mode, uint8_t target_id)
 {
-    if (mode == K230_ALIGN_MODE_PLACE)
+    if ((mode == K230_ALIGN_MODE_PLACE) ||
+        (mode == K230_ALIGN_MODE_STACK))
     {
         return (target_id >= 1U) && (target_id <= 3U);
     }
@@ -129,6 +154,35 @@ static bool target_id_valid(K230AlignMode_t mode, uint8_t target_id)
 static uint32_t abs_px(int32_t px)
 {
     return (uint32_t)((px < 0) ? (-px) : px);
+}
+
+static void send_stop_request(uint32_t now_ms)
+{
+    /* HAL忙时不直接失败；STOPPING会按固定周期重试。 */
+    if (K230_Stop() != HAL_OK)
+    {
+        if (robot_k230_align_stop_tx_failures < 65535U)
+        {
+            robot_k230_align_stop_tx_failures++;
+        }
+    }
+    s_stop_last_tx_ms = now_ms;
+    if (robot_k230_align_stop_requests < 65535U)
+    {
+        robot_k230_align_stop_requests++;
+    }
+}
+
+/* 判定本轮对位完成，但收到 stopped 前不向上层暴露 DONE。 */
+static void align_done(uint8_t exit_reason, uint32_t now_ms)
+{
+    s_pending_exit_reason = exit_reason;
+    robot_k230_align_stop_tx_failures = 0U;
+    robot_k230_align_stop_wait_ms = 0U;
+    robot_k230_align_stop_ack_ms = 0U;
+    robot_k230_align_stop_ack_received = 0U;
+    enter_state(K230_ALIGN_STOPPING, now_ms);
+    send_stop_request(now_ms);
 }
 
 /*
@@ -184,8 +238,13 @@ static void offset_to_body(int32_t px_x, int32_t px_y,
  * K230_ALIGN_REQUIRE_COLOR 置 0 时，Start 里会直接把 s_color_ok 置 1，
  * 等价于关掉这道校验。
  */
-static bool color_ready(void)
+static bool identity_ready(void)
 {
+    if (s_mode == K230_ALIGN_MODE_STACK)
+    {
+        return s_target_ok != 0U;
+    }
+
     if (s_mode != K230_ALIGN_MODE_DETECT)
     {
         return true;
@@ -211,11 +270,7 @@ static void handle_offset_pair(int32_t px_x, int32_t px_y, uint32_t now_ms)
     if ((abs_px(px_x) <= K230_ALIGN_TOLERANCE_PX) &&
         (abs_px(px_y) <= K230_ALIGN_TOLERANCE_PX))
     {
-        /* 已对准：让 K230 停止检测，否则偏差帧会继续占着 UART4。 */
-        (void)K230_Stop();
-        robot_k230_align_exit = K230_ALIGN_EXIT_TOLERANCE;
-
-        enter_state(K230_ALIGN_DONE, now_ms);
+        align_done(K230_ALIGN_EXIT_TOLERANCE, now_ms);
         return;
     }
 
@@ -250,12 +305,17 @@ void K230Align_Init(Chassis *chassis)
     s_state_start_ms = 0U;
     s_mode = K230_ALIGN_MODE_DETECT;
     s_target_id = 0U;
-    s_carousel_us = K230_ALIGN_CAROUSEL_POS_US;
+    s_anchor_color_id = 0U;
+    s_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+    s_servo_preset = false;
     s_iteration = 0U;
     s_color_ok = 0U;
     s_grab_seen = 0U;
     s_place_seen = 0U;
+    s_target_ok = 0U;
     s_offset_epoch_ms = 0U;
+    s_pending_exit_reason = K230_ALIGN_EXIT_NONE;
+    s_stop_last_tx_ms = 0U;
 
     robot_k230_align_mode = (uint8_t)K230_ALIGN_MODE_DETECT;
     robot_k230_align_state = K230_ALIGN_IDLE;
@@ -265,14 +325,23 @@ void K230Align_Init(Chassis *chassis)
     robot_k230_align_color_ok = 0U;
     robot_k230_align_grab = 0U;
     robot_k230_align_place = 0U;
+    robot_k230_align_target_ok = 0U;
     robot_k230_align_last_dir = '\0';
     robot_k230_align_last_px = 0;
     robot_k230_align_px_x = 0;
     robot_k230_align_px_y = 0;
+    robot_k230_align_stop_requests = 0U;
+    robot_k230_align_stop_tx_failures = 0U;
+    robot_k230_align_stop_wait_ms = 0U;
+    robot_k230_align_stop_ack_ms = 0U;
+    robot_k230_align_stop_ack_received = 0U;
 }
 
-bool K230Align_Start(K230AlignMode_t mode, uint8_t target_id,
-                     uint16_t carousel_us, uint32_t now_ms)
+/* 两个入口的公共实现：servo_preset 为真表示云台已由上层摆好。 */
+static bool align_start(K230AlignMode_t mode, uint8_t target_id,
+                        uint8_t anchor_color_id, float carousel_deg,
+                        bool servo_preset,
+                        uint32_t now_ms)
 {
     if ((s_chassis == NULL) || (!align_can_start()))
     {
@@ -284,14 +353,26 @@ bool K230Align_Start(K230AlignMode_t mode, uint8_t target_id,
         return false;
     }
 
+    if (((mode == K230_ALIGN_MODE_STACK) &&
+         ((anchor_color_id < 1U) || (anchor_color_id > 6U))) ||
+        ((mode != K230_ALIGN_MODE_STACK) && (anchor_color_id != 0U)))
+    {
+        return false;
+    }
+
     s_mode = mode;
     s_target_id = target_id;
-    s_carousel_us = carousel_us;
+    s_anchor_color_id = anchor_color_id;
+    s_carousel_deg = carousel_deg;
+    s_servo_preset = servo_preset;
     s_iteration = 0U;
     s_color_ok = 0U;
     s_grab_seen = 0U;
     s_place_seen = 0U;
+    s_target_ok = 0U;
     s_offset_epoch_ms = 0U;
+    s_pending_exit_reason = K230_ALIGN_EXIT_NONE;
+    s_stop_last_tx_ms = 0U;
 
 #if !K230_ALIGN_REQUIRE_COLOR
     /* 关掉颜色校验：不等颜色帧，收到偏差帧就微调。 */
@@ -308,10 +389,16 @@ bool K230Align_Start(K230AlignMode_t mode, uint8_t target_id,
     robot_k230_align_color_ok = s_color_ok;
     robot_k230_align_grab = 0U;
     robot_k230_align_place = 0U;
+    robot_k230_align_target_ok = 0U;
     robot_k230_align_last_dir = '\0';
     robot_k230_align_last_px = 0;
     robot_k230_align_px_x = 0;
     robot_k230_align_px_y = 0;
+    robot_k230_align_stop_requests = 0U;
+    robot_k230_align_stop_tx_failures = 0U;
+    robot_k230_align_stop_wait_ms = 0U;
+    robot_k230_align_stop_ack_ms = 0U;
+    robot_k230_align_stop_ack_received = 0U;
 
     /* 丢掉上一次对位遗留的事件，避免旧帧被当成本次的新偏差。 */
     (void)K230_TakeEvents();
@@ -320,20 +407,54 @@ bool K230Align_Start(K230AlignMode_t mode, uint8_t target_id,
      * 摄像头随夹爪旋转，所以先转到约定的基准姿态再开始检测。
      * 舵机是平滑步进的，这里只发目标，转到位由 ROTATE 状态确认，
      * 期间不发 detect/place——否则 K230 会在夹爪还在转的时候给出偏差。
+     *
+     * servo_preset 为真时（上层已在 ManipulatorAction 的视觉预置里转过
+     * 云台并张开），这里不再重发同一目标：重发不会让舵机动，只会多等
+     * 一个稳定期；而且识别前那段本来就是「云台先转、滑台后伸」。
      */
-    CarouselServo_SetUs(s_carousel_us);
+    if (!s_servo_preset)
+    {
+        CarouselServo_SetAngle(s_carousel_deg);
 
-    /*
-     * 同时张开夹爪：合拢的夹爪会挡住装在夹爪上的摄像头。
-     * 用 Large 是为了和取料姿态完全一致——ManipulatorAction 的
-     * MANIP_GROUND_TO_TRAY_PREPARE 同样是"转到取料方向 + Open_Large()"，
-     * 这样对位看到的画面就是真正取料时看到的画面。
-     * 两处必须一致，改一处要同步改另一处。
-     */
-    GripperServo_Open_Large();
+        /*
+         * 同时张开夹爪：合拢的夹爪会挡住装在夹爪上的摄像头。
+         * 用 Large 是为了和取料姿态完全一致——ManipulatorAction 的
+         * MANIP_GROUND_TO_TRAY_PREPARE 同样是"转到取料方向 + Open_Large()"，
+         * 这样对位看到的画面就是真正取料时看到的画面。
+         * 两处必须一致，改一处要同步改另一处。
+         * （预置入口下这一步由 ManipulatorAction_SlideJogToAlignStart()
+         * 用同一个 GripperServo_Open_Large() 做掉，所以也要一起改。）
+         */
+        GripperServo_Open_Large();
+    }
 
     enter_state(K230_ALIGN_ROTATE, now_ms);
     return true;
+}
+
+bool K230Align_Start(K230AlignMode_t mode, uint8_t target_id,
+                     float carousel_deg, uint32_t now_ms)
+{
+    return align_start(mode, target_id, 0U, carousel_deg, false, now_ms);
+}
+
+bool K230Align_StartPreset(K230AlignMode_t mode, uint8_t target_id,
+                           uint32_t now_ms)
+{
+    /*
+     * carousel_deg 只作为记录保存：本入口不会用它去驱动舵机，姿态已经由
+     * 上层摆成 K230_ALIGN_CAROUSEL_ANGLE_DEG 了，w/a/s/d 也是在这个姿态下
+     * 定义的（见 robot_config.h）。
+     */
+    return align_start(mode, target_id, 0U, K230_ALIGN_CAROUSEL_ANGLE_DEG,
+                       true, now_ms);
+}
+
+bool K230Align_StartStackPreset(uint8_t position_id, uint8_t anchor_color_id,
+                                uint32_t now_ms)
+{
+    return align_start(K230_ALIGN_MODE_STACK, position_id, anchor_color_id,
+                       K230_ALIGN_CAROUSEL_ANGLE_DEG, true, now_ms);
 }
 
 void K230Align_Update(uint32_t now_ms)
@@ -352,6 +473,33 @@ void K230Align_Update(uint32_t now_ms)
     }
 
     events = K230_TakeEvents();
+
+    /*
+     * STOPPING 期间旧偏差/place/error全部作废，只处理 stopped
+     * 和定时重试。不再因确认来得慢而退出：串口松动、K230 单帧
+     * 处理较慢时，迟到的 stopped 仍能让任务继续。若链路完全断开，
+     * 就安全停在本状态，不在未确认 K230 停止时启动机械动作。
+     */
+    if (s_state == K230_ALIGN_STOPPING)
+    {
+        robot_k230_align_stop_wait_ms = now_ms - s_state_start_ms;
+
+        if ((events & K230_EVENT_STOPPED) != 0U)
+        {
+            robot_k230_align_stop_ack_ms = robot_k230_align_stop_wait_ms;
+            robot_k230_align_stop_ack_received = 1U;
+            robot_k230_align_exit = s_pending_exit_reason;
+            s_pending_exit_reason = K230_ALIGN_EXIT_NONE;
+            enter_state(K230_ALIGN_DONE, now_ms);
+            return;
+        }
+
+        if ((now_ms - s_stop_last_tx_ms) >= K230_ALIGN_STOP_RETRY_MS)
+        {
+            send_stop_request(now_ms);
+        }
+        return;
+    }
 
     /* K230 主动报错（error,xxx）：任何状态下都立即失败。 */
     if ((events & K230_EVENT_ERROR) != 0U)
@@ -374,6 +522,34 @@ void K230Align_Update(uint32_t now_ms)
     }
 
     /*
+     * STACK模式只接受本轮请求的位置号。K230选框后先发target,n，最终还会发
+     * place,n；两者都会产生TARGET事件。若重新搜索时错误地回了相邻位置，
+     * 这里会重新关门，后续偏差不会推动底盘。
+     */
+    if ((s_mode == K230_ALIGN_MODE_STACK) &&
+        ((events & K230_EVENT_TARGET) != 0U))
+    {
+        uint8_t was_target_ok = s_target_ok;
+        s_target_ok = (g_k230_status.target_id == s_target_id) ? 1U : 0U;
+        robot_k230_align_target_ok = s_target_ok;
+
+        if ((s_target_ok != 0U) && (was_target_ok == 0U))
+        {
+            /*
+             * 身份确认之前到达的偏差一律作废。target,n和紧随其后的偏差可能
+             * 拥有同一个毫秒时间戳，所以仍使用“>= epoch”；真正更早的轴值
+             * 会因时间戳小于本时刻而被挡掉。
+             */
+            s_offset_epoch_ms = now_ms;
+        }
+        else if (s_target_ok == 0U)
+        {
+            /* 重新搜索若报成相邻位置，旧place也不能继续生效。 */
+            s_place_seen = 0U;
+        }
+    }
+
+    /*
      * DETECT：K230 回 grab = “已识别到目标、可以抓”。
      * 对位这条路不走 K230_TaskStartDetect，grab 得在这里自己接住。
      * 有些固件识别成功时只回 grab，不给单独的颜色行、也不给偏差帧；
@@ -393,8 +569,10 @@ void K230Align_Update(uint32_t now_ms)
      * 与 DETECT 的 grab 对称，是该模式下除“偏差进容差”外的另一条收工路。
      * PLACE 模式不报颜色，所以没有前置校验。
      */
-    if ((s_mode == K230_ALIGN_MODE_PLACE) &&
+    if (((s_mode == K230_ALIGN_MODE_PLACE) ||
+         (s_mode == K230_ALIGN_MODE_STACK)) &&
         ((events & K230_EVENT_PLACE) != 0U) &&
+        ((s_mode != K230_ALIGN_MODE_STACK) || (s_target_ok != 0U)) &&
         (s_place_seen == 0U))
     {
         s_place_seen = 1U;
@@ -414,7 +592,13 @@ void K230Align_Update(uint32_t now_ms)
     switch (s_state)
     {
         case K230_ALIGN_ROTATE:
-            if ((CarouselServo_IsDone() && GripperServo_IsDone()) ||
+            /*
+             * 等姿态就位。预置入口（s_servo_preset）下本模块没碰过舵机，
+             * 姿态是上层摆好的，这一帧就直接放行——但下面那段「清残帧、
+             * 发命令」照走，不能跳。
+             */
+            if (s_servo_preset ||
+                (CarouselServo_IsDone() && GripperServo_IsDone()) ||
                 ((now_ms - s_state_start_ms) >= K230_ALIGN_ROTATE_TIMEOUT_MS))
             {
                 /* 转动期间可能进来的残帧不算数：进 WAIT_OFFSET 时会把
@@ -448,24 +632,13 @@ void K230Align_Update(uint32_t now_ms)
                              (-g_k230_status.axis_y_px)) : 0;
 
             /*
-             * 偏差帧要过两道闸才消费：DETECT 下先确认目标颜色，
-             * 颜色对了进来的偏差才拿去纠偏。PLACE 不报颜色，color_ready() 恒真。
+             * 偏差帧要先过身份闸：DETECT确认目标颜色；STACK确认位置号；
+             * 普通PLACE无需身份报文。闸门通过后才允许拿偏差推动底盘。
              *
              * 两轴到齐就立刻合成一次斜向平移；只到一轴（另一轴偏差本来
              * 就是 0、K230 不发那一行）则等满配对窗口再按单轴走，免得
              * 每轮都空等一整个窗口。
              */
-            if (color_ready() &&
-                ((have_x && have_y) ||
-                 ((have_x || have_y) &&
-                  ((now_ms - s_state_start_ms) >= K230_ALIGN_PAIR_WINDOW_MS))))
-            {
-                s_grab_seen = 0U;
-                s_place_seen = 0U;
-                handle_offset_pair(px_x, px_y, now_ms);
-                break;
-            }
-
             /*
              * 两条“K230 说不用再调了”的路，按模式各认一条：
              *   DETECT 认 grab  —— 且必须先确认过目标颜色。否则没找到料时
@@ -474,17 +647,32 @@ void K230Align_Update(uint32_t now_ms)
              * 命中后主动发 stop，否则 K230 会继续占着 UART4 发偏差帧。
              */
             if (((s_mode == K230_ALIGN_MODE_DETECT) &&
-                 (s_grab_seen != 0U) && color_ready()) ||
-                ((s_mode == K230_ALIGN_MODE_PLACE) &&
+                 (s_grab_seen != 0U) && identity_ready()) ||
+                (((s_mode == K230_ALIGN_MODE_PLACE) ||
+                  (s_mode == K230_ALIGN_MODE_STACK)) &&
                  (s_place_seen != 0U)))
             {
                 s_grab_seen = 0U;
                 s_place_seen = 0U;
-                robot_k230_align_exit = (s_mode == K230_ALIGN_MODE_DETECT) ?
-                                        K230_ALIGN_EXIT_GRAB :
-                                        K230_ALIGN_EXIT_PLACE;
-                (void)K230_Stop();
-                enter_state(K230_ALIGN_DONE, now_ms);
+                align_done((s_mode == K230_ALIGN_MODE_DETECT) ?
+                           K230_ALIGN_EXIT_GRAB :
+                           K230_ALIGN_EXIT_PLACE,
+                           now_ms);
+                break;
+            }
+
+            /*
+             * 收工信号优先于同一帧的 offset。K230 常在最后一帧同时发
+             * “偏差 + grab/place”；旧顺序会先开始下一次运动并清掉 grab。
+             */
+            if (identity_ready() &&
+                ((have_x && have_y) ||
+                 ((have_x || have_y) &&
+                  ((now_ms - s_state_start_ms) >= K230_ALIGN_PAIR_WINDOW_MS))))
+            {
+                s_grab_seen = 0U;
+                s_place_seen = 0U;
+                handle_offset_pair(px_x, px_y, now_ms);
                 break;
             }
 
@@ -532,10 +720,14 @@ void K230Align_Update(uint32_t now_ms)
             break;
 
         case K230_ALIGN_SETTLE:
+#if K230_ALIGN_SETTLE_MS == 0U
+            enter_state(K230_ALIGN_WAIT_OFFSET, now_ms);
+#else
             if ((now_ms - s_state_start_ms) >= K230_ALIGN_SETTLE_MS)
             {
                 enter_state(K230_ALIGN_WAIT_OFFSET, now_ms);
             }
+#endif
             break;
 
         default:
