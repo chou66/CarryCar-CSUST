@@ -73,6 +73,19 @@ uint8_t Navigation_GetCurrentEdge(const Navigation_t *nav,
                                   uint8_t *from_node, uint8_t *to_node);
 
 /**
+ * @brief 预看当前边之后的下一条边，不推进路径进度。
+ *
+ * @param from_node 输出下一条边的起点（即当前边的终点）。
+ * @param to_node   输出下一条边的终点。
+ * @return 1 存在下一条边；0 当前边已是最后一条或导航未在运行。
+ *
+ * @note 边运动层在提交当前节点前用它预测“到站后是否还要转向”，
+ *       从而避免先纠到当前边航向、紧接着又转走一次。
+ */
+uint8_t Navigation_GetFollowingEdge(const Navigation_t *nav,
+                                    uint8_t *from_node, uint8_t *to_node);
+
+/**
  * @brief 通知导航层：当前from->to边已经真实执行完成。
  * @return 1成功推进，0当前状态不能推进。
  * @warning 实车必须确认到达to_node后才能调用；PC测试可模拟调用。

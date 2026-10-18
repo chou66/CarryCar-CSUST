@@ -170,6 +170,11 @@ static uint8_t storage_plan_to(uint8_t target_node,
     }
 
     EdgeMotion_BeginRoute(&s_edge);
+    /*
+     * 两段导航的终点 N2/N4 都带 task_yaw，到站后标定状态机会立即做任务
+     * 航向 PD，所以边末不需要先单独纠到当前边航向。
+     */
+    EdgeMotion_SetArrivalAlign(&s_edge, 1U);
     HMI_Navigation_UpdateDebugDisplay(&s_nav);
     storage_set_state(nav_state);
     return 1U;

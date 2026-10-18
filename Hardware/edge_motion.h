@@ -72,6 +72,16 @@ typedef struct
     uint8_t drive_backward; /* 1=当前边使用车身-Y后退；0=车身+Y前进。 */
     uint8_t turn_attempt;
 
+    /*
+     * 调用方声明：本次导航到达最终节点后，会直接做任务航向 PD。
+     *
+     * 置 1 时，边末若已经确定后面还有一次更大的转向（任务航向对准或下一
+     * 段拓扑边转向），就不再先把车纠到当前边航向，而是直接提交节点，让
+     * 那一次转向直接转到目标角度。默认 0：边末始终按原逻辑纠偏，独立导航
+     * 测试/未声明任务航向的调用方行为不变。
+     */
+    uint8_t arrival_align_valid;
+
     /* 边末 HWT101 航向修正状态。 */
     uint32_t settle_until_ms;
     uint32_t yaw_correct_start_ms;
@@ -96,6 +106,15 @@ void EdgeMotion_Init(EdgeMotion_t *em, Chassis *chassis, HMI_Navigation_t *hmi_n
  * edge_turn 根据 from/to 坐标重新计算。
  */
 void EdgeMotion_BeginRoute(EdgeMotion_t *em);
+
+/*
+ * @brief 声明本次导航到达最终节点后，上层会立即按节点的 task_yaw 做任务
+ *        航向对准。
+ *
+ * 必须在 EdgeMotion_BeginRoute()/RobotApp_GotoNode() 之后调用；BeginRoute
+ * 会把它清 0，避免上一条路线的声明泄漏到 VOFA/标定等其它导航。
+ */
+void EdgeMotion_SetArrivalAlign(EdgeMotion_t *em, uint8_t valid);
 
 void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms);
 void EdgeMotion_EStop(EdgeMotion_t *em);

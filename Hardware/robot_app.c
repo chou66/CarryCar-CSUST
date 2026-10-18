@@ -676,6 +676,18 @@ static uint8_t mission_plan_current_stage(void)
         return 0U;
     }
 
+    /*
+     * 任务点带固定 task_yaw 时，到达后 mission 会立即做任务航向 PD。
+     * 告知 EdgeMotion 不要先在边末单独纠到当前边航向，直接提交节点，
+     * 由任务航向一次转到目标角度。返回节点(N3/N9)没有任务航向，保持原
+     * 边末纠偏，确保入库平移方向准确；仅底盘测试(CHASSIS_ONLY)也不会
+     * 执行任务航向，必须继续纠偏。
+     */
+    EdgeMotion_SetArrivalAlign(&s_edge,
+        ((MISSION_CHASSIS_ONLY == 0U) &&
+         (robot_mission_stage != 7U) &&
+         (g_nodes[target].task_yaw_valid != 0U)) ? 1U : 0U);
+
     robot_mission_state = MISSION_NAVIGATING;
     return 1U;
 }

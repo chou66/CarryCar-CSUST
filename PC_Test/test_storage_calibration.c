@@ -156,6 +156,8 @@ void EdgeMotion_Init(EdgeMotion_t *em, Chassis *chassis,
     s_edge_active = 0U;
 }
 void EdgeMotion_BeginRoute(EdgeMotion_t *em) { (void)em; }
+void EdgeMotion_SetArrivalAlign(EdgeMotion_t *em, uint8_t valid)
+{ (void)em; (void)valid; }
 void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
 { (void)em; (void)now_ms; }
 void EdgeMotion_EStop(EdgeMotion_t *em)

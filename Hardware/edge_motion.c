@@ -173,6 +173,66 @@ static uint8_t edge_commit(EdgeMotion_t *em)
     return 1U;
 }
 
+/*
+ * 判断“当前边提交节点后，是否紧接着一定会做一次能覆盖当前航向的转向”。
+ *
+ * 两种来源：
+ *   1) 当前边终点就是本次导航最终任务点，且调用方声明到达后做任务航向
+ *      PD —— 此时不需要先纠到当前边航向，任务 PD 会直接转到 task_yaw；
+ *   2) 当前边终点是中间节点，但由 edge_turn 预测下一条边需要原地转向
+ *      —— 此时直接提交，让下一段一次转到下一条边的目标角度。
+ *
+ * 只有预测到“确实要转”才返回 1；若下一条边是直行通过、当前误差又落在
+ * 转向容差内，仍返回 0，让原有边末纠偏把航向收进死区，避免小误差沿路径
+ * 一直累积。
+ */
+static uint8_t edge_following_turn_covers_heading(EdgeMotion_t *em,
+                                                  float current_world_yaw_deg)
+{
+    uint8_t from_node;
+    uint8_t to_node;
+    uint8_t target_node;
+    EdgeTurnOptions_t options;
+    EdgeTurnPlan_t plan;
+
+    if (!em || !em->hmi_nav)
+        return 0U;
+
+    target_node = Navigation_GetTargetNode(&em->hmi_nav->nav);
+
+    /* 最终任务点：上层随后会直接做任务航向 PD。 */
+    if (em->arrival_align_valid && em->to_node == target_node)
+        return 1U;
+
+    /* 中间节点：用与 edge_apply_turn_plan() 完全相同的决策参数预测下一段。 */
+    if (!Navigation_GetFollowingEdge(&em->hmi_nav->nav,
+                                     &from_node, &to_node))
+        return 0U;
+
+    options.allow_reverse = ROUTE_ALLOW_REVERSE;
+    options.reverse_min_turn_saving_deg = ROUTE_REVERSE_MIN_TURN_SAVING_DEG;
+    options.arrival_yaw_valid = 0U;
+    options.arrival_world_yaw_deg = 0.0f;
+
+    if (to_node == target_node &&
+        target_node >= 1U && target_node <= NODE_NUM &&
+        g_nodes[target_node].task_yaw_valid)
+    {
+        options.arrival_yaw_valid = 1U;
+        options.arrival_world_yaw_deg = g_nodes[target_node].task_yaw_deg;
+    }
+
+    if (!EdgeTurn_Plan(from_node,
+                       to_node,
+                       current_world_yaw_deg,
+                       ROUTE_TURN_TOLERANCE_DEG,
+                       &options,
+                       &plan))
+        return 0U;
+
+    return plan.turn_required ? 1U : 0U;
+}
+
 static uint32_t edge_yaw_timeout_ms(float yaw_error_deg)
 {
     uint32_t timeout_ms = EDGE_MOTION_YAW_TIMEOUT_BASE_MS +
@@ -329,6 +389,7 @@ void EdgeMotion_Init(EdgeMotion_t *em, Chassis *chassis, HMI_Navigation_t *hmi_n
     em->turn_chassis_command_deg = 0.0f;
     em->drive_backward = 0U;
     em->turn_attempt = 0U;
+    em->arrival_align_valid = 0U;
     heading_init(&em->yaw_controller,
                  EDGE_MOTION_YAW_KP,
                  EDGE_MOTION_YAW_KD,
@@ -352,6 +413,14 @@ void EdgeMotion_BeginRoute(EdgeMotion_t *em)
     em->turn_chassis_command_deg = 0.0f;
     em->drive_backward = 0U;
     em->turn_attempt = 0U;
+    /* 新路线默认不假设上层会做任务航向，调用方需显式重新声明。 */
+    em->arrival_align_valid = 0U;
+}
+
+void EdgeMotion_SetArrivalAlign(EdgeMotion_t *em, uint8_t valid)
+{
+    if (!em) return;
+    em->arrival_align_valid = valid ? 1U : 0U;
 }
 
 void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
@@ -455,6 +524,17 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
                                          em->edge_heading_ref_deg);
 
         if (edge_absf(yaw_error_deg) <= EDGE_MOTION_YAW_DEADBAND_DEG)
+        {
+            (void)edge_commit(em);
+            return;
+        }
+
+        /*
+         * 后面本来就要转向时，不要“先纠到当前边航向、紧接着再转走”。
+         * 直接提交节点，让任务航向 PD 或下一段拓扑边转向一次到位。
+         */
+        if (edge_following_turn_covers_heading(em,
+                                               hwt101_world_yaw_deg(imu)))
         {
             (void)edge_commit(em);
             return;

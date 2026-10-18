@@ -213,6 +213,11 @@ static uint8_t rough_plan_to_n2(void)
     }
 
     EdgeMotion_BeginRoute(&s_edge);
+    /*
+     * 到 N2 后标定状态机会立即按 task_yaw(+90) 做与正式任务相同的
+     * 航向 PD，因此边末不必先单独纠到当前边航向。
+     */
+    EdgeMotion_SetArrivalAlign(&s_edge, 1U);
     HMI_Navigation_UpdateDebugDisplay(&s_nav);
     rough_set_state(ROUGH_CAL_NAVIGATING);
     return 1U;

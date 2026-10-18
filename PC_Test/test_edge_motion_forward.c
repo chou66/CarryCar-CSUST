@@ -264,12 +264,128 @@ static void test_large_error_is_corrected_and_rechecked(void)
           "Node commits only after settled yaw is inside deadband");
 }
 
+/*
+ * 中间节点后紧接着要转 90 度时，边末不再先纠到当前边航向：
+ * 直接提交节点，下一次 Update 由 edge_turn 一次转到下一条边的目标角。
+ *
+ * 路径 1->2->5->6：第一段 1->2 朝东(90 度)，第二段 2->5 朝北(0 度)。
+ */
+static void test_following_turn_skips_redundant_edge_correction(void)
+{
+    HMI_Navigation_t hmi;
+    Chassis chassis;
+    EdgeMotion_t edge;
+
+    memset(&hmi, 0, sizeof(hmi));
+    memset(&chassis, 0, sizeof(chassis));
+    reset_stubs();
+    hmi.initialized = 1U;
+    Navigation_Init(&hmi.nav, 1U, 0U);
+    Navigation_PlanTo(&hmi.nav, 6U);
+    EdgeMotion_Init(&edge, &chassis, &hmi);
+
+    set_yaw(90.0f, 0U);
+    EdgeMotion_Update(&edge, 0U);
+    finish_position();
+    EdgeMotion_Update(&edge, 1U);
+
+    /* 0.6 度超过边末死区，但下一条边需要转 90 度。 */
+    set_yaw(90.6f, 200U);
+    EdgeMotion_Update(&edge, 200U);
+    check(edge.state == EDGE_MOTION_IDLE &&
+          Navigation_GetCurrentNode(&hmi.nav) == 2U &&
+          !Navigation_IsDone(&hmi.nav) &&
+          s_velocity_count == 0U,
+          "Intermediate node commits without a redundant edge-end correction");
+
+    EdgeMotion_Update(&edge, 201U);
+    check(edge.state == EDGE_MOTION_TURNING_TO_EDGE &&
+          s_rotate_count == 1U &&
+          nearf(s_last_rotate_deg, 90.6f, 0.05f),
+          "Next edge turns directly from the drifted angle to its target heading");
+}
+
+/*
+ * 下一条边是直行通过时不能跳纠偏，否则 0.5~0.8 度的小误差会沿路径累积。
+ * 路径 1->2->3 两段都朝东。
+ */
+static void test_straight_through_node_still_corrects(void)
+{
+    HMI_Navigation_t hmi;
+    Chassis chassis;
+    EdgeMotion_t edge;
+
+    memset(&hmi, 0, sizeof(hmi));
+    memset(&chassis, 0, sizeof(chassis));
+    reset_stubs();
+    chassis.config.wheel_radius_m = 0.0385f;
+    chassis.config.half_length_m = 0.10f;
+    chassis.config.half_width_m = 0.10f;
+    chassis.config.gear_ratio = 1.0f;
+    hmi.initialized = 1U;
+    Navigation_Init(&hmi.nav, 1U, 0U);
+    Navigation_PlanTo(&hmi.nav, 3U);
+    EdgeMotion_Init(&edge, &chassis, &hmi);
+
+    set_yaw(90.0f, 0U);
+    EdgeMotion_Update(&edge, 0U);
+    finish_position();
+    EdgeMotion_Update(&edge, 1U);
+
+    set_yaw(90.6f, 200U);
+    EdgeMotion_Update(&edge, 200U);
+    check(edge.state == EDGE_MOTION_YAW_CORRECTING &&
+          Navigation_GetCurrentNode(&hmi.nav) == 1U &&
+          s_velocity_count == 1U,
+          "Straight-through node keeps the edge-end correction");
+}
+
+/*
+ * 最终任务点由 mission 的 task_yaw PD 接管；声明后边末直接提交，
+ * 即使当前边方向与任务航向相差很大，也交给任务 PD 一次转到位。
+ */
+static void test_final_task_node_defers_to_task_alignment(void)
+{
+    HMI_Navigation_t hmi;
+    Chassis chassis;
+    EdgeMotion_t edge;
+
+    memset(&hmi, 0, sizeof(hmi));
+    memset(&chassis, 0, sizeof(chassis));
+    reset_stubs();
+    hmi.initialized = 1U;
+    Navigation_Init(&hmi.nav, 5U, 0U);
+    Navigation_PlanTo(&hmi.nav, 6U);
+    EdgeMotion_Init(&edge, &chassis, &hmi);
+
+    EdgeMotion_BeginRoute(&edge);
+    check(edge.arrival_align_valid == 0U,
+          "BeginRoute clears a stale arrival-align declaration");
+    EdgeMotion_SetArrivalAlign(&edge, 1U);
+
+    set_yaw(90.0f, 0U);
+    EdgeMotion_Update(&edge, 0U);
+    finish_position();
+    EdgeMotion_Update(&edge, 1U);
+
+    set_yaw(90.6f, 200U);
+    EdgeMotion_Update(&edge, 200U);
+    check(edge.state == EDGE_MOTION_IDLE &&
+          Navigation_GetCurrentNode(&hmi.nav) == 6U &&
+          Navigation_IsDone(&hmi.nav) &&
+          s_velocity_count == 0U,
+          "Final task node defers heading work to task-yaw alignment");
+}
+
 int main(void)
 {
     test_turn_then_forward();
     test_already_aligned_goes_forward();
     test_node_behind_uses_reverse_without_full_turn();
     test_large_error_is_corrected_and_rechecked();
+    test_following_turn_skips_redundant_edge_correction();
+    test_straight_through_node_still_corrects();
+    test_final_task_node_defers_to_task_alignment();
     printf("PASS: %d\nFAIL: %d\n", s_pass, s_fail);
     return s_fail ? 1 : 0;
 }

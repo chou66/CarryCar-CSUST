@@ -88,6 +88,27 @@ uint8_t Navigation_GetCurrentEdge(const Navigation_t *nav,
     return 1U;
 }
 
+uint8_t Navigation_GetFollowingEdge(const Navigation_t *nav,
+                                    uint8_t *from_node, uint8_t *to_node)
+{
+    const PathExecutor_t *exec;
+
+    if (!nav || !from_node || !to_node || nav->state != NAV_STATE_RUNNING)
+        return 0U;
+
+    exec = &nav->executor;
+    if (exec->state != PATH_EXEC_RUNNING)
+        return 0U;
+
+    /* 当前边 = path[index] -> path[index+1]，下一条边从 index+1 开始。 */
+    if ((uint16_t)exec->index + 2U >= (uint16_t)exec->path.length)
+        return 0U;
+
+    *from_node = exec->path.node[exec->index + 1U];
+    *to_node   = exec->path.node[exec->index + 2U];
+    return 1U;
+}
+
 uint8_t Navigation_EdgeReached(Navigation_t *nav)
 {
     if (!nav || nav->state != NAV_STATE_RUNNING) return 0U;
