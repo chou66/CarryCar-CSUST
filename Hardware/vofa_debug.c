@@ -90,6 +90,7 @@ static void stop_all(void)
     uint8_t id;
     for (id = 1U; id <= 6U; ++id)
         Emm_V5_Stop_Now(id, false);
+    hwt101_set_platform_moving(AppUart_GetImu(), false);
 }
 
 
@@ -115,6 +116,8 @@ static void chassis_velocity_sync(uint8_t d1, uint8_t d2,
     if (rpm > VOFA_CHASSIS_MAX_RPM)
         rpm = VOFA_CHASSIS_MAX_RPM;
 
+    hwt101_set_platform_moving(AppUart_GetImu(), rpm != 0U);
+
     Emm_V5_Vel_Control(1U, d1, rpm, acc, true);
     HAL_Delay(3U);
     Emm_V5_Vel_Control(2U, d2, rpm, acc, true);
@@ -139,6 +142,7 @@ static void chassis_stop_sync(void)
     HAL_Delay(3U);
 
     Emm_V5_Synchronous_motion(0U);
+    hwt101_set_platform_moving(AppUart_GetImu(), false);
 }
 
 
@@ -515,6 +519,7 @@ void VofaDebug_Init(void)
      */
     chassis_config_init_mecanum(&cfg);
     chassis_init(&s_debug_chassis, &cfg);
+    chassis_bind_imu_filter(&s_debug_chassis, AppUart_GetImu());
     s_debug_chassis.acceleration = VOFA_FORMAL_MOVE_ACC;
 
     /*

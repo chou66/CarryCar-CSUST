@@ -30,6 +30,12 @@ static const WheelCommand *wheel_for_id(const MecanumWheelCommand *wheels, uint8
     }
 }
 
+static void set_imu_motion_hint(Chassis *chassis, bool moving)
+{
+    if (chassis && chassis->imu_filter)
+        hwt101_set_platform_moving(chassis->imu_filter, moving);
+}
+
 static HAL_StatusTypeDef send_motion_to_wheel(const Chassis *chassis, uint8_t id)
 {
     const WheelCommand *wheel = wheel_for_id(&chassis->active_wheels, id);
@@ -147,6 +153,7 @@ static void begin_motion(Chassis *chassis, uint32_t now_ms)
             chassis->position_done = true;
             chassis->tx_state = CHASSIS_TX_IDLE;
             chassis->dirty = false;
+            set_imu_motion_hint(chassis, false);
             return;
         }
 
@@ -183,6 +190,7 @@ static void fail_motion_dispatch(Chassis *chassis, uint32_t now_ms)
     chassis->dirty = false;
     chassis->velocity_watchdog_armed = false;
     chassis->emergency_stop = true;
+    set_imu_motion_hint(chassis, false);
     begin_stop(chassis, now_ms);
 }
 
@@ -191,6 +199,7 @@ static void fail_position_motion(Chassis *chassis, uint32_t now_ms)
     chassis->position_failed = true;
     chassis->position_done = false;
     chassis->emergency_stop = true;
+    set_imu_motion_hint(chassis, false);
     begin_stop(chassis, now_ms);
 }
 
@@ -230,6 +239,13 @@ void chassis_init(Chassis *chassis, const MecanumConfig *config)
     };
 }
 
+void chassis_bind_imu_filter(Chassis *chassis, Hwt101 *imu)
+{
+    if (!chassis) return;
+    chassis->imu_filter = imu;
+    hwt101_set_platform_moving(imu, false);
+}
+
 void chassis_set_velocity(Chassis *chassis, float vx, float vy, float wz, uint32_t now_ms)
 {
     /* NaN/Inf must never reach the kinematics or float-to-integer conversions. */
@@ -247,6 +263,8 @@ void chassis_set_velocity(Chassis *chassis, float vx, float vy, float wz, uint32
     chassis->velocity_watchdog_armed = true;
     chassis->tx_failed = false;
     chassis->dirty = true;
+    set_imu_motion_hint(chassis,
+                        vx != 0.0f || vy != 0.0f || wz != 0.0f);
 }
 
 void chassis_set_position(Chassis *chassis, float dx, float dy, float dtheta,
@@ -272,6 +290,8 @@ void chassis_set_position(Chassis *chassis, float dx, float dy, float dtheta,
     chassis->position_done = false;
     chassis->position_failed = false;
     chassis->dirty = true;
+    set_imu_motion_hint(chassis,
+                        dx != 0.0f || dy != 0.0f || dtheta != 0.0f);
 }
 
 void chassis_set_position_timeout(Chassis *chassis, uint32_t timeout_ms)
@@ -298,6 +318,7 @@ void chassis_stop(Chassis *chassis)
     chassis->target_z = 0.0f;
     chassis->dirty = false;
     chassis->emergency_stop = true;
+    set_imu_motion_hint(chassis, false);
 }
 
 bool chassis_position_done(const Chassis *chassis)
@@ -413,6 +434,7 @@ void chassis_update(Chassis *chassis, uint32_t now_ms)
             chassis->position_done = true;
             chassis->position_failed = false;
             chassis->tx_state = CHASSIS_TX_IDLE;
+            set_imu_motion_hint(chassis, false);
             return;
         }
 
@@ -448,6 +470,7 @@ void chassis_update(Chassis *chassis, uint32_t now_ms)
         if (chassis->tx_state == CHASSIS_TX_STOP_4) {
             chassis->tx_state = CHASSIS_TX_IDLE;
             chassis->emergency_stop = false;
+            set_imu_motion_hint(chassis, false);
         } else {
             chassis->tx_state = (ChassisTxState)((uint32_t)chassis->tx_state + 1U);
             chassis->next_tx_ms = now_ms;

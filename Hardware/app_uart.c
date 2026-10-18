@@ -26,6 +26,26 @@ static uint8_t s_rx_hmi;
 static uint8_t s_rx5;
 static Hwt101 s_imu;
 
+/* HWT101 滤波诊断镜像：避免 Keil Watch 依赖本文件 static 符号解析。 */
+volatile float imu_debug_yaw_raw_deg = 0.0f;
+volatile float imu_debug_yaw_filtered_deg = 0.0f;
+volatile float imu_debug_gyro_z_dps = 0.0f;
+volatile uint8_t imu_debug_yaw_hold_active = 0U;
+volatile uint8_t imu_debug_platform_moving = 0U;
+volatile uint32_t imu_debug_hold_enter_count = 0U;
+volatile uint32_t imu_debug_hold_exit_count = 0U;
+
+static void update_imu_debug_mirror(void)
+{
+    imu_debug_yaw_raw_deg = s_imu.yaw_raw_deg;
+    imu_debug_yaw_filtered_deg = s_imu.yaw_deg;
+    imu_debug_gyro_z_dps = s_imu.gyro_z_dps;
+    imu_debug_yaw_hold_active = s_imu.yaw_hold_active;
+    imu_debug_platform_moving = s_imu.platform_moving;
+    imu_debug_hold_enter_count = s_imu.yaw_hold_enter_count;
+    imu_debug_hold_exit_count = s_imu.yaw_hold_exit_count;
+}
+
 /*
  * USART3 / HMI 原始接收诊断。
  *
@@ -103,6 +123,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     if (huart == &huart1)
     {
         hwt101_feed_byte(&s_imu, s_rx1, now);
+        update_imu_debug_mirror();
         arm_rx(&huart1, &s_rx1);
     }
     else if (huart == &huart3)

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "mecanum_kinematics.h"
+#include "hwt101_uart.h"
 
 typedef enum {
     CHASSIS_MODE_VELOCITY,
@@ -25,6 +26,8 @@ typedef enum {
 
 typedef struct {
     MecanumConfig config;
+    /* 可选：绑定后由底盘命令自动门控 HWT101 停车抗漂移层。 */
+    Hwt101 *imu_filter;
     ChassisMode mode;
     float target_x;       /* 速度模式：vx_mps；位置模式：dx_m */
     float target_y;       /* 速度模式：vy_mps；位置模式：dy_m */
@@ -64,6 +67,7 @@ typedef struct {
 } Chassis;
 
 void chassis_init(Chassis *chassis, const MecanumConfig *config);
+void chassis_bind_imu_filter(Chassis *chassis, Hwt101 *imu);
 void chassis_set_velocity(Chassis *chassis, float vx_mps, float vy_mps,
                           float wz_radps, uint32_t now_ms);
 void chassis_set_position(Chassis *chassis, float dx_m, float dy_m,

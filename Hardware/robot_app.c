@@ -1069,6 +1069,7 @@ void RobotApp_Init(void)
     HMI_Protocol_Init();
     K230_Init();
     AppUart_Init();
+    chassis_bind_imu_filter(&s_chassis, AppUart_GetImu());
     HMI_Display_Init();
     HMI_Navigation_Init(&s_nav);
     EdgeMotion_Init(&s_edge, &s_chassis, &s_nav);

@@ -22,6 +22,15 @@
 void AppUart_Init(void);
 Hwt101 *AppUart_GetImu(void);
 
+/* HWT101 停车抗漂移层的 Keil Watch 镜像。 */
+extern volatile float imu_debug_yaw_raw_deg;
+extern volatile float imu_debug_yaw_filtered_deg;
+extern volatile float imu_debug_gyro_z_dps;
+extern volatile uint8_t imu_debug_yaw_hold_active;
+extern volatile uint8_t imu_debug_platform_moving;
+extern volatile uint32_t imu_debug_hold_enter_count;
+extern volatile uint32_t imu_debug_hold_exit_count;
+
 
 /*
  * HMI / USART3 接收诊断变量。
