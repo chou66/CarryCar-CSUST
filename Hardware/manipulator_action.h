@@ -205,8 +205,9 @@ typedef enum
  *
  * 只有「伸到识别位」那一段会先走 ROTATE（云台先转、滑台后伸）；
  * 「退回原点」不动云台，直接从 MOVE 开始。
- * 原料区/暂存区带 MANIP_VISION_PRE_DROP_MM 时，WAIT 到位后再走 LOWER；
+ * 暂存区带 STORAGE_VISION_PRE_DROP_MM 时，WAIT 到位后再走 LOWER；
  * 带预下降的回原点则先走 RAISE 抬回最高点，再回缩滑台。
+ * 原料区不做预下降，仍然直接 DONE。
  */
 typedef enum
 {
@@ -307,11 +308,7 @@ bool ManipulatorAction_StartToTrayAtPose(const ManipPose_t *pickup_pose);
  *   - 主动作空闲，滑台点动不在忙；
  *   - 滑台位置基准可信，且当前位置与 pickup_pose->slide_extend_mm 一致
  *     （容差 0.5 mm）；
- *   - 电机5位于视觉预下降高度（未启用预下降时就是最高原点），夹爪已张开。
- *
- * 若识别前执行过 MANIP_VISION_PRE_DROP_MM 预下降，本入口只补完
- * “取料高度 - 预下降量”的剩余下降量；夹紧后仍按完整取料高度一次抬回
- * 最高原点，因此后续滑台回缩/转盘/放料的高度假设不变。
+ *   - 电机5位于最高原点（原料区不做视觉预下降），夹爪已张开。
  *
  * 返回值 false 表示前提不满足或参数非法；此时不改变任何动作状态。
  * 回程滑台位移按“实测当前位置”计算，确保夹取后能准确退回 0 mm。
@@ -333,15 +330,15 @@ void ManipulatorAction_Abort(void);
  *   2) 滑台后伸——通用识别伸到 POS2 的伸出量；原料区停靠后使用
  *      RAW_VISION_SLIDE_START_MM（已扣除底盘靠近量），
  *      让取像距离与识别姿态自洽。
- *   3) 原料区/暂存区在滑台到位后，再下降电机5 MANIP_VISION_PRE_DROP_MM，
- *      让相机靠近物料后再发 detect/place。粗加工区不预下降。
+ *   3) 暂存区在滑台到位后，再下降电机5 STORAGE_VISION_PRE_DROP_MM，
+ *      让相机靠近圆环后再发 place。原料区/粗加工区不预下降，保持在
+ *      最高原点识别。
  * 三件都就位后才由上层发 detect/place（见 K230Align_StartPreset）。
  * 识别结束后：
  *   - 原料区由 RawMaterialAlign 动态调整云台/滑台，对准完成后调用
- *     StartToTrayFromAlignedPose() 从当前预下降高度补完剩余下降量再抓取；
- *     夹紧后一次抬回最高原点，不再退回原点；
- *   - 粗加工区/暂存区仍由调用方退回原点：带预下降时先 RAISE 抬回最高点，
- *     再回缩滑台，然后从最高原点执行固定位姿动作。
+ *     StartToTrayFromAlignedPose() 从最高原点直接下降抓取，不再退回原点；
+ *   - 粗加工区/暂存区仍由调用方退回原点：暂存区若带预下降，先 RAISE
+ *     抬回最高点，再回缩滑台，然后从最高原点执行固定位姿动作。
  * 动作引擎里「伸出=发相对位移、回程=发负值」的假设因此保持不变。
  *
  * 模块会在每次电机到位确认后记录滑台绝对位置。原料视觉位置环可反复调用
@@ -385,7 +382,7 @@ float ManipulatorAction_SlideJogGetPositionMm(void);
 bool ManipulatorAction_SlideJogPositionKnown(void);
 
 /*
- * 视觉预下降状态（原料区/暂存区识别用）。
+ * 视觉预下降状态（暂存区识别用；原料区不做预下降）。
  * 返回已经实际施加到电机5上的下降量，负数=当前比最高原点低；
  * 未预下降或已由后续动作接管时返回 0。
  */

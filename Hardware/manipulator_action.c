@@ -132,7 +132,7 @@ static bool jog_position_valid = true;
 static float jog_delta_mm = 0.0f;
 
 /*
- * 视觉预下降（原料区/暂存区）：
+ * 视觉预下降（当前仅暂存区识别使用，原料区保持最高点识别）：
  *   jog_vision_drop_target_mm 本次准备下降的带符号位移（负数=向下）；
  *   jog_vision_drop_mm        已经确认施加到电机5上的带符号位移；
  *   jog_vision_drop_applied   true 表示电机5当前比最高原点低 -drop_mm，
@@ -493,8 +493,8 @@ static bool prepare_to_tray_start(const ManipPose_t *pickup_pose)
 
     /*
      * 预下降已经低于/等于本次取料高度时，剩余位移会变成向上走，
-     * 说明 MANIP_VISION_PRE_DROP_MM 配置过深。拒绝启动，保持预下降
-     * 状态不变，由上层报错；绝不能悄悄把夹爪先抬起来再抓。
+     * 说明预下降量配置得过深（当前对应 STORAGE_VISION_PRE_DROP_MM）。
+     * 拒绝启动，保持预下降状态不变，由上层报错；绝不能悄悄把夹爪先抬起来再抓。
      */
     if (jog_vision_drop_applied &&
         ((effective_mm - jog_vision_drop_mm) > 0.05f))
@@ -568,9 +568,9 @@ bool ManipulatorAction_StartToTrayAtPose(const ManipPose_t *pickup_pose)
  * RawMaterialAlign 又把云台/滑台调到相机验证过的二维位置。因此本入口
  * 只校验“滑台位置确实等于传入位姿”，然后从直接下降状态开始。
  *
- * 视觉预置若已把电机5下降到 -MANIP_VISION_PRE_DROP_MM，prepare_to_tray_start()
- * 只把剩余下降量写进去程位移，回程仍按完整取料高度计算，保证夹紧后
- * 一次抬回最高原点。
+ * 原料区保持在最高原点识别，调用时电机5位于最高原点，因此这里按完整的
+ * MANIP_PICKUP_TABLE_MM 下降量执行；回程仍按完整取料高度计算，
+ * 夹紧后一次抬回最高原点。
  */
 bool ManipulatorAction_StartToTrayFromAlignedPose(const ManipPose_t *pickup_pose)
 {
@@ -1963,7 +1963,7 @@ bool ManipulatorAction_SlideJogToStorageAlignStart(void)
      * SlideJogHomeStart() 先抬回最高点，再回缩滑台。
      */
     return slide_jog_start_target(STORAGE_SLIDE_POS2_MM, true,
-                                  MANIP_VISION_PRE_DROP_MM);
+                                  STORAGE_VISION_PRE_DROP_MM);
 }
 
 bool ManipulatorAction_SlideJogToRawAlignStart(void)
@@ -1981,11 +1981,11 @@ bool ManipulatorAction_SlideJogToRawAlignStart(void)
     }
 
     /*
-     * 滑台到识别位后先下降电机5预取像高度；RawMaterialAlign 对准完成后
-     * StartToTrayFromAlignedPose() 会从该高度补完剩余下降量再抓取。
+     * 原料区保持在最高原点识别，不做视觉预下降：每块料都要在夹爪靠近
+     * 物料的位置做多轮旋转微调，提前下降会缩小夹爪与物料的间隙。
+     * RawMaterialAlign 对准完成后由 StartToTrayFromAlignedPose() 直接下降。
      */
-    return slide_jog_start_target(RAW_VISION_SLIDE_START_MM, true,
-                                  MANIP_VISION_PRE_DROP_MM);
+    return slide_jog_start_target(RAW_VISION_SLIDE_START_MM, true, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogToPositionStart(float target_mm)

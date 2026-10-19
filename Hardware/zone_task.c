@@ -394,10 +394,9 @@ void ZoneTask_Update(uint32_t now_ms)
             step = &active_program->steps[task_index];
 
             /*
-             * 云台姿态、滑台前伸和视觉预下降都已经在 SLIDE_OUT 那一段做完了
+             * 云台姿态与滑台前伸都已经在 SLIDE_OUT 那一段做完了
              * （ManipulatorAction_SlideJogToRawAlignStart：先转云台到取料位2
-             * 并张开，再把滑台前伸到识别位，最后下降电机5
-             * MANIP_VISION_PRE_DROP_MM），这里只负责发 detect,<颜色号>
+             * 并张开，再把滑台前伸到识别位），这里只负责发 detect,<颜色号>
              * 并等识别到该颜色、微调到偏差容差内，才允许夹取。
              */
             if (!RawMaterialAlign_Start(step->align_color, now_ms))
