@@ -132,7 +132,7 @@ static bool jog_position_valid = true;
 static float jog_delta_mm = 0.0f;
 
 /*
- * 视觉预下降（当前仅暂存区识别使用，原料区保持最高点识别）：
+ * 视觉预下降（粗加工区/暂存区识别使用，原料区保持最高点识别）：
  *   jog_vision_drop_target_mm 本次准备下降的带符号位移（负数=向下）；
  *   jog_vision_drop_mm        已经确认施加到电机5上的带符号位移；
  *   jog_vision_drop_applied   true 表示电机5当前比最高原点低 -drop_mm，
@@ -493,7 +493,7 @@ static bool prepare_to_tray_start(const ManipPose_t *pickup_pose)
 
     /*
      * 预下降已经低于/等于本次取料高度时，剩余位移会变成向上走，
-     * 说明预下降量配置得过深（当前对应 STORAGE_VISION_PRE_DROP_MM）。
+     * 说明预下降量配置得过深（粗加工区/暂存区的预下降宏）。
      * 拒绝启动，保持预下降状态不变，由上层报错；绝不能悄悄把夹爪先抬起来再抓。
      */
     if (jog_vision_drop_applied &&
@@ -1942,7 +1942,13 @@ bool ManipulatorAction_SlideJogToRoughAlignStart(void)
         return false;
     }
 
-    return slide_jog_start_target(ROUGH_SLIDE_POS2_MM, true, 0.0f);
+    /*
+     * 与暂存区相同：滑台到位后再下降电机5到预取像高度，让相机靠近
+     * 2号圆环；K230 底盘对位和航向复核结束后由 SlideJogHomeStart()
+     * 先抬回最高点，再回缩滑台。
+     */
+    return slide_jog_start_target(ROUGH_SLIDE_POS2_MM, true,
+                                  ROUGH_VISION_PRE_DROP_MM);
 }
 
 bool ManipulatorAction_SlideJogToStorageAlignStart(void)

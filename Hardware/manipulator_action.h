@@ -205,8 +205,8 @@ typedef enum
  *
  * 只有「伸到识别位」那一段会先走 ROTATE（云台先转、滑台后伸）；
  * 「退回原点」不动云台，直接从 MOVE 开始。
- * 暂存区带 STORAGE_VISION_PRE_DROP_MM 时，WAIT 到位后再走 LOWER；
- * 带预下降的回原点则先走 RAISE 抬回最高点，再回缩滑台。
+ * 粗加工区/暂存区带 ROUGH_/STORAGE_VISION_PRE_DROP_MM 时，WAIT 到位后
+ * 再走 LOWER；带预下降的回原点则先走 RAISE 抬回最高点，再回缩滑台。
  * 原料区不做预下降，仍然直接 DONE。
  */
 typedef enum
@@ -330,15 +330,15 @@ void ManipulatorAction_Abort(void);
  *   2) 滑台后伸——通用识别伸到 POS2 的伸出量；原料区停靠后使用
  *      RAW_VISION_SLIDE_START_MM（已扣除底盘靠近量），
  *      让取像距离与识别姿态自洽。
- *   3) 暂存区在滑台到位后，再下降电机5 STORAGE_VISION_PRE_DROP_MM，
- *      让相机靠近圆环后再发 place。原料区/粗加工区不预下降，保持在
- *      最高原点识别。
+ *   3) 粗加工区/暂存区在滑台到位后，再下降电机5
+ *      ROUGH_/STORAGE_VISION_PRE_DROP_MM，让相机靠近圆环后再发 place。
+ *      原料区不预下降，保持在最高原点识别。
  * 三件都就位后才由上层发 detect/place（见 K230Align_StartPreset）。
  * 识别结束后：
  *   - 原料区由 RawMaterialAlign 动态调整云台/滑台，对准完成后调用
  *     StartToTrayFromAlignedPose() 从最高原点直接下降抓取，不再退回原点；
- *   - 粗加工区/暂存区仍由调用方退回原点：暂存区若带预下降，先 RAISE
- *     抬回最高点，再回缩滑台，然后从最高原点执行固定位姿动作。
+ *   - 粗加工区/暂存区仍由调用方退回原点：带预下降时先 RAISE 抬回最高点，
+ *     再回缩滑台，然后从最高原点执行固定位姿动作。
  * 动作引擎里「伸出=发相对位移、回程=发负值」的假设因此保持不变。
  *
  * 模块会在每次电机到位确认后记录滑台绝对位置。原料视觉位置环可反复调用
@@ -349,9 +349,11 @@ void ManipulatorAction_Abort(void);
  * 启动条件不满足时返回 false 且不改变任何状态：
  *   SlideJogToAlignStart —— 暂存区通用识别预置
  *   SlideJogToRoughAlignStart —— 粗加工区2号参考环预置，使用实车标定的
- *                                ROUGH_SLIDE_POS2_MM
+ *                                ROUGH_SLIDE_POS2_MM，滑台到位后预下降
+ *                                ROUGH_VISION_PRE_DROP_MM
  *   SlideJogToStorageAlignStart —— 暂存区2号参考环预置，使用独立的
- *                                  STORAGE_SLIDE_POS2_MM
+ *                                  STORAGE_SLIDE_POS2_MM，滑台到位后预下降
+ *                                  STORAGE_VISION_PRE_DROP_MM
  *   SlideJogToRawAlignStart —— 原料停靠后的补偿预伸
  *   SlideJogToPositionStart —— 当前位置可信，走到新的绝对目标
  *   SlideJogHomeStart       —— 从当前可信的非零位置回原点；若此前做过
@@ -382,7 +384,7 @@ float ManipulatorAction_SlideJogGetPositionMm(void);
 bool ManipulatorAction_SlideJogPositionKnown(void);
 
 /*
- * 视觉预下降状态（暂存区识别用；原料区不做预下降）。
+ * 视觉预下降状态（粗加工区/暂存区识别用；原料区不做预下降）。
  * 返回已经实际施加到电机5上的下降量，负数=当前比最高原点低；
  * 未预下降或已由后续动作接管时返回 0。
  */
