@@ -655,6 +655,42 @@ static void process_cmd(void)
         hwt101_set_zero(AppUart_GetImu());
         break;
 
+    case 0x03U:
+        /*
+         * HWT101 零偏自校准。
+         *   P1=1 开始：发送 FF AA 48 01 00，整车必须静止；到时自动发送
+         *              FF AA 48 00 00 退出。
+         *   P1=0 中止：立即发送退出指令。
+         *   P2 = 校准时长（秒），0 表示默认 20 s，内部限制 5~120 s。
+         *
+         * 只允许在任务未启动/已结束，或 VOFA 已接管（RobotApp 暂停）
+         * 时执行，避免边行驶边校准。
+         */
+        if (p1 == 0U)
+        {
+            AppUart_ImuZeroBiasCalAbort();
+            break;
+        }
+
+        if (p1 != 1U)
+        {
+            last_result = 2U;
+            break;
+        }
+
+        if (!RobotApp_IsVofaOverride() && !RobotApp_IsMissionIdle())
+        {
+            last_result = 2U;
+            break;
+        }
+
+        if (!AppUart_ImuZeroBiasCalStart(HAL_GetTick(),
+                                         (uint32_t)p2 * 1000U))
+        {
+            last_result = 2U;
+        }
+        break;
+
     case 0x10U:
         if (!valid_id(p1) || p2 > 1U) { last_result = 2U; break; }
         Emm_V5_En_Control(p1, p2 ? true : false, false);

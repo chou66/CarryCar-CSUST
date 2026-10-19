@@ -145,6 +145,13 @@ int main(void)
 		
 
     VofaDebug_Update(now_ms);
+    /*
+     * HWT101 零偏校准计时（VOFA 0x03 启动后约 20 s 自动退出）。
+     * 这里重新取 tick：0x03 是在 VofaDebug_Update() 内部用 HAL_GetTick()
+     * 记录起点的，若继续用循环开头缓存的 now_ms，理论上可能比起点小 1 ms，
+     * 无符号相减会下溢成极大值并立刻结束校准。
+     */
+    AppUart_Update(HAL_GetTick());
     RobotApp_Update(now_ms);
 
 		

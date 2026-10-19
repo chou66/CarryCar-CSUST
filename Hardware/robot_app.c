@@ -1292,5 +1292,12 @@ uint8_t RobotApp_IsVofaOverrideReady(void)
     return (robot_app_vofa_override && robot_app_vofa_override_ready) ? 1U : 0U;
 }
 
+uint8_t RobotApp_IsMissionIdle(void)
+{
+    return (robot_mission_state == MISSION_WAIT_MAP ||
+            robot_mission_state == MISSION_DONE ||
+            robot_mission_state == MISSION_ERROR) ? 1U : 0U;
+}
+
 Chassis *RobotApp_GetChassis(void) { return &s_chassis; }
 HMI_Navigation_t *RobotApp_GetNavigation(void) { return &s_nav; }

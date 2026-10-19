@@ -20,6 +20,8 @@ void RobotApp_EStop(void);
 void RobotApp_EnterVofaOverride(void);
 uint8_t RobotApp_IsVofaOverride(void);
 uint8_t RobotApp_IsVofaOverrideReady(void);
+/* 1=任务尚未启动或已结束/失败，允许做不影响执行器的维护操作。 */
+uint8_t RobotApp_IsMissionIdle(void);
 extern volatile uint8_t robot_app_vofa_override;
 extern volatile uint8_t robot_app_vofa_override_ready;
 

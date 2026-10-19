@@ -20,7 +20,28 @@
  * HAL_UART_RxCpltCallback() 只允许在 app_uart.c 中维护一份。
  */
 void AppUart_Init(void);
+void AppUart_Update(uint32_t now_ms);
 Hwt101 *AppUart_GetImu(void);
+
+/*
+ * HWT101 零偏自校准（VOFA 命令 0x03）。
+ *
+ * 发送 FF AA 48 01 00 后模块进入“自动获取零偏”模式，整车必须保持静止
+ * 约 20 s；到时自动发送 FF AA 48 00 00 退出。返回值 0 表示拒绝
+ * （正在校准 / 底盘仍在运动 / 串口发送失败）。
+ *
+ * 注意：
+ *   - 校准会改变模块后续的零偏估计，应在建立比赛世界零点之前做；
+ *   - duration_ms 传 0 使用默认 20000 ms，内部限制在 5 s ~ 120 s；
+ *   - 校准过程中一旦检测到底盘运动命令，会立即退出并置为中止状态。
+ */
+uint8_t AppUart_ImuZeroBiasCalStart(uint32_t now_ms, uint32_t duration_ms);
+void AppUart_ImuZeroBiasCalAbort(void);
+
+/* 零偏校准状态镜像：0=空闲, 1=校准中, 2=完成, 3=因底盘运动中止, 4=串口失败。 */
+extern volatile uint8_t imu_debug_zero_bias_cal_state;
+extern volatile uint32_t imu_debug_zero_bias_cal_elapsed_ms;
+extern volatile uint32_t imu_debug_zero_bias_cal_total_ms;
 
 /* HWT101 停车抗漂移层的 Keil Watch 镜像。 */
 extern volatile float imu_debug_yaw_raw_deg;

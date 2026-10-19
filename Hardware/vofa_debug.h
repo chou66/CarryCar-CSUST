@@ -41,6 +41,13 @@
  *
  * 01 stop all motors
  * 02 zero HWT101 yaw
+ * 03 HWT101 zero-bias auto calibration:
+ *    P1=1 start (send FF AA 48 01 00, keep the whole chassis still),
+ *    P1=0 abort (send FF AA 48 00 00 immediately).
+ *    P2=calibration seconds, 0 -> default 20 s (clamped to 5..120 s).
+ *    Only accepted when the mission is idle or VOFA override is active.
+ *    The exit command FF AA 48 00 00 is sent automatically when time is up,
+ *    when P1=0, or when a chassis motion command arrives during calibration.
  * 10 motor enable: P1=id, P2=0/1
  * 11 motor velocity: P1=id, P2=dir, P3=rpm/10, P4=acc
  * 12 stop one motor: P1=id
@@ -141,7 +148,9 @@
  *   vehicle RIGHT points from node 1 toward node 2 (+X)
  *
  * Ch9 / last_result:
- * 0=no command, 1=accepted/running, 2=bad parameter or busy,
+ * 0=no command, 1=accepted/running, 2=bad parameter or busy
+ *   (0x03 also returns 2 when the mission is running, the chassis is still
+ *    moving, calibration is already running, or the USART1 TX failed),
  * 3=unknown command, 4=formal position done, 5=formal position failed,
  * 6=navigation target reached, 7=navigation/no-path logic error,
  * 8=navigation physical edge motion failed,

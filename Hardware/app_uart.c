@@ -26,6 +26,35 @@ static uint8_t s_rx_hmi;
 static uint8_t s_rx5;
 static Hwt101 s_imu;
 
+/*
+ * HWT101 零偏自校准。
+ *
+ * HWT101 是纯积分单轴陀螺，零偏会直接积分成航向漂移。模块支持
+ * “自动获取零偏”模式：静止约 20 s 让固件重新估计零偏，再退出。
+ * 这里只负责发指令和计时，静止由调用者保证；一旦底盘收到运动命令，
+ * 说明校准条件已被破坏，立即退出并标记中止，避免写入一个错误的零偏。
+ */
+#define IMU_ZERO_BIAS_CAL_DEFAULT_MS     20000U
+#define IMU_ZERO_BIAS_CAL_MIN_MS          5000U
+#define IMU_ZERO_BIAS_CAL_MAX_MS        120000U
+#define IMU_ZERO_BIAS_CAL_TX_TIMEOUT_MS     20U
+
+#define IMU_ZERO_BIAS_CAL_IDLE              0U
+#define IMU_ZERO_BIAS_CAL_RUNNING           1U
+#define IMU_ZERO_BIAS_CAL_DONE              2U
+#define IMU_ZERO_BIAS_CAL_ABORTED_MOTION    3U
+#define IMU_ZERO_BIAS_CAL_UART_ERROR        4U
+
+static const uint8_t s_imu_cal_enter_cmd[5] = {0xFFU, 0xAAU, 0x48U, 0x01U, 0x00U};
+static const uint8_t s_imu_cal_exit_cmd[5]  = {0xFFU, 0xAAU, 0x48U, 0x00U, 0x00U};
+
+volatile uint8_t imu_debug_zero_bias_cal_state = IMU_ZERO_BIAS_CAL_IDLE;
+volatile uint32_t imu_debug_zero_bias_cal_elapsed_ms = 0U;
+volatile uint32_t imu_debug_zero_bias_cal_total_ms = 0U;
+
+static uint32_t s_imu_cal_start_ms;
+static uint32_t s_imu_cal_total_ms;
+
 /* HWT101 滤波诊断镜像：避免 Keil Watch 依赖本文件 static 符号解析。 */
 volatile float imu_debug_yaw_raw_deg = 0.0f;
 volatile float imu_debug_yaw_filtered_deg = 0.0f;
@@ -114,6 +143,87 @@ void AppUart_Init(void)
 Hwt101 *AppUart_GetImu(void)
 {
     return &s_imu;
+}
+
+static uint8_t imu_command_send(const uint8_t *cmd)
+{
+    return (HAL_UART_Transmit(&huart1, (uint8_t *)cmd, 5U,
+                              IMU_ZERO_BIAS_CAL_TX_TIMEOUT_MS) == HAL_OK) ? 1U : 0U;
+}
+
+static void imu_zero_bias_cal_finish(uint8_t final_state)
+{
+    /* 只有真正处于校准模式时才需要退出指令，避免干扰模块正常输出。 */
+    if (!imu_command_send(s_imu_cal_exit_cmd))
+    {
+        final_state = IMU_ZERO_BIAS_CAL_UART_ERROR;
+    }
+
+    imu_debug_zero_bias_cal_state = final_state;
+}
+
+uint8_t AppUart_ImuZeroBiasCalStart(uint32_t now_ms, uint32_t duration_ms)
+{
+    if (imu_debug_zero_bias_cal_state == IMU_ZERO_BIAS_CAL_RUNNING)
+        return 0U;
+
+    /* 底盘仍有运动命令时不允许开始，否则零偏会被运动污染。 */
+    if (s_imu.platform_moving)
+        return 0U;
+
+    if (duration_ms == 0U)
+        duration_ms = IMU_ZERO_BIAS_CAL_DEFAULT_MS;
+    if (duration_ms < IMU_ZERO_BIAS_CAL_MIN_MS)
+        duration_ms = IMU_ZERO_BIAS_CAL_MIN_MS;
+    if (duration_ms > IMU_ZERO_BIAS_CAL_MAX_MS)
+        duration_ms = IMU_ZERO_BIAS_CAL_MAX_MS;
+
+    if (!imu_command_send(s_imu_cal_enter_cmd))
+    {
+        imu_debug_zero_bias_cal_state = IMU_ZERO_BIAS_CAL_UART_ERROR;
+        return 0U;
+    }
+
+    s_imu_cal_start_ms = now_ms;
+    s_imu_cal_total_ms = duration_ms;
+    imu_debug_zero_bias_cal_elapsed_ms = 0U;
+    imu_debug_zero_bias_cal_total_ms = duration_ms;
+    imu_debug_zero_bias_cal_state = IMU_ZERO_BIAS_CAL_RUNNING;
+    return 1U;
+}
+
+void AppUart_ImuZeroBiasCalAbort(void)
+{
+    if (imu_debug_zero_bias_cal_state != IMU_ZERO_BIAS_CAL_RUNNING)
+        return;
+
+    imu_zero_bias_cal_finish(IMU_ZERO_BIAS_CAL_IDLE);
+}
+
+void AppUart_Update(uint32_t now_ms)
+{
+    uint32_t elapsed_ms;
+
+    if (imu_debug_zero_bias_cal_state != IMU_ZERO_BIAS_CAL_RUNNING)
+        return;
+
+    elapsed_ms = (uint32_t)(now_ms - s_imu_cal_start_ms);
+    imu_debug_zero_bias_cal_elapsed_ms = elapsed_ms;
+
+    /*
+     * 校准要求整车静止。底盘一旦收到运动命令就立即中止：此时固件可能
+     * 已经把运动样本当成零偏，继续等待只会写入更差的结果。
+     */
+    if (s_imu.platform_moving)
+    {
+        imu_zero_bias_cal_finish(IMU_ZERO_BIAS_CAL_ABORTED_MOTION);
+        return;
+    }
+
+    if (elapsed_ms >= s_imu_cal_total_ms)
+    {
+        imu_zero_bias_cal_finish(IMU_ZERO_BIAS_CAL_DONE);
+    }
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
