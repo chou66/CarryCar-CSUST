@@ -198,11 +198,15 @@ typedef enum
  *   MANIP_JOG_ROTATE 先转云台：夹爪转到识别姿态并张开，等舵机到位
  *   MANIP_JOG_MOVE   滑台指令已发出（等下一个 Update 切进 WAIT）
  *   MANIP_JOG_WAIT   等滑台到位
+ *   MANIP_JOG_LOWER  滑台已到识别位，等电机5下降到预取像高度
+ *   MANIP_JOG_RAISE  回原点前，等电机5先抬回最高原点
  *   MANIP_JOG_DONE   到位
  *   MANIP_JOG_ERROR  发送失败 / 超时 / 堵转保护
  *
  * 只有「伸到识别位」那一段会先走 ROTATE（云台先转、滑台后伸）；
  * 「退回原点」不动云台，直接从 MOVE 开始。
+ * 原料区/暂存区带 MANIP_VISION_PRE_DROP_MM 时，WAIT 到位后再走 LOWER；
+ * 带预下降的回原点则先走 RAISE 抬回最高点，再回缩滑台。
  */
 typedef enum
 {
@@ -212,7 +216,9 @@ typedef enum
     MANIP_JOG_DONE,
     MANIP_JOG_ERROR,
     /* 追加在末尾，保持前面所有枚举值不变。 */
-    MANIP_JOG_ROTATE
+    MANIP_JOG_ROTATE,
+    MANIP_JOG_LOWER,
+    MANIP_JOG_RAISE
 } ManipulatorSlideJogState_t;
 
 /*
@@ -301,7 +307,11 @@ bool ManipulatorAction_StartToTrayAtPose(const ManipPose_t *pickup_pose);
  *   - 主动作空闲，滑台点动不在忙；
  *   - 滑台位置基准可信，且当前位置与 pickup_pose->slide_extend_mm 一致
  *     （容差 0.5 mm）；
- *   - 电机5位于最高原点，夹爪已张开。
+ *   - 电机5位于视觉预下降高度（未启用预下降时就是最高原点），夹爪已张开。
+ *
+ * 若识别前执行过 MANIP_VISION_PRE_DROP_MM 预下降，本入口只补完
+ * “取料高度 - 预下降量”的剩余下降量；夹紧后仍按完整取料高度一次抬回
+ * 最高原点，因此后续滑台回缩/转盘/放料的高度假设不变。
  *
  * 返回值 false 表示前提不满足或参数非法；此时不改变任何动作状态。
  * 回程滑台位移按“实测当前位置”计算，确保夹取后能准确退回 0 mm。
@@ -323,11 +333,15 @@ void ManipulatorAction_Abort(void);
  *   2) 滑台后伸——通用识别伸到 POS2 的伸出量；原料区停靠后使用
  *      RAW_VISION_SLIDE_START_MM（已扣除底盘靠近量），
  *      让取像距离与识别姿态自洽。
- * 两件都就位后才由上层发 detect/place（见 K230Align_StartPreset）。
+ *   3) 原料区/暂存区在滑台到位后，再下降电机5 MANIP_VISION_PRE_DROP_MM，
+ *      让相机靠近物料后再发 detect/place。粗加工区不预下降。
+ * 三件都就位后才由上层发 detect/place（见 K230Align_StartPreset）。
  * 识别结束后：
  *   - 原料区由 RawMaterialAlign 动态调整云台/滑台，对准完成后调用
- *     StartToTrayFromAlignedPose() 直接从当前姿态下降抓取，不再退回原点；
- *   - 粗加工区/暂存区仍由调用方退回原点，再从原点执行固定位姿动作。
+ *     StartToTrayFromAlignedPose() 从当前预下降高度补完剩余下降量再抓取；
+ *     夹紧后一次抬回最高原点，不再退回原点；
+ *   - 粗加工区/暂存区仍由调用方退回原点：带预下降时先 RAISE 抬回最高点，
+ *     再回缩滑台，然后从最高原点执行固定位姿动作。
  * 动作引擎里「伸出=发相对位移、回程=发负值」的假设因此保持不变。
  *
  * 模块会在每次电机到位确认后记录滑台绝对位置。原料视觉位置环可反复调用
@@ -343,7 +357,8 @@ void ManipulatorAction_Abort(void);
  *                                  STORAGE_SLIDE_POS2_MM
  *   SlideJogToRawAlignStart —— 原料停靠后的补偿预伸
  *   SlideJogToPositionStart —— 当前位置可信，走到新的绝对目标
- *   SlideJogHomeStart       —— 从当前可信的非零位置回原点
+ *   SlideJogHomeStart       —— 从当前可信的非零位置回原点；若此前做过
+ *                              视觉预下降，先抬回最高原点，再回缩滑台
  *
  * 名字里的 "Jog" 是沿用旧的滑台点动叫法：这两个入口都以「滑台挪一段」
  * 为目的，ToAlignStart 额外承担了上面第 1 步的云台预转。
@@ -369,6 +384,14 @@ bool ManipulatorAction_SlideJogRebaseHome(void);
 float ManipulatorAction_SlideJogGetPositionMm(void);
 bool ManipulatorAction_SlideJogPositionKnown(void);
 
+/*
+ * 视觉预下降状态（原料区/暂存区识别用）。
+ * 返回已经实际施加到电机5上的下降量，负数=当前比最高原点低；
+ * 未预下降或已由后续动作接管时返回 0。
+ */
+float ManipulatorAction_SlideJogGetVisionDropMm(void);
+void ManipulatorAction_SlideJogClearVisionDrop(void);
+
 bool ManipulatorAction_SlideJogIsBusy(void);
 bool ManipulatorAction_SlideJogIsDone(void);
 bool ManipulatorAction_SlideJogHasError(void);
@@ -383,6 +406,10 @@ extern volatile uint8_t robot_manip_jog_state;
 extern volatile uint8_t manip_debug_jog_fail_reason;
 extern volatile float robot_manip_slide_position_mm;
 extern volatile uint8_t robot_manip_slide_position_valid;
+
+/* 视觉预下降镜像：drop_mm 负数=比最高原点低，applied=1 表示尚未抬回。 */
+extern volatile float robot_manip_vision_drop_mm;
+extern volatile uint8_t robot_manip_vision_drop_applied;
 
 bool ManipulatorAction_IsBusy(void);
 bool ManipulatorAction_IsDone(void);

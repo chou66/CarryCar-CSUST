@@ -131,10 +131,31 @@ static bool jog_position_valid = true;
  */
 static float jog_delta_mm = 0.0f;
 
+/*
+ * 视觉预下降（原料区/暂存区）：
+ *   jog_vision_drop_target_mm 本次准备下降的带符号位移（负数=向下）；
+ *   jog_vision_drop_mm        已经确认施加到电机5上的带符号位移；
+ *   jog_vision_drop_applied   true 表示电机5当前比最高原点低 -drop_mm，
+ *                             后续 TO_TRAY 动作或 SlideJogHomeStart 必须
+ *                             负责把它补齐回最高原点；
+ *   jog_vision_drop_pending   true 表示滑台到位后还要执行这次下降。
+ */
+static float jog_vision_drop_target_mm = 0.0f;
+static float jog_vision_drop_mm = 0.0f;
+static bool jog_vision_drop_applied = false;
+static bool jog_vision_drop_pending = false;
+
+/* RAISE 结束后是否继续把滑台退回原点（HomeStart 使用）。 */
+static bool jog_home_after_raise = false;
+
 volatile uint8_t robot_manip_jog_state = (uint8_t)MANIP_JOG_IDLE;
 volatile uint8_t manip_debug_jog_fail_reason = MANIP_FAIL_NONE;
 volatile float robot_manip_slide_position_mm = 0.0f;
 volatile uint8_t robot_manip_slide_position_valid = 1U;
+
+/* 视觉预下降的 Watch 镜像：负数=当前比最高原点低。 */
+volatile float robot_manip_vision_drop_mm = 0.0f;
+volatile uint8_t robot_manip_vision_drop_applied = 0U;
 
 /* 把当前状态与流程方向刷新到 Watch 可见的镜像变量。 */
 static void sync_action_state(void)
@@ -142,6 +163,8 @@ static void sync_action_state(void)
     robot_manip_action_state = (uint8_t)action_state;
     robot_manip_active_flow = (uint8_t)active_flow;
     robot_manip_jog_state = (uint8_t)jog_state;
+    robot_manip_vision_drop_mm = jog_vision_drop_mm;
+    robot_manip_vision_drop_applied = jog_vision_drop_applied ? 1U : 0U;
 }
 
 static void enter_jog_state(
@@ -401,6 +424,11 @@ void ManipulatorAction_Init(void)
     jog_current_position_mm = 0.0f;
     jog_target_position_mm = 0.0f;
     jog_position_valid = true;
+    jog_vision_drop_target_mm = 0.0f;
+    jog_vision_drop_mm = 0.0f;
+    jog_vision_drop_applied = false;
+    jog_vision_drop_pending = false;
+    jog_home_after_raise = false;
     robot_manip_jog_state = (uint8_t)MANIP_JOG_IDLE;
     manip_debug_jog_fail_reason = MANIP_FAIL_NONE;
     robot_manip_slide_position_mm = 0.0f;
@@ -463,11 +491,38 @@ static bool prepare_to_tray_start(const ManipPose_t *pickup_pose)
     effective_mm = pickup_pose->gimbal_drop_mm +
                    ((float)pickup_pose->layer * MANIP_LAYER_STEP_MM);
 
+    /*
+     * 预下降已经低于/等于本次取料高度时，剩余位移会变成向上走，
+     * 说明 MANIP_VISION_PRE_DROP_MM 配置过深。拒绝启动，保持预下降
+     * 状态不变，由上层报错；绝不能悄悄把夹爪先抬起来再抓。
+     */
+    if (jog_vision_drop_applied &&
+        ((effective_mm - jog_vision_drop_mm) > 0.05f))
+    {
+        return false;
+    }
+
     active_pickup_carousel_deg = pickup_pose->carousel_deg;
     active_pickup_slide_mm = pickup_pose->slide_extend_mm;
     active_pickup_slide_return_mm = -pickup_pose->slide_extend_mm;
-    active_pickup_gimbal_mm = effective_mm;
-    active_pickup_gimbal_return_mm = -effective_mm;
+
+    /*
+     * 如果视觉预置已经把电机5下降到取像高度，去程只需要补完剩余下降量；
+     * 回程仍按“从最高原点下到 effective_mm”计算，才能一次抬回最高点。
+     * 预下降状态从这一刻起由主动作接管。
+     */
+    if (jog_vision_drop_applied)
+    {
+        active_pickup_gimbal_mm = effective_mm - jog_vision_drop_mm;
+        active_pickup_gimbal_return_mm = -effective_mm;
+        jog_vision_drop_applied = false;
+        jog_vision_drop_mm = 0.0f;
+    }
+    else
+    {
+        active_pickup_gimbal_mm = effective_mm;
+        active_pickup_gimbal_return_mm = -effective_mm;
+    }
 
     state_start_ms = HAL_GetTick();
     motor_start_ms = 0U;
@@ -512,6 +567,10 @@ bool ManipulatorAction_StartToTrayAtPose(const ManipPose_t *pickup_pose)
  * 这里不再动云台和滑台：视觉预置已经把云台转到识别姿态并张开夹爪，
  * RawMaterialAlign 又把云台/滑台调到相机验证过的二维位置。因此本入口
  * 只校验“滑台位置确实等于传入位姿”，然后从直接下降状态开始。
+ *
+ * 视觉预置若已把电机5下降到 -MANIP_VISION_PRE_DROP_MM，prepare_to_tray_start()
+ * 只把剩余下降量写进去程位移，回程仍按完整取料高度计算，保证夹紧后
+ * 一次抬回最高原点。
  */
 bool ManipulatorAction_StartToTrayFromAlignedPose(const ManipPose_t *pickup_pose)
 {
@@ -968,6 +1027,19 @@ static void update_to_tray(uint32_t now_ms)
                     record_pending_fail(MANIP_FAIL_SERVO, 0U);
                     action_fail(now_ms);
                 }
+                break;
+            }
+
+            /*
+             * 视觉预下降量正好等于取料高度时，去程位移为 0；此时不能发
+             * 0 脉冲位置命令（等不到新的到位标志），直接闭合夹爪即可。
+             */
+            if ((active_pickup_gimbal_mm < 0.05f) &&
+                (active_pickup_gimbal_mm > -0.05f))
+            {
+                enter_state(
+                    MANIP_GROUND_TO_TRAY_CLOSE,
+                    now_ms);
                 break;
             }
 
@@ -1506,6 +1578,77 @@ static bool slide_jog_can_start(void)
 }
 
 /*
+ * 滑台已到识别位后，执行视觉预下降并切进 LOWER。
+ *
+ * 顺序固定为「先在最高点伸出滑台，再下降电机5」：伸齿条时夹爪仍处在
+ * 最高点，不容易在工件/圆环边缘扫出干涉；两轴都到位后才允许上层发
+ * detect/place。没有预下降请求时直接进入 DONE。
+ */
+static bool slide_jog_start_vision_drop(uint32_t now_ms)
+{
+    if (!jog_vision_drop_pending)
+    {
+        enter_jog_state(MANIP_JOG_DONE, now_ms);
+        return true;
+    }
+
+    prepare_motor_feedback(MOTOR_GIMBAL_MASK);
+
+    motor_start_ms = now_ms;
+    last_status_query_ms = now_ms;
+
+    if (!Manipulator_Gimbal_MoveMm(
+            jog_vision_drop_target_mm,
+            MANIP_GIMBAL_RPM,
+            MANIP_GIMBAL_ACC))
+    {
+        /* 指令没发出去，电机5没有移动，位置假设仍然成立。 */
+        manip_debug_jog_fail_reason = MANIP_FAIL_SEND;
+        jog_vision_drop_pending = false;
+        enter_jog_state(MANIP_JOG_ERROR, now_ms);
+        return false;
+    }
+
+    jog_vision_drop_pending = false;
+    enter_jog_state(MANIP_JOG_LOWER, now_ms);
+    return true;
+}
+
+/*
+ * 回原点前先抬回最高原点（视觉预下降的反向动作）。
+ * then_home=true 时，RAISE 到位后继续把滑台回缩到 0 mm。
+ */
+static bool slide_jog_start_vision_raise(bool then_home)
+{
+    uint32_t now_ms = HAL_GetTick();
+
+    if (!jog_vision_drop_applied)
+    {
+        return false;
+    }
+
+    jog_home_after_raise = then_home;
+
+    prepare_motor_feedback(MOTOR_GIMBAL_MASK);
+
+    motor_start_ms = now_ms;
+    last_status_query_ms = now_ms;
+
+    if (!Manipulator_Gimbal_MoveMm(
+            -jog_vision_drop_mm,
+            MANIP_GIMBAL_RPM,
+            MANIP_GIMBAL_ACC))
+    {
+        manip_debug_jog_fail_reason = MANIP_FAIL_SEND;
+        enter_jog_state(MANIP_JOG_ERROR, now_ms);
+        return false;
+    }
+
+    enter_jog_state(MANIP_JOG_RAISE, now_ms);
+    return true;
+}
+
+/*
  * 发滑台位移指令并切进 MOVE。ROTATE 阶段结束、以及不需要预转的退回段
  * 都走这里，保证「准备反馈 -> 记录起始时刻 -> 发指令」三步不重不漏。
  */
@@ -1529,6 +1672,14 @@ static bool slide_jog_send_move(float delta_mm)
             robot_manip_slide_position_mm = jog_current_position_mm;
             robot_manip_slide_position_valid = 1U;
             Manipulator_Slide_SetAlign();
+        }
+
+        /*
+         * 滑台本来就在识别位时，预下降仍要执行，否则视觉会在最高点取像。
+         */
+        if (jog_vision_drop_pending)
+        {
+            return slide_jog_start_vision_drop(now_ms);
         }
 
         enter_jog_state(MANIP_JOG_DONE, now_ms);
@@ -1555,14 +1706,26 @@ static bool slide_jog_send_move(float delta_mm)
     return true;
 }
 
-static bool slide_jog_start_target(float target_mm, bool prepare_vision)
+static bool slide_jog_start_target(float target_mm, bool prepare_vision,
+                                   float pre_drop_mm)
 {
     uint32_t now_ms = HAL_GetTick();
     float delta_mm;
 
     if (!slide_jog_can_start() || !jog_position_valid ||
         (target_mm < 0.0f) ||
-        (target_mm > MANIP_SLIDE_SOFT_MAX_MM))
+        (target_mm > MANIP_SLIDE_SOFT_MAX_MM) ||
+        (pre_drop_mm < 0.0f))
+    {
+        return false;
+    }
+
+    /*
+     * 上一次预下降还没抬回最高原点时，拒绝再次叠加下降量。
+     * 正常流程里不会出现（原料每次抓取后会抬回，暂存区 HomeStart 会抬回），
+     * 这里只作为防止重复下降 100 mm 的硬保护。
+     */
+    if (prepare_vision && jog_vision_drop_applied)
     {
         return false;
     }
@@ -1574,8 +1737,21 @@ static bool slide_jog_start_target(float target_mm, bool prepare_vision)
 
     if (!prepare_vision)
     {
-        /* 视觉闭环点动 / 退回原点都不重复改变云台。 */
+        /* 视觉闭环点动 / 退回原点都不重复改变云台，也不新增预下降。 */
+        jog_vision_drop_pending = false;
         return slide_jog_send_move(delta_mm);
+    }
+
+    /* 滑台到位后再下降电机5；只记录请求，等 WAIT 确认滑台到位才执行。 */
+    if (pre_drop_mm > 0.0f)
+    {
+        jog_vision_drop_target_mm = -pre_drop_mm;
+        jog_vision_drop_pending = true;
+    }
+    else
+    {
+        jog_vision_drop_target_mm = 0.0f;
+        jog_vision_drop_pending = false;
     }
 
     /*
@@ -1638,7 +1814,18 @@ static void update_slide_jog(uint32_t now_ms)
                     robot_manip_slide_position_valid = 1U;
                 }
 
-                enter_jog_state(MANIP_JOG_DONE, now_ms);
+                /*
+                 * 视觉预置：滑台到位后还要下降电机5，等 LOWER 确认后才
+                 * 允许上层发 detect/place；普通点动/回原点直接 DONE。
+                 */
+                if (jog_vision_drop_pending)
+                {
+                    (void)slide_jog_start_vision_drop(now_ms);
+                }
+                else
+                {
+                    enter_jog_state(MANIP_JOG_DONE, now_ms);
+                }
             }
             else if (motor_wait_failed(motor_result))
             {
@@ -1646,8 +1833,74 @@ static void update_slide_jog(uint32_t now_ms)
                 manip_debug_jog_fail_reason = pending_fail_reason;
                 pending_fail_reason = MANIP_FAIL_NONE;
                 pending_fail_motor = 0U;
+                jog_vision_drop_pending = false;
 
                 /* 半路停下的滑台位置不可知，位置基准作废。 */
+                Manipulator_StopAll();
+                jog_position_valid = false;
+                robot_manip_slide_position_valid = 0U;
+                enter_jog_state(MANIP_JOG_ERROR, now_ms);
+            }
+            break;
+
+        case MANIP_JOG_LOWER:
+            /* 滑台已经在识别位，这里只等电机5下降到预取像高度。 */
+            motor_result = wait_motor_position(MOTOR_GIMBAL_MASK, now_ms);
+
+            if (motor_result == MOTOR_REACHED)
+            {
+                jog_vision_drop_mm = jog_vision_drop_target_mm;
+                jog_vision_drop_applied = true;
+                enter_jog_state(MANIP_JOG_DONE, now_ms);
+            }
+            else if (motor_wait_failed(motor_result))
+            {
+                manip_debug_jog_fail_reason = pending_fail_reason;
+                pending_fail_reason = MANIP_FAIL_NONE;
+                pending_fail_motor = 0U;
+
+                /*
+                 * 电机5可能停在任意高度，不能假装它还在最高原点。
+                 * 主动作已作废，必须人工重新确认机械原点后才能继续。
+                 */
+                Manipulator_StopAll();
+                jog_position_valid = false;
+                robot_manip_slide_position_valid = 0U;
+                enter_jog_state(MANIP_JOG_ERROR, now_ms);
+            }
+            break;
+
+        case MANIP_JOG_RAISE:
+            /* 先抬回最高原点；HomeStart 还要在抬升完成后回缩滑台。 */
+            motor_result = wait_motor_position(MOTOR_GIMBAL_MASK, now_ms);
+
+            if (motor_result == MOTOR_REACHED)
+            {
+                jog_vision_drop_mm = 0.0f;
+                jog_vision_drop_target_mm = 0.0f;
+                jog_vision_drop_applied = false;
+
+                if (jog_home_after_raise)
+                {
+                    jog_home_after_raise = false;
+                    jog_to_home = true;
+                    jog_target_position_mm = 0.0f;
+                    jog_delta_mm = -jog_current_position_mm;
+
+                    /* 发送失败已由 send_move 切到 ERROR。 */
+                    (void)slide_jog_send_move(jog_delta_mm);
+                }
+                else
+                {
+                    enter_jog_state(MANIP_JOG_DONE, now_ms);
+                }
+            }
+            else if (motor_wait_failed(motor_result))
+            {
+                manip_debug_jog_fail_reason = pending_fail_reason;
+                pending_fail_reason = MANIP_FAIL_NONE;
+                pending_fail_motor = 0U;
+
                 Manipulator_StopAll();
                 jog_position_valid = false;
                 robot_manip_slide_position_valid = 0U;
@@ -1668,7 +1921,7 @@ bool ManipulatorAction_SlideJogToAlignStart(void)
         return false;
     }
 
-    return slide_jog_start_target(MANIP_PICKUP_SLIDE_ALIGN_MM, true);
+    return slide_jog_start_target(MANIP_PICKUP_SLIDE_ALIGN_MM, true, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogToRoughAlignStart(void)
@@ -1689,7 +1942,7 @@ bool ManipulatorAction_SlideJogToRoughAlignStart(void)
         return false;
     }
 
-    return slide_jog_start_target(ROUGH_SLIDE_POS2_MM, true);
+    return slide_jog_start_target(ROUGH_SLIDE_POS2_MM, true, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogToStorageAlignStart(void)
@@ -1705,7 +1958,12 @@ bool ManipulatorAction_SlideJogToStorageAlignStart(void)
         return false;
     }
 
-    return slide_jog_start_target(STORAGE_SLIDE_POS2_MM, true);
+    /*
+     * 暂存区识别同样先下降到预取像高度。K230 底盘对位完成后由
+     * SlideJogHomeStart() 先抬回最高点，再回缩滑台。
+     */
+    return slide_jog_start_target(STORAGE_SLIDE_POS2_MM, true,
+                                  MANIP_VISION_PRE_DROP_MM);
 }
 
 bool ManipulatorAction_SlideJogToRawAlignStart(void)
@@ -1722,7 +1980,12 @@ bool ManipulatorAction_SlideJogToRawAlignStart(void)
         return false;
     }
 
-    return slide_jog_start_target(RAW_VISION_SLIDE_START_MM, true);
+    /*
+     * 滑台到识别位后先下降电机5预取像高度；RawMaterialAlign 对准完成后
+     * StartToTrayFromAlignedPose() 会从该高度补完剩余下降量再抓取。
+     */
+    return slide_jog_start_target(RAW_VISION_SLIDE_START_MM, true,
+                                  MANIP_VISION_PRE_DROP_MM);
 }
 
 bool ManipulatorAction_SlideJogToPositionStart(float target_mm)
@@ -1733,18 +1996,29 @@ bool ManipulatorAction_SlideJogToPositionStart(float target_mm)
         return false;
     }
 
-    return slide_jog_start_target(target_mm, false);
+    return slide_jog_start_target(target_mm, false, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogHomeStart(void)
 {
     /* 退回量按当前已确认位置计算，不再假定识别位固定为 115 mm。 */
-    if (!Manipulator_Slide_AtAlign() || !jog_position_valid)
+    if (!Manipulator_Slide_AtAlign() || !jog_position_valid ||
+        !slide_jog_can_start())
     {
         return false;
     }
 
-    return slide_jog_start_target(0.0f, false);
+    /*
+     * 暂存区/原料区在识别位额外下降过电机5：必须先抬回最高原点，再回缩
+     * 滑台，保持“滑台回零时电机5一定在最高点”的既有前提；否则后续固定
+     * 位姿动作会从错误高度继续下降。
+     */
+    if (jog_vision_drop_applied)
+    {
+        return slide_jog_start_vision_raise(true);
+    }
+
+    return slide_jog_start_target(0.0f, false, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogRebaseHome(void)
@@ -1783,11 +2057,26 @@ bool ManipulatorAction_SlideJogPositionKnown(void)
     return jog_position_valid;
 }
 
+float ManipulatorAction_SlideJogGetVisionDropMm(void)
+{
+    return jog_vision_drop_applied ? jog_vision_drop_mm : 0.0f;
+}
+
+void ManipulatorAction_SlideJogClearVisionDrop(void)
+{
+    jog_vision_drop_target_mm = 0.0f;
+    jog_vision_drop_mm = 0.0f;
+    jog_vision_drop_applied = false;
+    jog_vision_drop_pending = false;
+}
+
 bool ManipulatorAction_SlideJogIsBusy(void)
 {
     return (jog_state == MANIP_JOG_ROTATE) ||
            (jog_state == MANIP_JOG_MOVE) ||
-           (jog_state == MANIP_JOG_WAIT);
+           (jog_state == MANIP_JOG_WAIT) ||
+           (jog_state == MANIP_JOG_LOWER) ||
+           (jog_state == MANIP_JOG_RAISE);
 }
 
 bool ManipulatorAction_SlideJogIsDone(void)
@@ -1847,9 +2136,13 @@ void ManipulatorAction_Abort(void)
      */
     if ((jog_state == MANIP_JOG_ROTATE) ||
         (jog_state == MANIP_JOG_MOVE) ||
-        (jog_state == MANIP_JOG_WAIT))
+        (jog_state == MANIP_JOG_WAIT) ||
+        (jog_state == MANIP_JOG_LOWER) ||
+        (jog_state == MANIP_JOG_RAISE))
     {
         manip_debug_jog_fail_reason = MANIP_FAIL_ABORT;
+        jog_vision_drop_pending = false;
+        jog_home_after_raise = false;
         jog_state = MANIP_JOG_ERROR;
         robot_manip_jog_state = (uint8_t)MANIP_JOG_ERROR;
     }
