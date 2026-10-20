@@ -34,8 +34,11 @@ uint16_t Servo_AngleToUs(float angle_deg, float travel_deg)
     return clamp_us((uint16_t)(pulse_us + 0.5f));
 }
 
-#define CAROUSEL_STEP_PERIOD_MS     20U  //多久改变一次脉宽
-#define CAROUSEL_STEP_US            10U  //每次改变多少脉宽
+#define CAROUSEL_STEP_PERIOD_MS     20U  //多久改变一次脉宽（PWM周期，不能再小）
+/* 每次改变的脉宽。20 us/20 ms 约 135 deg/s（270 deg / 2000 us）。
+ * 原值 10 us（约 67.5 deg/s）走完 205 deg 需 3.0 s，超过
+ * K230_ALIGN_ROTATE_TIMEOUT_MS；加大后长距离回转也能按时到位。 */
+#define CAROUSEL_STEP_US            20U  //每次改变多少脉宽
 #define CAROUSEL_SETTLE_MS          150U //输出到达目标后的稳定时间
 
 #define GRIPPER_STEP_PERIOD_MS      20U
