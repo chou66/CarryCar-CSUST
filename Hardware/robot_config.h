@@ -447,9 +447,13 @@
                                                     *   "已对准"而退出识别）。
                                                     * 粗加工区/第一轮暂存区走 PLACE，第二轮暂存区
                                                     * 走独立STACK身份闸门；本宏对它们均无影响。 */
-#define K230_ALIGN_PLACE_ID                  2U    /* 粗加工区位置基准固定为2号圆环；只对它做一次底盘视觉对位。
-                                                    * 1/3号随后完全使用 ZONE_ROUGH_POS1/3_POSE，
-                                                    * 不再次启动视觉。暂存区目前也沿用位置号2。 */
+#define K230_ALIGN_PLACE_ID                  2U    /* 粗加工区/暂存区的底盘基准固定为2号放置位：区域入口只对
+                                                    * 它做一次 K230 PLACE-2 底盘平移校准。
+                                                    * 1/3号位不再只靠写死位姿：区域任务会先用
+                                                    * ZONE_ROUGH_/ZONE_STORAGE_POSn_POSE 伸出，再用
+                                                    * place,<位号> 做云台+滑台的二维视觉校准
+                                                    * （见 RawMaterialAlign_StartPlace）。
+                                                    * 第二轮暂存区仍走 STACK-2，不受此宏影响。 */
 //#define K230_ALIGN_MM_PER_PX                0.5f   
 #define K230_ALIGN_TOLERANCE_PX              1U    /* 偏差 <= 此值即认为对准 */
 #define K230_ALIGN_MAX_ITER                  255U  /* 微调次数上限：255 是 uint8_t 上限，标定阶段等同于取消次数限制，
@@ -518,6 +522,27 @@
  * 滑台一次冲到总行程上限。闭环速度主要靠“停稳后立即请求下一帧”提高，
  * 不靠取消这道机械保护。 */
 #define RAW_VISION_SLIDE_STEP_MAX_MM            20.0f
+
+/* ---------- 粗加工区/暂存区 1、3 号位机械臂校准 ----------
+ *
+ * 区域入口已经用放置位2做过一次底盘平移校准，但底盘残余的微量平移/偏航
+ * 误差在离2号位较远的1、3号位会被放大。这里复用原料区的二维位置闭环
+ * （K230 像素偏差 -> 云台角 + 齿条伸出量），只不过启动命令从
+ * detect,<颜色> 换成 place,<放置位号>，不再移动底盘：
+ *
+ *   先按现有固定位姿伸出（云台转到该位角度、齿条伸到该位长度）
+ *   -> K230 place,<位号> 连续取像
+ *   -> px_y(a/d) 调云台角、px_x(w/s) 调齿条长度
+ *   -> 中心容差内确认后，把校准后的位姿用于本区域的放置/取回
+ *
+ * PID、方向符号、单步限幅仍沿用 RAW_VISION_*（同一套相机和机械结构）。
+ * 只有云台安全窗口需要单独放宽：原料窗口是取料位3..取料位1，而粗加工/
+ * 暂存区的3号位为178 deg，低于原料下界180.1 deg。
+ */
+#define PLACE_VISION_CAROUSEL_MIN_DEG          160.0f
+#define PLACE_VISION_CAROUSEL_MAX_DEG          250.0f
+#define PLACE_VISION_SLIDE_MIN_MM               55.0f
+#define PLACE_VISION_SLIDE_MAX_MM               MANIP_SLIDE_SOFT_MAX_MM
 
 /* ---------- 原料区三轮识别颜色 ----------
  * 原料区要把三块料依次抓进料盘 1/2/3，每块料之前各做一轮

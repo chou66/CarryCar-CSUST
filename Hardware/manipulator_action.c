@@ -1706,8 +1706,8 @@ static bool slide_jog_send_move(float delta_mm)
     return true;
 }
 
-static bool slide_jog_start_target(float target_mm, bool prepare_vision,
-                                   float pre_drop_mm)
+static bool slide_jog_start_target(float target_mm, float carousel_deg,
+                                   bool prepare_vision, float pre_drop_mm)
 {
     uint32_t now_ms = HAL_GetTick();
     float delta_mm;
@@ -1715,7 +1715,9 @@ static bool slide_jog_start_target(float target_mm, bool prepare_vision,
     if (!slide_jog_can_start() || !jog_position_valid ||
         (target_mm < 0.0f) ||
         (target_mm > MANIP_SLIDE_SOFT_MAX_MM) ||
-        (pre_drop_mm < 0.0f))
+        (pre_drop_mm < 0.0f) ||
+        (carousel_deg < PLACE_VISION_CAROUSEL_MIN_DEG) ||
+        (carousel_deg > PLACE_VISION_CAROUSEL_MAX_DEG))
     {
         return false;
     }
@@ -1758,9 +1760,10 @@ static bool slide_jog_start_target(float target_mm, bool prepare_vision,
      * 伸到识别位之前先把云台转到识别姿态并张开夹爪——顺序不能反。
      * 这里只发舵机目标，到位由 ROTATE 状态确认，确认过才发电机指令，
      * 免得夹爪还在转的时候滑台已经伸出去。
-     * 目标值与 K230Align 发检测命令前用的是同一个宏，两处必须一致。
+     * 原料区/2号参考环传 K230_ALIGN_CAROUSEL_ANGLE_DEG（POS2），
+     * 粗加工/暂存区 1、3 号位传该位固定位姿的云台角，之后由视觉微调。
      */
-    CarouselServo_SetAngle(K230_ALIGN_CAROUSEL_ANGLE_DEG);
+    CarouselServo_SetAngle(carousel_deg);
     GripperServo_Open_Large();
 
     manip_debug_jog_fail_reason = MANIP_FAIL_NONE;
@@ -1921,7 +1924,8 @@ bool ManipulatorAction_SlideJogToAlignStart(void)
         return false;
     }
 
-    return slide_jog_start_target(MANIP_PICKUP_SLIDE_ALIGN_MM, true, 0.0f);
+    return slide_jog_start_target(MANIP_PICKUP_SLIDE_ALIGN_MM,
+                                  K230_ALIGN_CAROUSEL_ANGLE_DEG, true, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogToRoughAlignStart(void)
@@ -1947,7 +1951,8 @@ bool ManipulatorAction_SlideJogToRoughAlignStart(void)
      * 2号圆环；K230 底盘对位和航向复核结束后由 SlideJogHomeStart()
      * 先抬回最高点，再回缩滑台。
      */
-    return slide_jog_start_target(ROUGH_SLIDE_POS2_MM, true,
+    return slide_jog_start_target(ROUGH_SLIDE_POS2_MM,
+                                  K230_ALIGN_CAROUSEL_ANGLE_DEG, true,
                                   ROUGH_VISION_PRE_DROP_MM);
 }
 
@@ -1968,8 +1973,29 @@ bool ManipulatorAction_SlideJogToStorageAlignStart(void)
      * 暂存区识别同样先下降到预取像高度。K230 底盘对位完成后由
      * SlideJogHomeStart() 先抬回最高点，再回缩滑台。
      */
-    return slide_jog_start_target(STORAGE_SLIDE_POS2_MM, true,
+    return slide_jog_start_target(STORAGE_SLIDE_POS2_MM,
+                                  K230_ALIGN_CAROUSEL_ANGLE_DEG, true,
                                   STORAGE_VISION_PRE_DROP_MM);
+}
+
+bool ManipulatorAction_SlideJogToRingAlignStart(float carousel_deg,
+                                                float slide_mm,
+                                                float pre_drop_mm)
+{
+    /*
+     * 粗加工区/第一轮暂存区的 1、3 号位：先按该位现有标定位姿伸出
+     * （云台角 + 齿条长度），让相机看到目标圆环的初始画面；随后
+     * RawMaterialAlign_StartPlace() 用同一套二维视觉闭环微调机械臂。
+     *
+     * 与 2 号参考环一样从原点出发，滑台到位后再预下降 pre_drop_mm，
+     * 保证 1、3 号位的取像距离与 2 号位标定时一致。
+     */
+    if (!Manipulator_Slide_AtHome())
+    {
+        return false;
+    }
+
+    return slide_jog_start_target(slide_mm, carousel_deg, true, pre_drop_mm);
 }
 
 bool ManipulatorAction_SlideJogToRawAlignStart(void)
@@ -1991,7 +2017,8 @@ bool ManipulatorAction_SlideJogToRawAlignStart(void)
      * 物料的位置做多轮旋转微调，提前下降会缩小夹爪与物料的间隙。
      * RawMaterialAlign 对准完成后由 StartToTrayFromAlignedPose() 直接下降。
      */
-    return slide_jog_start_target(RAW_VISION_SLIDE_START_MM, true, 0.0f);
+    return slide_jog_start_target(RAW_VISION_SLIDE_START_MM,
+                                  K230_ALIGN_CAROUSEL_ANGLE_DEG, true, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogToPositionStart(float target_mm)
@@ -2002,7 +2029,8 @@ bool ManipulatorAction_SlideJogToPositionStart(float target_mm)
         return false;
     }
 
-    return slide_jog_start_target(target_mm, false, 0.0f);
+    return slide_jog_start_target(target_mm, K230_ALIGN_CAROUSEL_ANGLE_DEG,
+                                  false, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogHomeStart(void)
@@ -2024,7 +2052,8 @@ bool ManipulatorAction_SlideJogHomeStart(void)
         return slide_jog_start_vision_raise(true);
     }
 
-    return slide_jog_start_target(0.0f, false, 0.0f);
+    return slide_jog_start_target(0.0f, K230_ALIGN_CAROUSEL_ANGLE_DEG,
+                                  false, 0.0f);
 }
 
 bool ManipulatorAction_SlideJogRebaseHome(void)

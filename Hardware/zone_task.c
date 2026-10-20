@@ -25,14 +25,21 @@ typedef struct
     ZoneStepFlow_t flow;
     uint8_t        tray_slot;   /* 料盘选择舵机槽位 0..2 */
     ManipPose_t    pose;        /* 外部端位姿（robot_config.h 的 ZONE_*_POSE） */
-    uint8_t        align_color; /* 0=该步不做视觉对位；1~6=开始动作前先按该
+    uint8_t        align_color; /* 0=该步不做 DETECT 对位；1~6=开始动作前先按该
                                  * 颜色号做一次 DETECT 对位（转夹爪到统一的
                                  * 识别位 POS2 + 张开 -> 滑台前伸到识别位 ->
                                  * 发 detect + 旋转舵机跟踪），识别到该颜色才夹。
                                  * 目前只有原料区填非 0。
                                  * POS2 是起始姿态；对准完成的动态角度会覆盖
-                                 * 本步 pose.carousel_deg。粗加工区/暂存区不做
-                                 * DETECT，用的是放置对位。 */
+                                 * 本步 pose.carousel_deg。 */
+    uint8_t        align_place_id; /* 0=该步不做机械臂视觉校准；1~3=开始动作前
+                                    * 先按本步固定位姿伸出，再发 place,<位号>
+                                    * 做与原料区相同的二维位置闭环。
+                                    * 同一区域批次内每个位号只校准一次，之后
+                                    * 的步骤直接复用校准结果。
+                                    * 目前只用于粗加工区两批与暂存区第一批的
+                                    * 1、3 号位；2 号位已由底盘 PLACE-2 对位，
+                                    * 暂存区第二批（叠放）保留原固定位姿流程。 */
 } ZoneStep_t;
 
 typedef struct
@@ -61,9 +68,9 @@ typedef struct
  */
 static const ZoneStep_t s_raw_batch0[3] =
 {
-    { ZONE_STEP_TO_TRAY, 0U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B1_COLOR_1 },
-    { ZONE_STEP_TO_TRAY, 1U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B1_COLOR_2 },
-    { ZONE_STEP_TO_TRAY, 2U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B1_COLOR_3 }
+    { ZONE_STEP_TO_TRAY, 0U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B1_COLOR_1, 0U },
+    { ZONE_STEP_TO_TRAY, 1U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B1_COLOR_2, 0U },
+    { ZONE_STEP_TO_TRAY, 2U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B1_COLOR_3, 0U }
 };
 
 /*
@@ -73,57 +80,66 @@ static const ZoneStep_t s_raw_batch0[3] =
  */
 static const ZoneStep_t s_raw_batch1[3] =
 {
-    { ZONE_STEP_TO_TRAY, 0U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B2_COLOR_1 },
-    { ZONE_STEP_TO_TRAY, 1U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B2_COLOR_2 },
-    { ZONE_STEP_TO_TRAY, 2U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B2_COLOR_3 }
+    { ZONE_STEP_TO_TRAY, 0U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B2_COLOR_1, 0U },
+    { ZONE_STEP_TO_TRAY, 1U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B2_COLOR_2, 0U },
+    { ZONE_STEP_TO_TRAY, 2U, ZONE_RAW_POS2_POSE, K230_RAW_ALIGN_B2_COLOR_3, 0U }
 };
 
 /*
  * 粗加工区：先把料盘三块放到三个工位，加工完再把三块取回料盘。
  *
- * 注意这里六步的 align_color 全是 0，这不是漏做视觉：RobotApp 在进入本
- * 区域前只用固定的 2 号圆环做一次 PLACE 底盘对位。对位完成以后，1/2/3
- * 号圆环的相对位置固定，所以六步全部重放 robot_config.h 里写死的
- * ZONE_ROUGH_POSn_POSE；尤其1号、3号绝不再次视觉追踪或移动底盘。
+ * 六步的 align_color 全是 0，这不是漏做视觉：RobotApp 在进入本区域前只用
+ * 固定的 2 号圆环做一次 PLACE 底盘对位。对位完成以后，2 号位直接重放
+ * ZONE_ROUGH_POS2_POSE，不移动底盘。
+ *
+ * 1、3 号位改为「先按现有固定位姿伸出 -> place,<位号> 二维闭环校准机械臂」：
+ *   放料（FROM_TRAY）时先空夹爪校准，再退回原点用校准位姿放料；
+ *   取回（TO_TRAY）时复用同一位号已经校准好的位姿，不重复校准。
+ * 两种流程都不再启动底盘视觉。
  */
 static const ZoneStep_t s_rough_batch0[6] =
 {
-    { ZONE_STEP_FROM_TRAY, 0U, ZONE_ROUGH_POS1_POSE, 0U },
-    { ZONE_STEP_FROM_TRAY, 1U, ZONE_ROUGH_POS2_POSE, 0U },
-    { ZONE_STEP_FROM_TRAY, 2U, ZONE_ROUGH_POS3_POSE, 0U },
-    { ZONE_STEP_TO_TRAY,   0U, ZONE_ROUGH_POS1_POSE, 0U },
-    { ZONE_STEP_TO_TRAY,   1U, ZONE_ROUGH_POS2_POSE, 0U },
-    { ZONE_STEP_TO_TRAY,   2U, ZONE_ROUGH_POS3_POSE, 0U }
+    { ZONE_STEP_FROM_TRAY, 0U, ZONE_ROUGH_POS1_POSE, 0U, 1U },
+    { ZONE_STEP_FROM_TRAY, 1U, ZONE_ROUGH_POS2_POSE, 0U, 0U },
+    { ZONE_STEP_FROM_TRAY, 2U, ZONE_ROUGH_POS3_POSE, 0U, 3U },
+    { ZONE_STEP_TO_TRAY,   0U, ZONE_ROUGH_POS1_POSE, 0U, 1U },
+    { ZONE_STEP_TO_TRAY,   1U, ZONE_ROUGH_POS2_POSE, 0U, 0U },
+    { ZONE_STEP_TO_TRAY,   2U, ZONE_ROUGH_POS3_POSE, 0U, 3U }
 };
 
 static const ZoneStep_t s_rough_batch1[6] =
 {
-    { ZONE_STEP_FROM_TRAY, 0U, ZONE_ROUGH_POS1_POSE, 0U },
-    { ZONE_STEP_FROM_TRAY, 1U, ZONE_ROUGH_POS2_POSE, 0U },
-    { ZONE_STEP_FROM_TRAY, 2U, ZONE_ROUGH_POS3_POSE, 0U },
-    { ZONE_STEP_TO_TRAY,   0U, ZONE_ROUGH_POS1_POSE, 0U },
-    { ZONE_STEP_TO_TRAY,   1U, ZONE_ROUGH_POS2_POSE, 0U },
-    { ZONE_STEP_TO_TRAY,   2U, ZONE_ROUGH_POS3_POSE, 0U }
-};
-
-/* 暂存区第一批：料盘三块放到暂存位第一层。 */
-static const ZoneStep_t s_storage_batch0[3] =
-{
-    { ZONE_STEP_FROM_TRAY, 0U, ZONE_STORAGE_POS1_POSE, 0U },
-    { ZONE_STEP_FROM_TRAY, 1U, ZONE_STORAGE_POS2_POSE, 0U },
-    { ZONE_STEP_FROM_TRAY, 2U, ZONE_STORAGE_POS3_POSE, 0U }
+    { ZONE_STEP_FROM_TRAY, 0U, ZONE_ROUGH_POS1_POSE, 0U, 1U },
+    { ZONE_STEP_FROM_TRAY, 1U, ZONE_ROUGH_POS2_POSE, 0U, 0U },
+    { ZONE_STEP_FROM_TRAY, 2U, ZONE_ROUGH_POS3_POSE, 0U, 3U },
+    { ZONE_STEP_TO_TRAY,   0U, ZONE_ROUGH_POS1_POSE, 0U, 1U },
+    { ZONE_STEP_TO_TRAY,   1U, ZONE_ROUGH_POS2_POSE, 0U, 0U },
+    { ZONE_STEP_TO_TRAY,   2U, ZONE_ROUGH_POS3_POSE, 0U, 3U }
 };
 
 /*
- * 暂存区第二批：叠放到第一层之上。
+ * 暂存区第一批：料盘三块放到暂存位第一层。
+ * 与粗加工区相同，1、3 号位先用 place,<位号> 校准机械臂；2 号位由底盘
+ * PLACE-2 对位后直接重放固定位姿。
+ */
+static const ZoneStep_t s_storage_batch0[3] =
+{
+    { ZONE_STEP_FROM_TRAY, 0U, ZONE_STORAGE_POS1_POSE, 0U, 1U },
+    { ZONE_STEP_FROM_TRAY, 1U, ZONE_STORAGE_POS2_POSE, 0U, 0U },
+    { ZONE_STEP_FROM_TRAY, 2U, ZONE_STORAGE_POS3_POSE, 0U, 3U }
+};
+
+/*
+ * 暂存区第二批：叠放到第一层之上，保留原流程（不插入机械臂二维校准）。
  * 这里的 pose 是默认（同序号）占位，实际目标位由
  * s_storage_l2_target[] 在运行时重映射（见 start_step_action）。
+ * 第二批的定位由 K230 的 STACK 模式（身份锚定 + 外圆定位）在 mission 层完成。
  */
 static const ZoneStep_t s_storage_batch1[3] =
 {
-    { ZONE_STEP_FROM_TRAY, 0U, ZONE_STORAGE_POS1_L2_POSE, 0U },
-    { ZONE_STEP_FROM_TRAY, 1U, ZONE_STORAGE_POS2_L2_POSE, 0U },
-    { ZONE_STEP_FROM_TRAY, 2U, ZONE_STORAGE_POS3_L2_POSE, 0U }
+    { ZONE_STEP_FROM_TRAY, 0U, ZONE_STORAGE_POS1_L2_POSE, 0U, 0U },
+    { ZONE_STEP_FROM_TRAY, 1U, ZONE_STORAGE_POS2_L2_POSE, 0U, 0U },
+    { ZONE_STEP_FROM_TRAY, 2U, ZONE_STORAGE_POS3_L2_POSE, 0U, 0U }
 };
 
 /* ★ 手工配置点 2：第二批第 i 块叠到第一批的哪个暂存位。
@@ -170,6 +186,48 @@ static uint32_t state_start_ms = 0U;
 static float raw_aligned_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
 static float raw_aligned_slide_mm = RAW_VISION_SLIDE_START_MM;
 static bool raw_aligned_pose_valid = false;
+
+/*
+ * 粗加工区/第一轮暂存区 1、3 号位的机械臂二维校准结果，按位号 1..3 缓存。
+ * 同一批次内同一位置只校准一次：FROM_TRAY 用空夹爪先校准再放料，
+ * TO_TRAY 取回时直接复用，避免重复伸出/校准和多余运动。
+ * 每次 ZoneTask_Start 清空，不同批次（底盘停靠位可能不同）不串用。
+ */
+static float ring_aligned_carousel_deg[3] =
+{
+    K230_ALIGN_CAROUSEL_ANGLE_DEG,
+    K230_ALIGN_CAROUSEL_ANGLE_DEG,
+    K230_ALIGN_CAROUSEL_ANGLE_DEG
+};
+static float ring_aligned_slide_mm[3] = { 0.0f, 0.0f, 0.0f };
+static bool ring_aligned_pose_valid[3] = { false, false, false };
+
+/* 该步是否需要在动作前做一次 place,<位号> 机械臂校准。 */
+static bool ring_align_needed(const ZoneStep_t *step)
+{
+    return (step->align_place_id >= 1U) &&
+           (step->align_place_id <= 3U) &&
+           !ring_aligned_pose_valid[step->align_place_id - 1U];
+}
+
+/* 1、3 号位校准前的预下降量：与 2 号参考环取像高度一致。 */
+static float ring_align_pre_drop_mm(void)
+{
+    return (active_zone == ZONE_ROUGH) ? ROUGH_VISION_PRE_DROP_MM
+                                       : STORAGE_VISION_PRE_DROP_MM;
+}
+
+static void reset_ring_pose_cache(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < 3U; i++)
+    {
+        ring_aligned_carousel_deg[i] = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+        ring_aligned_slide_mm[i] = 0.0f;
+        ring_aligned_pose_valid[i] = false;
+    }
+}
 
 /*
  * 状态镜像：非 static 全局，Keil Watch 直接输变量名即可观察，
@@ -265,6 +323,18 @@ static bool start_step_action(void)
         pose = s_storage_l2_pose[s_storage_l2_target[task_index]];
     }
 
+    /*
+     * 粗加工区/第一轮暂存区的 1、3 号位：用本批次已校准的云台角与齿条
+     * 伸出量覆盖固定位姿；gimbal_drop_mm 与 layer 仍取步骤表。
+     */
+    if ((step->align_place_id >= 1U) &&
+        (step->align_place_id <= 3U) &&
+        ring_aligned_pose_valid[step->align_place_id - 1U])
+    {
+        pose.carousel_deg = ring_aligned_carousel_deg[step->align_place_id - 1U];
+        pose.slide_extend_mm = ring_aligned_slide_mm[step->align_place_id - 1U];
+    }
+
     if ((active_zone == ZONE_RAW) &&
         (step->align_color != 0U) &&
         raw_aligned_pose_valid)
@@ -299,6 +369,7 @@ void ZoneTask_Init(void)
     raw_aligned_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
     raw_aligned_slide_mm = RAW_VISION_SLIDE_START_MM;
     raw_aligned_pose_valid = false;
+    reset_ring_pose_cache();
 }
 
 bool ZoneTask_Start(ZoneId_t zone, uint8_t batch)
@@ -320,6 +391,7 @@ bool ZoneTask_Start(ZoneId_t zone, uint8_t batch)
     raw_aligned_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
     raw_aligned_slide_mm = RAW_VISION_SLIDE_START_MM;
     raw_aligned_pose_valid = false;
+    reset_ring_pose_cache();
 
     if (active_program->step_count == 0U)
     {
@@ -335,6 +407,7 @@ bool ZoneTask_Start(ZoneId_t zone, uint8_t batch)
 void ZoneTask_Update(uint32_t now_ms)
 {
     const ZoneStep_t *step;
+    uint8_t ring_index;
 
     /* 每帧刷新镜像：task_index 自增后 Watch 立刻可见。 */
     sync_task_state();
@@ -376,6 +449,16 @@ void ZoneTask_Update(uint32_t now_ms)
                     raw_aligned_slide_mm = RAW_VISION_SLIDE_START_MM;
                     raw_aligned_pose_valid = false;
                     enter_state(ZONE_TASK_SLIDE_OUT, now_ms);
+                }
+                else if (ring_align_needed(
+                             &active_program->steps[task_index]))
+                {
+                    /*
+                     * 粗加工区/第一轮暂存区 1、3 号位首次使用：先按该位
+                     * 固定位姿伸出，再 place,<位号> 二维校准机械臂。
+                     * 已校准过的位号直接复用，走正常的 START_ACTION。
+                     */
+                    enter_state(ZONE_TASK_RING_OUT, now_ms);
                 }
                 else
                 {
@@ -482,6 +565,76 @@ void ZoneTask_Update(uint32_t now_ms)
             else if (ManipulatorAction_SlideJogIsDone())
             {
                 enter_state(ZONE_TASK_START_ACTION, now_ms);
+            }
+            break;
+
+        /*
+         * 粗加工区/第一轮暂存区 1、3 号位校准：先按该位现有固定位姿伸出
+         * （云台角 + 齿条长度 + 与 2 号参考环相同的预下降），让相机看到
+         * 目标圆环；再用 place,<位号> 做与原料区相同的二维位置闭环。
+         */
+        case ZONE_TASK_RING_OUT:
+            step = &active_program->steps[task_index];
+
+            if (!ManipulatorAction_SlideJogToRingAlignStart(
+                    step->pose.carousel_deg,
+                    step->pose.slide_extend_mm,
+                    ring_align_pre_drop_mm()))
+            {
+                task_fail(now_ms);
+                break;
+            }
+
+            enter_state(ZONE_TASK_WAIT_RING_OUT, now_ms);
+            break;
+
+        case ZONE_TASK_WAIT_RING_OUT:
+            if (ManipulatorAction_SlideJogHasError())
+            {
+                task_fail(now_ms);
+            }
+            else if (ManipulatorAction_SlideJogIsDone())
+            {
+                enter_state(ZONE_TASK_RING_ALIGN, now_ms);
+            }
+            break;
+
+        case ZONE_TASK_RING_ALIGN:
+            step = &active_program->steps[task_index];
+
+            if (!RawMaterialAlign_StartPlace(step->align_place_id,
+                                             step->pose.carousel_deg,
+                                             now_ms))
+            {
+                task_fail(now_ms);
+                break;
+            }
+
+            enter_state(ZONE_TASK_WAIT_RING_ALIGN, now_ms);
+            break;
+
+        case ZONE_TASK_WAIT_RING_ALIGN:
+            if (RawMaterialAlign_HasError())
+            {
+                task_fail(now_ms);
+            }
+            else if (RawMaterialAlign_IsDone())
+            {
+                step = &active_program->steps[task_index];
+                ring_index = (uint8_t)(step->align_place_id - 1U);
+
+                /*
+                 * 保存“相机对准瞬间”的云台角与齿条长度。滑台先抬回最高点、
+                 * 退回原点，随后 START_ACTION 用这组值执行放置/取回：
+                 * 放料时夹爪已经拿着料，不能停在校准位直接放。
+                 */
+                ring_aligned_carousel_deg[ring_index] =
+                    RawMaterialAlign_GetCarouselDeg();
+                ring_aligned_slide_mm[ring_index] =
+                    RawMaterialAlign_GetSlideMm();
+                ring_aligned_pose_valid[ring_index] = true;
+
+                enter_state(ZONE_TASK_SLIDE_HOME, now_ms);
             }
             break;
 

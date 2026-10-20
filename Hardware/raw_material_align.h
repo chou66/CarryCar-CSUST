@@ -8,18 +8,25 @@
 
 /**
  * @file raw_material_align.h
- * @brief 原料区二维视觉位置闭环。
+ * @brief 二维视觉位置闭环：原料区（detect）与粗加工/暂存区机械臂校准（place）。
  *
- * 上层先完成 RAW_VISION_SLIDE_START_MM 的机械预置，然后调用 Start。
- * 本模块把 K230 的两轴像素误差转换成两个位置执行器的增量目标：
+ * 上层先完成机械预置，然后调用 Start / StartPlace。本模块把 K230 的两轴
+ * 像素误差转换成两个位置执行器的增量目标：
  *   w/s (px_x) -> 齿轮齿条绝对伸出量
  *   a/d (px_y) -> 云台舵机绝对角度
  * 每次执行器到位并稳定后再取下一帧，不驱动底盘。
  *
+ * 两种目标：
+ *   RAW_ALIGN_MODE_DETECT：原料区发 detect,<颜色号>，识别到该颜色且居中
+ *     后结束；Start() 是它的兼容入口。
+ *   RAW_ALIGN_MODE_PLACE：粗加工区/第一轮暂存区的1、3号位发 place,<位号>。
+ *     上层必须先按该位现有固定位姿伸出（云台角+齿条长度），本模块只做
+ *     机械臂二维微调，不移动底盘；收到 place 或连续居中同样可结束。
+ *
  * 完成后 GetCarouselDeg()/GetSlideMm() 返回相机真正对准时的机械位姿。
  * 调用方必须保存两者：仅保存云台角度而把滑台恢复成固定值，会再次改变
  * 相机/夹爪与目标的径向关系。当前位置环不限制迭代次数，只能由居中、
- * K230 的 grab、远端 error 或上层 Abort 结束。
+ * K230 的 grab/place、远端 error 或上层 Abort 结束。
  */
 
 typedef enum
@@ -46,6 +53,15 @@ typedef enum
 #define RAW_ALIGN_EXIT_GRAB        2U
 #define RAW_ALIGN_EXIT_FAIL        3U
 #define RAW_ALIGN_EXIT_ABORT       4U
+/* PLACE 模式收到 K230 的 place 收工；追加在末尾，保留原有编号。 */
+#define RAW_ALIGN_EXIT_PLACE       5U
+
+/* 本模块当前跟踪哪类目标。 */
+typedef enum
+{
+    RAW_ALIGN_MODE_DETECT = 0, /* detect,<颜色1..6>：原料区 */
+    RAW_ALIGN_MODE_PLACE       /* place,<位号1..3>：粗加工/第一轮暂存区机械臂 */
+} RawAlignMode_t;
 
 /* 位置目标被哪个软件边界钳住；NONE 表示本轮没有撞限位。 */
 #define RAW_ALIGN_LIMIT_NONE       0U
@@ -53,7 +69,24 @@ typedef enum
 #define RAW_ALIGN_LIMIT_MAX        2U
 
 void RawMaterialAlign_Init(void);
+/* 原料区 DETECT 入口：发 detect,<color_id>。 */
 bool RawMaterialAlign_Start(uint8_t color_id, uint32_t now_ms);
+
+/*
+ * 粗加工区/第一轮暂存区 1、3 号位机械臂校准入口：发 place,<position_id>。
+ *
+ * 调用前必须已经用 SlideJogToRingAlignStart() 把云台转到 carousel_deg、
+ * 齿条伸到该位现有长度（可带视觉预下降）。本函数不重复驱动云台/滑台，
+ * 以当前滑台位置作为径向环起点，以 carousel_deg 作为切向环起点；
+ * 完成后 GetCarouselDeg()/GetSlideMm() 就是校准后的放置/取回位姿。
+ *
+ * @param position_id  K230 放置位号 1..3
+ * @param carousel_deg 预置位云台角（该位写死位姿的 carousel_deg）
+ * @return false 表示参数非法、滑台位置不可信或当前仍在忙。
+ */
+bool RawMaterialAlign_StartPlace(uint8_t position_id, float carousel_deg,
+                                 uint32_t now_ms);
+
 void RawMaterialAlign_Update(uint32_t now_ms);
 void RawMaterialAlign_Abort(void);
 

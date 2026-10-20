@@ -34,9 +34,14 @@
  * 对位失败则整个区域任务失败停车；此时滑台可能停在半路，位置基准作废，
  * 需人工把滑台推回原点并调用 Manipulator_Slide_SetHome() 才能重新启动。
  * （云台预转阶段失败也同样作废基准——急停语义下不假设滑台没被碰过。）
- * 粗加工区/暂存区的对位由 mission 在整区域动作之前做一次，步骤里为 0。
- * 其中粗加工区固定只识别2号圆环来修正底盘；完成后1号、3号依靠已标定的
- * 固定云台角和齿条长度放置/取回，不会在六个机械步骤中再次启动视觉。
+ * 粗加工区/暂存区的底盘对位由 mission 在整区域动作之前做一次（识别放置位2），
+ * 步骤里 align_color 为 0。对位完成后：
+ *   - 2 号位直接重放固定位姿（底盘已经对准）；
+ *   - 粗加工区两批、第一轮暂存区的 1、3 号位（align_place_id = 1/3）
+ *     先按该位现有固定位姿伸出，再发 place,<位号>，用与原料区相同的
+ *     二维位置闭环（像素偏差 -> 云台角 + 齿条伸出量）校准机械臂；
+ *     同一批次内每个位号只校准一次，之后的步骤复用校准结果；
+ *   - 第二轮暂存区（叠放）保留原流程：K230 STACK 身份锚定 + 外圆定位。
  *
  * 步骤表与所有位姿标定都集中在 zone_task.c / robot_config.h，
  * 本模块不含任何机械尺寸数字。
@@ -64,8 +69,13 @@ typedef enum
     /* 追加在末尾，保持前面所有枚举值不变。 */
     ZONE_TASK_SLIDE_OUT,       /* 识别前：云台先转到识别位并张开，滑台再前伸 */
     ZONE_TASK_WAIT_SLIDE_OUT,
-    ZONE_TASK_SLIDE_HOME,      /* 保留状态值；原料视觉对准后已改为直接抓取 */
-    ZONE_TASK_WAIT_SLIDE_HOME
+    ZONE_TASK_SLIDE_HOME,      /* 校准后：先抬回最高点，再回缩滑台到原点 */
+    ZONE_TASK_WAIT_SLIDE_HOME,
+    /* 粗加工区/第一轮暂存区 1、3 号位的机械臂二维校准（place,<位号>）。 */
+    ZONE_TASK_RING_OUT,        /* 按该位固定位姿伸出并预下降，等相机取像 */
+    ZONE_TASK_WAIT_RING_OUT,
+    ZONE_TASK_RING_ALIGN,      /* 发 place,<位号>，云台/滑台二维闭环 */
+    ZONE_TASK_WAIT_RING_ALIGN  /* 等校准结束，保存位姿后回原点 */
 } ZoneTaskState_t;
 
 void ZoneTask_Init(void);

@@ -337,8 +337,11 @@ void ManipulatorAction_Abort(void);
  * 识别结束后：
  *   - 原料区由 RawMaterialAlign 动态调整云台/滑台，对准完成后调用
  *     StartToTrayFromAlignedPose() 从最高原点直接下降抓取，不再退回原点；
- *   - 粗加工区/暂存区仍由调用方退回原点：带预下降时先 RAISE 抬回最高点，
- *     再回缩滑台，然后从最高原点执行固定位姿动作。
+ *   - 粗加工区/暂存区的 2 号位只做底盘对位，仍由调用方退回原点：带预下降
+ *     时先 RAISE 抬回最高点，再回缩滑台，然后从最高原点执行固定位姿动作；
+ *   - 粗加工区/第一轮暂存区的 1、3 号位用 RingAlignStart 预置后，同样由
+ *     RawMaterialAlign_StartPlace() 二维校准机械臂；放置/取回时按校准结果
+ *     复用（TO_TRAY 可直接从校准位下降，FROM_TRAY 先回原点再按校准位姿动作）。
  * 动作引擎里「伸出=发相对位移、回程=发负值」的假设因此保持不变。
  *
  * 模块会在每次电机到位确认后记录滑台绝对位置。原料视觉位置环可反复调用
@@ -354,6 +357,10 @@ void ManipulatorAction_Abort(void);
  *   SlideJogToStorageAlignStart —— 暂存区2号参考环预置，使用独立的
  *                                  STORAGE_SLIDE_POS2_MM，滑台到位后预下降
  *                                  STORAGE_VISION_PRE_DROP_MM
+ *   SlideJogToRingAlignStart —— 粗加工区/第一轮暂存区 1、3 号位预置：
+ *                               云台与该位写死位姿同角，齿条伸到该位现有
+ *                               长度，滑台到位后预下降，随后交给
+ *                               RawMaterialAlign_StartPlace() 做二维校准
  *   SlideJogToRawAlignStart —— 原料停靠后的补偿预伸
  *   SlideJogToPositionStart —— 当前位置可信，走到新的绝对目标
  *   SlideJogHomeStart       —— 从当前可信的非零位置回原点；若此前做过
@@ -369,6 +376,19 @@ void ManipulatorAction_Abort(void);
 bool ManipulatorAction_SlideJogToAlignStart(void);
 bool ManipulatorAction_SlideJogToRoughAlignStart(void);
 bool ManipulatorAction_SlideJogToStorageAlignStart(void);
+
+/*
+ * 粗加工区/第一轮暂存区 1、3 号位的机械臂校准预置：
+ *   1) 云台转到 carousel_deg（该位现有固定位姿角度），夹爪张开；
+ *   2) 齿条伸到 slide_mm（该位现有固定长度）；
+ *   3) 滑台到位后电机5下降 pre_drop_mm，让相机靠近圆环。
+ * 之后由 RawMaterialAlign_StartPlace() 发 place,<位号> 做二维闭环。
+ * 调用前提：滑台在机械原点（与 2 号参考环预置相同）。
+ */
+bool ManipulatorAction_SlideJogToRingAlignStart(float carousel_deg,
+                                                float slide_mm,
+                                                float pre_drop_mm);
+
 bool ManipulatorAction_SlideJogToRawAlignStart(void);
 bool ManipulatorAction_SlideJogToPositionStart(float target_mm);
 bool ManipulatorAction_SlideJogHomeStart(void);

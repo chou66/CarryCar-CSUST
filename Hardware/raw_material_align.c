@@ -87,9 +87,11 @@ typedef enum
 static RawMaterialAlignState_t s_state = RAW_ALIGN_IDLE;
 static uint32_t s_state_start_ms = 0U;
 static uint32_t s_offset_epoch_ms = 0U;
-static uint8_t s_color_id = 0U;
+static RawAlignMode_t s_mode = RAW_ALIGN_MODE_DETECT;
+static uint8_t s_target_id = 0U;   /* DETECT=颜色号1..6；PLACE=位号1..3 */
 static uint8_t s_color_ok = 0U;
 static uint8_t s_grab_seen = 0U;
+static uint8_t s_place_seen = 0U;
 static uint8_t s_stable_frames = 0U;
 static uint16_t s_iteration = 0U;
 static RawStopPurpose_t s_stop_purpose = RAW_STOP_PURPOSE_NONE;
@@ -212,6 +214,12 @@ static bool axis_line_usable(char direction, uint32_t line_ms)
 
 static bool color_ready(void)
 {
+    /* PLACE 模式不报颜色，位置身份由 place,<位号> 命令本身确定。 */
+    if (s_mode != RAW_ALIGN_MODE_DETECT)
+    {
+        return true;
+    }
+
 #if K230_ALIGN_REQUIRE_COLOR
     return s_color_ok != 0U;
 #else
@@ -221,6 +229,17 @@ static bool color_ready(void)
 
 /* request_next_frame 会在 busy 恢复握手完成后被调用，先做本地前置声明。 */
 static bool request_next_frame(uint32_t now_ms);
+
+/* 按当前模式发启动命令：原料区 detect，颜色/位号共用 s_target_id。 */
+static HAL_StatusTypeDef send_align_command(void)
+{
+    if (s_mode == RAW_ALIGN_MODE_PLACE)
+    {
+        return K230_StartPlace(s_target_id);
+    }
+
+    return K230_StartDetect(s_target_id);
+}
 
 static void raw_align_fail(uint8_t error, uint32_t now_ms)
 {
@@ -298,7 +317,7 @@ static bool request_next_frame(uint32_t now_ms)
     robot_raw_align_have_y = 0U;
     enter_state(RAW_ALIGN_WAIT_OFFSET, now_ms);
 
-    if (K230_StartDetect(s_color_id) != HAL_OK)
+    if (send_align_command() != HAL_OK)
     {
         raw_align_fail(RAW_ALIGN_ERROR_SEND, now_ms);
         return false;
@@ -332,12 +351,13 @@ static void handle_stop_handshake(uint32_t events, uint32_t now_ms)
         {
             /*
              * busy 说明 K230 保存的是另一条旧任务。stopped 到达后必须清空
-             * 旧颜色/旧 grab/连续帧计数，再从当前 s_color_id 重新开始；否则
-             * 旧绿色帧可能被误当成下一块物料的有效结果。
+             * 旧颜色/旧 grab/旧 place/连续帧计数，再从当前 s_target_id 重新
+             * 开始；否则旧目标帧可能被误当成下一块物料的有效结果。
              */
             s_stop_purpose = RAW_STOP_PURPOSE_NONE;
             s_color_ok = 0U;
             s_grab_seen = 0U;
+            s_place_seen = 0U;
             s_stable_frames = 0U;
             robot_raw_align_color_ok = 0U;
             robot_raw_align_grab = 0U;
@@ -375,6 +395,30 @@ static void handle_offset_pair(int32_t px_x, int32_t px_y, uint32_t now_ms)
     float slide_requested;
     float angle_target;
     float slide_target;
+    float angle_min;
+    float angle_max;
+    float slide_min;
+    float slide_max;
+
+    /*
+     * 两种入口共用同一套 PID 和单步限幅，只有安全窗口不同：
+     * 原料区被限制在三个取料位之间；粗加工/暂存区的3号位为178 deg，
+     * 低于原料下界，因此 PLACE 模式使用各自标定窗口。
+     */
+    if (s_mode == RAW_ALIGN_MODE_PLACE)
+    {
+        angle_min = PLACE_VISION_CAROUSEL_MIN_DEG;
+        angle_max = PLACE_VISION_CAROUSEL_MAX_DEG;
+        slide_min = PLACE_VISION_SLIDE_MIN_MM;
+        slide_max = PLACE_VISION_SLIDE_MAX_MM;
+    }
+    else
+    {
+        angle_min = RAW_VISION_CAROUSEL_MIN_DEG;
+        angle_max = RAW_VISION_CAROUSEL_MAX_DEG;
+        slide_min = RAW_VISION_SLIDE_MIN_MM;
+        slide_max = RAW_VISION_SLIDE_MAX_MM;
+    }
 
     robot_raw_align_px_x = px_x;
     robot_raw_align_px_y = px_y;
@@ -439,22 +483,18 @@ static void handle_offset_pair(int32_t px_x, int32_t px_y, uint32_t now_ms)
     angle_requested = s_carousel_deg + angle_step;
     slide_requested = s_slide_mm + slide_step;
 
-    angle_target = raw_clampf(angle_requested,
-                              RAW_VISION_CAROUSEL_MIN_DEG,
-                              RAW_VISION_CAROUSEL_MAX_DEG);
-    slide_target = raw_clampf(slide_requested,
-                              RAW_VISION_SLIDE_MIN_MM,
-                              RAW_VISION_SLIDE_MAX_MM);
+    angle_target = raw_clampf(angle_requested, angle_min, angle_max);
+    slide_target = raw_clampf(slide_requested, slide_min, slide_max);
 
     robot_raw_align_angle_limit =
-        (angle_requested < RAW_VISION_CAROUSEL_MIN_DEG) ?
+        (angle_requested < angle_min) ?
         RAW_ALIGN_LIMIT_MIN :
-        ((angle_requested > RAW_VISION_CAROUSEL_MAX_DEG) ?
+        ((angle_requested > angle_max) ?
          RAW_ALIGN_LIMIT_MAX : RAW_ALIGN_LIMIT_NONE);
     robot_raw_align_slide_limit =
-        (slide_requested < RAW_VISION_SLIDE_MIN_MM) ?
+        (slide_requested < slide_min) ?
         RAW_ALIGN_LIMIT_MIN :
-        ((slide_requested > RAW_VISION_SLIDE_MAX_MM) ?
+        ((slide_requested > slide_max) ?
          RAW_ALIGN_LIMIT_MAX : RAW_ALIGN_LIMIT_NONE);
 
     robot_raw_align_angle_step_deg = angle_target - s_carousel_deg;
@@ -501,9 +541,11 @@ void RawMaterialAlign_Init(void)
     s_state = RAW_ALIGN_IDLE;
     s_state_start_ms = 0U;
     s_offset_epoch_ms = 0U;
-    s_color_id = 0U;
+    s_mode = RAW_ALIGN_MODE_DETECT;
+    s_target_id = 0U;
     s_color_ok = 0U;
     s_grab_seen = 0U;
+    s_place_seen = 0U;
     s_stable_frames = 0U;
     s_iteration = 0U;
     s_stop_purpose = RAW_STOP_PURPOSE_NONE;
@@ -551,30 +593,46 @@ void RawMaterialAlign_Init(void)
     robot_raw_align_busy_recoveries = 0U;
 }
 
-bool RawMaterialAlign_Start(uint8_t color_id, uint32_t now_ms)
+/*
+ * 两个入口的公共实现。Start 不负责机械预置：调用者必须已经完成
+ * 「云台转到 carousel_deg + 夹爪张开 + 滑台伸到起点」，这里只检查滑台
+ * 位置是否仍可信，然后以实际软件记录的位置作为径向环起点。
+ */
+static bool raw_align_start(RawAlignMode_t mode, uint8_t target_id,
+                            float carousel_deg, uint32_t now_ms)
 {
-    /*
-     * Start 不负责机械预置。调用者必须已经完成：云台 POS2、夹爪张开、
-     * 滑台到 RAW_VISION_SLIDE_START_MM。这里只检查滑台位置是否仍可信，
-     * 然后以实际软件记录的位置作为径向环起点。
-     */
+    bool target_valid;
+
+    if (mode == RAW_ALIGN_MODE_PLACE)
+    {
+        target_valid = (target_id >= 1U) && (target_id <= 3U);
+    }
+    else
+    {
+        target_valid = (target_id >= 1U) && (target_id <= 6U);
+    }
+
     if (!can_start() ||
-        (color_id < 1U) || (color_id > 6U) ||
+        !target_valid ||
+        (carousel_deg < 0.0f) ||
+        (carousel_deg > CAROUSEL_TRAVEL_DEG) ||
         !ManipulatorAction_SlideJogPositionKnown() ||
         ManipulatorAction_SlideJogIsBusy())
     {
         return false;
     }
 
-    s_color_id = color_id;
+    s_mode = mode;
+    s_target_id = target_id;
     s_color_ok = 0U;
     s_grab_seen = 0U;
+    s_place_seen = 0U;
     s_stable_frames = 0U;
     s_iteration = 0U;
     s_stop_purpose = RAW_STOP_PURPOSE_NONE;
     s_pending_exit_reason = RAW_ALIGN_EXIT_NONE;
     s_stop_last_tx_ms = 0U;
-    s_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+    s_carousel_deg = carousel_deg;
     s_slide_mm = ManipulatorAction_SlideJogGetPositionMm();
     s_wait_carousel = false;
     s_wait_slide = false;
@@ -621,6 +679,27 @@ bool RawMaterialAlign_Start(uint8_t color_id, uint32_t now_ms)
         return false;
     }
     return true;
+}
+
+bool RawMaterialAlign_Start(uint8_t color_id, uint32_t now_ms)
+{
+    /*
+     * 原料区：云台 POS2、夹爪张开、滑台到视觉起点（通常
+     * RAW_VISION_SLIDE_START_MM）后发 detect,<颜色号>。
+     */
+    return raw_align_start(RAW_ALIGN_MODE_DETECT, color_id,
+                           K230_ALIGN_CAROUSEL_ANGLE_DEG, now_ms);
+}
+
+bool RawMaterialAlign_StartPlace(uint8_t position_id, float carousel_deg,
+                                 uint32_t now_ms)
+{
+    /*
+     * 粗加工/暂存区 1、3 号位：上层已按该位现有固定位姿转好云台、伸出
+     * 齿条；这里只发 place,<位号>，用同一套云台/齿条二维闭环微调机械臂。
+     */
+    return raw_align_start(RAW_ALIGN_MODE_PLACE, position_id,
+                           carousel_deg, now_ms);
 }
 
 void RawMaterialAlign_Update(uint32_t now_ms)
@@ -670,31 +749,50 @@ void RawMaterialAlign_Update(uint32_t now_ms)
         return;
     }
 
-    if (((events & K230_EVENT_COLOR) != 0U) &&
-        (g_k230_status.color_id == s_color_id))
+    /*
+     * 只有 DETECT（原料区）需要颜色身份闸门和 grab 收工信号。
+     * PLACE 模式没有颜色概念，收工信号是 K230 的 place。
+     */
+    if ((s_mode == RAW_ALIGN_MODE_DETECT) &&
+        ((events & K230_EVENT_COLOR) != 0U) &&
+        (g_k230_status.color_id == s_target_id))
     {
         s_color_ok = 1U;
         robot_raw_align_color_ok = 1U;
     }
 
-    if ((events & K230_EVENT_GRAB) != 0U)
+    if ((s_mode == RAW_ALIGN_MODE_DETECT) &&
+        ((events & K230_EVENT_GRAB) != 0U))
     {
         s_grab_seen = 1U;
         robot_raw_align_grab = 1U;
+    }
+
+    if ((s_mode == RAW_ALIGN_MODE_PLACE) &&
+        ((events & K230_EVENT_PLACE) != 0U))
+    {
+        s_place_seen = 1U;
     }
 
     switch (s_state)
     {
         case RAW_ALIGN_WAIT_OFFSET:
             /*
-             * 收工信号优先于偏差：K230 可能在最后一帧同时发送偏差和 grab，
-             * 若先处理偏差就会启动下一次机械移动，并把有效 grab 当旧帧清掉。
-             * grab 的协议含义是 K230 已判断可抓；没有 grab 时仍可依靠连续
-             * 居中帧正常结束。
+             * 收工信号优先于偏差：K230 可能在最后一帧同时发送偏差和收工信号，
+             * 若先处理偏差就会启动下一次机械移动，并把有效信号当旧帧清掉。
+             * DETECT 认 grab（K230 已判断可抓），PLACE 认 place（已对准放置位）；
+             * 没有收工信号时仍可依靠连续居中帧正常结束。
              */
-            if (color_ready() && s_grab_seen)
+            if ((s_mode == RAW_ALIGN_MODE_DETECT) &&
+                color_ready() && s_grab_seen)
             {
                 raw_align_done(RAW_ALIGN_EXIT_GRAB, now_ms);
+                break;
+            }
+
+            if ((s_mode == RAW_ALIGN_MODE_PLACE) && s_place_seen)
+            {
+                raw_align_done(RAW_ALIGN_EXIT_PLACE, now_ms);
                 break;
             }
 
@@ -717,15 +815,17 @@ void RawMaterialAlign_Update(uint32_t now_ms)
                  ((have_x || have_y) &&
                   ((now_ms - s_state_start_ms) >= RAW_VISION_PAIR_WINDOW_MS))))
             {
+                /* 这帧偏差会被消费，随之而来的收工信号属于下一帧，先清掉。 */
                 s_grab_seen = 0U;
                 robot_raw_align_grab = 0U;
+                s_place_seen = 0U;
                 handle_offset_pair(px_x, px_y, now_ms);
                 break;
             }
 
             if ((now_ms - s_state_start_ms) >= RAW_VISION_RESEND_MS)
             {
-                if (K230_StartDetect(s_color_id) != HAL_OK)
+                if (send_align_command() != HAL_OK)
                 {
                     raw_align_fail(RAW_ALIGN_ERROR_SEND, now_ms);
                     break;
@@ -754,6 +854,7 @@ void RawMaterialAlign_Update(uint32_t now_ms)
                 /* 执行器移动时的图像已经过期，稳定后重新建立收帧时间界。 */
                 s_grab_seen = 0U;
                 robot_raw_align_grab = 0U;
+                s_place_seen = 0U;
                 enter_state(RAW_ALIGN_SETTLE, now_ms);
             }
             break;

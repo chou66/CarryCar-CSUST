@@ -23,6 +23,8 @@ static int s_slide_busy;
 static int s_slide_error;
 static int s_carousel_done = 1;
 static int s_start_detect_count;
+static int s_start_place_count;
+static uint8_t s_last_place_id;
 static int s_stop_count;
 static int s_pass;
 static int s_fail;
@@ -40,6 +42,13 @@ HAL_StatusTypeDef K230_StartDetect(uint8_t color_id)
 {
     (void)color_id;
     s_start_detect_count++;
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef K230_StartPlace(uint8_t position_id)
+{
+    s_last_place_id = position_id;
+    s_start_place_count++;
     return HAL_OK;
 }
 
@@ -226,6 +235,62 @@ int main(void)
           robot_raw_align_stop_ack_ms == 1510U &&
           robot_raw_align_stop_tx_failures == 0U,
           "A late stopped acknowledgment still completes the raw grab path");
+
+    /*
+     * PLACE 模式：粗加工区/第一轮暂存区 1、3 号位的机械臂二维校准。
+     * 起点是该位现有固定位姿，命令换成 place,<位号>。
+     */
+    s_slide_mm = ROUGH_SLIDE_POS1_MM;
+    s_slide_busy = 0;
+    s_carousel_done = 1;
+    RawMaterialAlign_Init();
+    s_now = 2000U;
+    check(RawMaterialAlign_StartPlace(1U, ROUGH_CAROUSEL_POS1_DEG, s_now),
+          "Ring align starts from the position's fixed pose");
+    check((s_start_place_count == 1) && (s_last_place_id == 1U),
+          "PLACE mode sends place,<position id>");
+
+    feed_pair('w', 20, 'a', 10, 2010U);
+    check(nearf_local(s_slide_target_mm, ROUGH_SLIDE_POS1_MM + 10.0f, 0.01f),
+          "PLACE mode reuses the raw radial PID mapping on the slide");
+    check(nearf_local(s_carousel_target_deg,
+                      ROUGH_CAROUSEL_POS1_DEG + 1.0f, 0.01f),
+          "PLACE mode reuses the raw tangential PID mapping on the carousel");
+
+    s_slide_mm = s_slide_target_mm;
+    s_slide_busy = 0;
+    s_carousel_done = 1;
+    RawMaterialAlign_Update(2030U);
+    RawMaterialAlign_Update(2130U);
+    check(s_start_place_count == 2,
+          "Settle completion resends place instead of detect");
+
+    s_now = 2140U;
+    s_events = K230_EVENT_PLACE;
+    RawMaterialAlign_Update(s_now);
+    check(robot_raw_align_state == RAW_ALIGN_STOPPING,
+          "K230 place also waits for the stopped handshake");
+    s_now = 2150U;
+    s_events = K230_EVENT_STOPPED;
+    RawMaterialAlign_Update(s_now);
+    check(RawMaterialAlign_IsDone() &&
+          robot_raw_align_exit == RAW_ALIGN_EXIT_PLACE,
+          "PLACE mode reports the place exit reason");
+
+    /* 3号位178 deg低于原料区180.1 deg下界，必须走PLACE专用安全窗口。 */
+    s_slide_mm = ROUGH_SLIDE_POS3_MM;
+    s_slide_busy = 0;
+    s_carousel_done = 1;
+    RawMaterialAlign_Init();
+    s_now = 2200U;
+    check(RawMaterialAlign_StartPlace(3U, ROUGH_CAROUSEL_POS3_DEG, s_now),
+          "POS3 ring align starts below the raw carousel lower bound");
+    feed_pair('w', 0, 'a', -1000, 2210U);
+    check(nearf_local(s_carousel_target_deg,
+                      ROUGH_CAROUSEL_POS3_DEG -
+                      RAW_VISION_ANGLE_STEP_MAX_DEG, 0.01f) &&
+          (s_carousel_target_deg < RAW_VISION_CAROUSEL_MIN_DEG),
+          "PLACE safety window allows POS3 below the raw lower bound");
 
     printf("PASS: %d\nFAIL: %d\n", s_pass, s_fail);
     return s_fail ? 1 : 0;
