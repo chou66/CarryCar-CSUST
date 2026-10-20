@@ -211,8 +211,8 @@ static bool ring_align_needed(const ZoneStep_t *step)
 }
 
 /*
- * 1、3 号位校准前的预下降量：独立标定值（当前 80 mm），不再沿用 2 号
- * 参考环的 100 mm——这两个位置已经按其固定齿条长度伸出，相机距离不同。
+ * 圆环识别前的预下降量：1、2、3 号位共用 RING_VISION_PRE_DROP_MM。
+ * 2 号位在 mission 层的底盘对位里用同一个宏，保证三个位置的取像高度一致。
  */
 static float ring_align_pre_drop_mm(void)
 {

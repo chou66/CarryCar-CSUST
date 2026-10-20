@@ -205,7 +205,7 @@ typedef enum
  *
  * 只有「伸到识别位」那一段会先走 ROTATE（云台先转、滑台后伸）；
  * 「退回原点」不动云台，直接从 MOVE 开始。
- * 粗加工区/暂存区带 ROUGH_/STORAGE_VISION_PRE_DROP_MM 时，WAIT 到位后
+ * 粗加工区/暂存区带 RING_VISION_PRE_DROP_MM 时，WAIT 到位后
  * 再走 LOWER；带预下降的回原点则先走 RAISE 抬回最高点，再回缩滑台。
  * 原料区不做预下降，仍然直接 DONE。
  */
@@ -331,8 +331,8 @@ void ManipulatorAction_Abort(void);
  *      RAW_VISION_SLIDE_START_MM（已扣除底盘靠近量），
  *      让取像距离与识别姿态自洽。
  *   3) 粗加工区/暂存区在滑台到位后，再下降电机5
- *      ROUGH_/STORAGE_VISION_PRE_DROP_MM，让相机靠近圆环后再发 place。
- *      原料区不预下降，保持在最高原点识别。
+ *      RING_VISION_PRE_DROP_MM（1、2、3 号位共用），让相机靠近圆环后
+ *      再发 place。原料区不预下降，保持在最高原点识别。
  * 三件都就位后才由上层发 detect/place（见 K230Align_StartPreset）。
  * 识别结束后：
  *   - 原料区由 RawMaterialAlign 动态调整云台/滑台，对准完成后调用
@@ -353,13 +353,14 @@ void ManipulatorAction_Abort(void);
  *   SlideJogToAlignStart —— 暂存区通用识别预置
  *   SlideJogToRoughAlignStart —— 粗加工区2号参考环预置，使用实车标定的
  *                                ROUGH_SLIDE_POS2_MM，滑台到位后预下降
- *                                ROUGH_VISION_PRE_DROP_MM
+ *                                RING_VISION_PRE_DROP_MM
  *   SlideJogToStorageAlignStart —— 暂存区2号参考环预置，使用独立的
  *                                  STORAGE_SLIDE_POS2_MM，滑台到位后预下降
- *                                  STORAGE_VISION_PRE_DROP_MM
+ *                                  RING_VISION_PRE_DROP_MM
  *   SlideJogToRingAlignStart —— 粗加工区/第一轮暂存区 1、3 号位预置：
  *                               云台与该位写死位姿同角，齿条伸到该位现有
- *                               长度，滑台到位后预下降，随后交给
+ *                               长度，滑台到位后同样预下降
+ *                               RING_VISION_PRE_DROP_MM，随后交给
  *                               RawMaterialAlign_StartPlace() 做二维校准
  *   SlideJogToRawAlignStart —— 原料停靠后的补偿预伸
  *   SlideJogToPositionStart —— 当前位置可信，走到新的绝对目标

@@ -1953,7 +1953,7 @@ bool ManipulatorAction_SlideJogToRoughAlignStart(void)
      */
     return slide_jog_start_target(ROUGH_SLIDE_POS2_MM,
                                   K230_ALIGN_CAROUSEL_ANGLE_DEG, true,
-                                  ROUGH_VISION_PRE_DROP_MM);
+                                  RING_VISION_PRE_DROP_MM);
 }
 
 bool ManipulatorAction_SlideJogToStorageAlignStart(void)
@@ -1975,7 +1975,7 @@ bool ManipulatorAction_SlideJogToStorageAlignStart(void)
      */
     return slide_jog_start_target(STORAGE_SLIDE_POS2_MM,
                                   K230_ALIGN_CAROUSEL_ANGLE_DEG, true,
-                                  STORAGE_VISION_PRE_DROP_MM);
+                                  RING_VISION_PRE_DROP_MM);
 }
 
 bool ManipulatorAction_SlideJogToRingAlignStart(float carousel_deg,
