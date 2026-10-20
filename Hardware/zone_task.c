@@ -210,11 +210,13 @@ static bool ring_align_needed(const ZoneStep_t *step)
            !ring_aligned_pose_valid[step->align_place_id - 1U];
 }
 
-/* 1、3 号位校准前的预下降量：与 2 号参考环取像高度一致。 */
+/*
+ * 1、3 号位校准前的预下降量：独立标定值（当前 80 mm），不再沿用 2 号
+ * 参考环的 100 mm——这两个位置已经按其固定齿条长度伸出，相机距离不同。
+ */
 static float ring_align_pre_drop_mm(void)
 {
-    return (active_zone == ZONE_ROUGH) ? ROUGH_VISION_PRE_DROP_MM
-                                       : STORAGE_VISION_PRE_DROP_MM;
+    return RING_VISION_PRE_DROP_MM;
 }
 
 static void reset_ring_pose_cache(void)

@@ -531,6 +531,7 @@
  * detect,<颜色> 换成 place,<放置位号>，不再移动底盘：
  *
  *   先按现有固定位姿伸出（云台转到该位角度、齿条伸到该位长度）
+ *   -> 滑台到位后下降 RING_VISION_PRE_DROP_MM
  *   -> K230 place,<位号> 连续取像
  *   -> px_y(a/d) 调云台角、px_x(w/s) 调齿条长度
  *   -> 中心容差内确认后，把校准后的位姿用于本区域的放置/取回
@@ -543,6 +544,15 @@
 #define PLACE_VISION_CAROUSEL_MAX_DEG          250.0f
 #define PLACE_VISION_SLIDE_MIN_MM               55.0f
 #define PLACE_VISION_SLIDE_MAX_MM               MANIP_SLIDE_SOFT_MAX_MM
+
+/*
+ * 1、3 号位机械臂校准前的垂直预下降量（正数=下降）。
+ *
+ * 这两个位置已经先伸到了各自的固定齿条长度，相机到圆环的距离与 2 号参考环
+ * 不同，因此使用独立标定值，不再沿用 ROUGH_/STORAGE_VISION_PRE_DROP_MM
+ * 的 100 mm。设为 0 表示在最高原点取像。
+ */
+#define RING_VISION_PRE_DROP_MM                 80.0f
 
 /* ---------- 原料区三轮识别颜色 ----------
  * 原料区要把三块料依次抓进料盘 1/2/3，每块料之前各做一轮
