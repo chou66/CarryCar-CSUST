@@ -766,10 +766,13 @@ static uint8_t mission_plan_current_stage(void)
  *
  * 触发时机是阶段推进的那一刻——上一段区域动作刚刚收尾，齿条在原点、
  * 电机5在最高机械原点、主动作空闲，此时回转夹爪不会碰到料盘或场地结构。
- * 之后整车开往下一个作业节点，舵机由 CarouselServo_Update /
- * GripperServo_Update 在行驶途中自行平滑到位，到站后
- * SlideJogToXXXAlignStart() 往往一调用就能直接伸齿条：粗加工区/暂存区
- * 的前伸本来就和云台转向并行，这里舵机通常早已 DONE，并行等待立即通过。
+ * 之后整车开往下一个作业节点，舵机和电机5由 CarouselServo_Update /
+ * GripperServo_Update / ManipulatorAction_Update 在行驶途中自行到位。
+ *
+ * 粗加工区/暂存区还要在识别前下降电机5，这一下降也放在这里：料盘/云台/
+ * 夹爪先摆位，等云台与夹爪转到位后再下降电机5（齿条仍在原点），整个过程
+ * 都落在转向去下一区域的行驶窗口内；到站后 SlideJogToXXXAlignStart()
+ * 只负责伸齿条，识别等待时间缩短。原料区保持最高点识别，pre_drop 为 0。
  *
  * 三个作业区的取像姿态本来都是 CAROUSEL_PICKUP_POS2_DEG，料盘槽位取该区域
  * 步骤表首步的槽位，因此预置结果与到站流程完全一致，只是把时间挪到了
@@ -785,6 +788,7 @@ static void mission_preposition_next_stage(void)
     ZoneId_t zone;
     uint8_t batch;
     uint8_t slot;
+    float pre_drop_mm = 0.0f;
 
     if (!mission_zone_for_stage(robot_mission_stage, &zone, &batch))
     {
@@ -800,7 +804,21 @@ static void mission_preposition_next_stage(void)
         return;
     }
 
-    (void)ManipulatorAction_PrepositionForNextZone(slot);
+    /*
+     * 只有粗加工区/暂存区在识别前降低电机5；原料区要贴着物料做多轮
+     * 旋转微调，必须保持最高点。数值与到站流程使用的宏一致，保证
+     * slide_jog_start_target() 能识别出“这次下降已经由预置完成”。
+     */
+    if (zone == ZONE_ROUGH)
+    {
+        pre_drop_mm = ROUGH_VISION_PRE_DROP_MM;
+    }
+    else if (zone == ZONE_STORAGE)
+    {
+        pre_drop_mm = STORAGE_VISION_PRE_DROP_MM;
+    }
+
+    (void)ManipulatorAction_PrepositionForNextZoneWithDrop(slot, pre_drop_mm);
 #endif
 }
 
@@ -1100,6 +1118,8 @@ static void mission_update(uint32_t now_ms)
      * 对位前：云台转向与滑台前伸是并行下发的，SlideJogIsDone() 只在
      * 「滑台到位 + 两路舵机 DONE（或舵机超时兜底）」同时满足后才为真，
      * 所以这里开始发 place/detect 时，前伸和转向都已经完成，识别不会提前。
+     * 粗加工区/暂存区的电机5预下降已在行驶预置阶段完成，IsDone() 不再
+     * 包含停车后的下降等待。
      */
     if (robot_mission_state == MISSION_VISION_PRESET)
     {

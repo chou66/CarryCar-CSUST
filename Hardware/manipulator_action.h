@@ -208,6 +208,8 @@ typedef enum
  *   MANIP_JOG_RAISE  回原点前，等电机5先抬回最高原点
  *   MANIP_JOG_HEIGHT 低位标定时，电机5在“取像高度”和“实际放置高度”之间
  *                    单独升降；该状态绝不移动滑台和云台
+ *   MANIP_JOG_PRE_ROTATE 行驶预置：料盘/云台/夹爪目标已下发，先等云台与
+ *                    夹爪转到位，再进入 LOWER 下降电机5（先转后降）
  *   MANIP_JOG_DONE   到位
  *   MANIP_JOG_ERROR  发送失败 / 超时 / 堵转保护
  *
@@ -221,6 +223,8 @@ typedef enum
  * 「退回原点」不动云台，直接从 MOVE 开始。
  * 粗加工区/暂存区带 ROUGH_/STORAGE_VISION_PRE_DROP_MM 时，WAIT 到位后
  * 再走 LOWER；带预下降的回原点则先走 RAISE 抬回最高点，再回缩滑台。
+ * 正式任务的预下降已经在行驶预置里由 PRE_ROTATE 完成（云台/夹爪 DONE 后
+ * 才下降），到站流程检测到 jog_vision_drop_applied 就不再进入 LOWER。
  * 原料区不做预下降，仍然直接 DONE。
  */
 typedef enum
@@ -234,7 +238,12 @@ typedef enum
     MANIP_JOG_ROTATE,
     MANIP_JOG_LOWER,
     MANIP_JOG_RAISE,
-    MANIP_JOG_HEIGHT
+    MANIP_JOG_HEIGHT,
+    /*
+     * 行驶预置专用：料盘/云台/夹爪目标已经下发，先等云台与夹爪转到位，
+     * 再把电机5下降到视觉取像高度，避免“边转边降”造成扫掠干涉。
+     */
+    MANIP_JOG_PRE_ROTATE
 } ManipulatorSlideJogState_t;
 
 /*
@@ -499,26 +508,46 @@ extern volatile uint8_t robot_manip_vision_drop_applied;
  * ==================== 行驶途中的机械预置（多步并行） ====================
  *
  * 正式任务在“上一段作业刚收尾、底盘还没起步”的那一刻调用本接口，把下一次
- * 作业要用的料盘槽位、云台识别角和夹爪张开量提前摆好，让舵机与底盘运动
- * 并行：
+ * 作业要用的料盘槽位、云台识别角、夹爪张开量和（粗加工区/暂存区的）电机5
+ * 视觉预下降提前做好，让这些动作与底盘转向、行驶并行：
  *
- *   只动三路舵机（料盘选择、云台、夹爪），不伸齿条、不下降电机5。
+ *   ManipulatorAction_PrepositionForNextZone()          只动三路舵机
+ *   ManipulatorAction_PrepositionForNextZoneWithDrop()  舵机转到位后再下降电机5
+ *
+ * 预下降不会和云台旋转同时进行：MANIP_JOG_PRE_ROTATE 先等云台与夹爪 DONE
+ * （或 K230_ALIGN_ROTATE_TIMEOUT_MS 兜底），再发电机5命令，避免夹爪一边
+ * 扫掠一边下降；这段时间仍落在底盘行驶窗口内，不额外停车。
  *
  * 这样做的安全性来自现有动作收尾约定：每一段区域动作结束时齿条都已回到
  * 原点、电机5都在最高机械原点（见 MANIP_GROUND_TO_TRAY_WAIT_RETURN_GIMBAL /
  * MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETURN_GIMBAL），夹爪是在
- * 收回且抬高的状态下回转，不会扫到料盘或场地结构。
+ * 收回且抬高的状态下回转，不会扫到料盘或场地结构；预下降只做垂直运动，
+ * 此时齿条仍在原点。
+ *
+ * 注意：预下降之后，到站时的齿条前伸是在已经降低的高度上进行的，不再走
+ * 「最高点前伸、再下降」的旧顺序。首次上机请低速确认前伸路径上没有高于
+ * 该高度的圆环边缘/工装。
  *
  * 云台角固定取 CAROUSEL_PICKUP_POS2_DEG，与 SlideJogToXXXAlignStart() 到站
- * 后下发的目标完全一致。后者的 MANIP_JOG_ROTATE 阶段重新下发同一目标时，
- * 舵机若已在位只会重新走一次 150 ms 稳定确认（CarouselServo_SetUs /
- * GripperServo_SetUs 在 current==target 时直接进 SETTLING），随后立刻伸齿条，
- * 因而省掉了“停车后才开始转云台”的那段时间。
+ * 后下发的目标完全一致。后者重新下发同一目标时，舵机若已在位只会重新走
+ * 一次 150 ms 稳定确认（CarouselServo_SetUs / GripperServo_SetUs 在
+ * current==target 时直接进 SETTLING），随后立刻伸齿条，因而省掉了“停车后
+ * 才开始转云台”和“停车后才下降电机5”的时间。
  *
  * 启动条件不满足时返回 false 且不改变任何状态；预置失败绝不让任务失败——
  * 到站后的原有流程本身会把同样的姿态摆好，只是慢一些。
  */
 bool ManipulatorAction_PrepositionForNextZone(uint8_t tray_slot);
+
+/*
+ * @param gimbal_pre_drop_mm 电机5视觉预下降量（正数=向下），0 表示不下降。
+ *        粗加工区传 ROUGH_VISION_PRE_DROP_MM，暂存区传
+ *        STORAGE_VISION_PRE_DROP_MM，原料区保持 0（最高点识别）。
+ * @return true 表示舵机预置已下发；电机5下降是否成功不影响返回值，失败时
+ *         到站流程会按原顺序在齿条到位后补做。
+ */
+bool ManipulatorAction_PrepositionForNextZoneWithDrop(uint8_t tray_slot,
+                                                      float gimbal_pre_drop_mm);
 
 /*
  * 预置结果镜像（非 static 全局，Keil Watch 直接输名字即可）：
