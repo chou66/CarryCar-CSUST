@@ -6,6 +6,7 @@
 #include "raw_material_align.h"
 #include "robot_config.h"
 #include "servo.h"
+#include "task_code.h"
 
 #include <stddef.h>
 
@@ -67,9 +68,8 @@ static const ZoneStep_t s_raw_batch0[3] =
 };
 
 /*
- * 第二批当前写死验证使用另外三种颜色4/5/6，避免再次抓取第一批的1/2/3。
- * 以后接入二维码时，只需把robot_config.h里的K230_RAW_ALIGN_B2_COLOR_n
- * 替换成任务码第三组解析结果，本状态机无需改动。
+ * 表内4/5/6只供独立机械测试兜底。正式任务装载二维码后，第一批/第二批
+ * align_color分别由任务码第一组/第三组在运行时覆盖。
  */
 static const ZoneStep_t s_raw_batch1[3] =
 {
@@ -83,8 +83,8 @@ static const ZoneStep_t s_raw_batch1[3] =
  *
  * 注意这里六步的 align_color 全是 0，这不是漏做视觉：RobotApp 在进入本
  * 区域前只用固定的 2 号圆环做一次 PLACE 底盘对位。对位完成以后，1/2/3
- * 号圆环的相对位置固定，所以六步全部重放 robot_config.h 里写死的
- * ZONE_ROUGH_POSn_POSE；尤其1号、3号绝不再次视觉追踪或移动底盘。
+ * 号圆环的相对位置固定；每块料按任务码第二/第四组选择已标定的
+ * ZONE_ROUGH_POSn_POSE，1/2/3号都不再视觉追踪或移动底盘。
  */
 static const ZoneStep_t s_rough_batch0[6] =
 {
@@ -106,7 +106,7 @@ static const ZoneStep_t s_rough_batch1[6] =
     { ZONE_STEP_TO_TRAY,   2U, ZONE_ROUGH_POS3_POSE, 0U }
 };
 
-/* 暂存区第一批：料盘三块放到暂存位第一层。 */
+/* 暂存区第一批：按任务码第二组放到暂存位第一层。 */
 static const ZoneStep_t s_storage_batch0[3] =
 {
     { ZONE_STEP_FROM_TRAY, 0U, ZONE_STORAGE_POS1_POSE, 0U },
@@ -115,9 +115,11 @@ static const ZoneStep_t s_storage_batch0[3] =
 };
 
 /*
- * 暂存区第二批：叠放到第一层之上。
- * 这里的 pose 是默认（同序号）占位，实际目标位由
- * s_storage_l2_target[] 在运行时重映射（见 start_step_action）。
+ * 暂存区第二批：放到第一层之上。
+ * 表内pose只是无任务码独立调试时的同序号默认值。正式任务会在
+ * start_step_action()中读取task_code.c按同色关系计算出的storage_slot，
+ * 选择对应圆环的第二层位姿。第四组只控制第二批粗加工区位置，不能在
+ * 暂存区直接复用，否则颜色顺序变化时会叠放到错误物料上。
  */
 static const ZoneStep_t s_storage_batch1[3] =
 {
@@ -126,9 +128,28 @@ static const ZoneStep_t s_storage_batch1[3] =
     { ZONE_STEP_FROM_TRAY, 2U, ZONE_STORAGE_POS3_L2_POSE, 0U }
 };
 
-/* ★ 手工配置点 2：第二批第 i 块叠到第一批的哪个暂存位。
- * 默认同序号；本版固定数组驱动，接任务码后按颜色填写。 */
+/* 无任务码的独立机械调试保留同序号兜底；正式任务由二维码覆盖。 */
 static const uint8_t s_storage_l2_target[3] = { 0U, 1U, 2U };
+
+/*
+ * 三个粗加工圆环的实测“夹爪中心”机械位姿。二维码只选择数组下标，不改变
+ * 这些标定值；底盘进入本区时先以独立的95 mm相机位姿对准2号圆，随后相机
+ * 齿条完整回零，正式放置/取回再从本数组读取1/2/3号位姿。尤其2号必须使用
+ * ROUGH_SLIDE_POS2_MM=90 mm，不能继续沿用相机取像时的95 mm。
+ */
+static const ManipPose_t s_rough_pose[3] =
+{
+    ZONE_ROUGH_POS1_POSE,
+    ZONE_ROUGH_POS2_POSE,
+    ZONE_ROUGH_POS3_POSE
+};
+
+static const ManipPose_t s_storage_l1_pose[3] =
+{
+    ZONE_STORAGE_POS1_POSE,
+    ZONE_STORAGE_POS2_POSE,
+    ZONE_STORAGE_POS3_POSE
+};
 
 /* 三个暂存位“叠放层”位姿，供 s_storage_l2_target 索引。 */
 static const ManipPose_t s_storage_l2_pose[3] =
@@ -160,16 +181,113 @@ static const ZoneProgram_t s_zone_program[ZONE_ID_COUNT][2] =
 
 /* ------------------------------------------------------------------------- */
 
-volatile static ZoneTaskState_t task_state = ZONE_TASK_IDLE;
+static volatile ZoneTaskState_t task_state = ZONE_TASK_IDLE;
 static const ZoneProgram_t *active_program = NULL;
 static ZoneId_t active_zone = ZONE_RAW;
 static uint8_t active_batch = 0U;
 static uint8_t task_index = 0U;
 static uint32_t state_start_ms = 0U;
 /* 原料区本步二维视觉闭环得到的动态夹取位姿。 */
-static float raw_aligned_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+static float raw_aligned_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
 static float raw_aligned_slide_mm = RAW_VISION_SLIDE_START_MM;
 static bool raw_aligned_pose_valid = false;
+static MissionTaskCode_t s_task_code;
+
+/*
+ * 粗加工区共有6步：前三步从托盘放下，后三步从相同圆环取回。
+ * task_index对3取余后，两段都会回到同一个任务物料下标，保证取回顺序、
+ * 托盘槽位和放下时完全一致；原料区/暂存区各只有3步，可直接使用下标。
+ */
+static uint8_t current_item_index(void)
+{
+    if (active_zone == ZONE_ROUGH)
+        return (uint8_t)(task_index % TASK_CODE_ITEM_COUNT);
+    return task_index;
+}
+
+static uint8_t current_align_color(const ZoneStep_t *step)
+{
+    uint8_t item = current_item_index();
+
+    /*
+     * 正式任务的原料识别颜色来自二维码第一组/第三组；步骤表内的宏只在
+     * 没有装载任务码的独立机械调试中兜底，不能覆盖比赛任务顺序。
+     */
+    if (step && active_zone == ZONE_RAW && s_task_code.valid &&
+        item < TASK_CODE_ITEM_COUNT)
+    {
+        return s_task_code.batch[active_batch][item].color;
+    }
+
+    return step ? step->align_color : 0U;
+}
+
+/*
+ * 本步外部端“标定位姿”（不含原料区视觉对准后的动态覆盖）。
+ *
+ * MOVE_TRAY 提前转云台时用来决定目标角度，start_step_action() 也先取这组
+ * 值再按原料对位结果覆盖，两处必须使用同一套任务码映射，避免“预转角度”
+ * 和“真正动作角度”不一致。
+ */
+static ManipPose_t current_step_pose(void)
+{
+    const ZoneStep_t *step = &active_program->steps[task_index];
+    ManipPose_t pose = step->pose;
+    uint8_t item = current_item_index();
+
+    if (s_task_code.valid && item < TASK_CODE_ITEM_COUNT)
+    {
+        uint8_t slot;
+
+        if (active_zone == ZONE_ROUGH)
+        {
+            /* 第一批读第二组，第二批读第四组，选择粗加工区1~3号位姿。 */
+            slot = s_task_code.batch[active_batch][item].rough_slot;
+            if (slot >= 1U && slot <= 3U) pose = s_rough_pose[slot - 1U];
+        }
+        else if (active_zone == ZONE_STORAGE)
+        {
+            slot = s_task_code.batch[active_batch][item].storage_slot;
+            if (slot >= 1U && slot <= 3U)
+            {
+                pose = (active_batch == 0U) ?
+                       s_storage_l1_pose[slot - 1U] :
+                       s_storage_l2_pose[slot - 1U];
+            }
+        }
+    }
+    else if ((active_zone == ZONE_STORAGE) && (active_batch == 1U))
+    {
+        /* 无任务码的独立机械测试：第二批仍按同序号叠放。 */
+        pose = s_storage_l2_pose[s_storage_l2_target[task_index]];
+    }
+
+    return pose;
+}
+
+/*
+ * 滑台是否已经停在原料识别位。
+ *
+ * RawStationTask 在车体 +X 停靠平移的同一个窗口里把齿条预伸到
+ * RAW_VISION_SLIDE_START_MM；满足这个条件时本区域第一步可以跳过
+ * SLIDE_OUT，直接进入视觉识别。
+ */
+static bool raw_slide_prealigned_ready(ZoneId_t zone)
+{
+    float pos;
+
+    if ((zone != ZONE_RAW) ||
+        !Manipulator_Slide_AtAlign() ||
+        !ManipulatorAction_SlideJogIsDone() ||
+        !ManipulatorAction_SlideJogPositionKnown())
+    {
+        return false;
+    }
+
+    pos = ManipulatorAction_SlideJogGetPositionMm();
+    return (pos >= (RAW_VISION_SLIDE_START_MM - 0.5f)) &&
+           (pos <= (RAW_VISION_SLIDE_START_MM + 0.5f));
+}
 
 /*
  * 状态镜像：非 static 全局，Keil Watch 直接输变量名即可观察，
@@ -223,7 +341,7 @@ static void task_fail(uint32_t now_ms)
     enter_state(ZONE_TASK_ERROR, now_ms);
 }
 
-static bool task_can_start(void)
+static bool task_can_start(ZoneId_t zone)
 {
     if ((task_state != ZONE_TASK_IDLE) &&
         (task_state != ZONE_TASK_DONE))
@@ -241,11 +359,16 @@ static bool task_can_start(void)
     }
 
     /*
-     * 滑台位置基准必须有效（确知停在原点）：原料区每步都要先前伸到识别位，
-     * 这个固定量是相对原点算的。急停或上一轮失败后基准会作废，此时直接
-     * 拒绝启动，而不是启动后才发现点动发不出去。
+     * 滑台位置基准必须有效：原料区每步都要前伸到识别位，这个固定量是
+     * 相对原点算的。急停或上一轮失败后基准会作废，此时直接拒绝启动，
+     * 而不是启动后才发现点动发不出去。
+     *
+     * 例外：RawStationTask 已在停靠平移窗口里把齿条预伸到原料识别位，
+     * 此时滑台基准是 ALIGN 且位置为 RAW_VISION_SLIDE_START_MM，属于
+     * 正常输入；第一步的视觉识别会直接从这个位置开始。
      */
-    if (!Manipulator_Slide_AtHome())
+    if (!Manipulator_Slide_AtHome() &&
+        !raw_slide_prealigned_ready(zone))
     {
         return false;
     }
@@ -253,20 +376,21 @@ static bool task_can_start(void)
     return true;
 }
 
-/* 启动当前步骤对应的机械臂动作。 */
+/*
+ * 启动当前步骤对应的机械臂动作。
+ *
+ * MOVE_TRAY 已经和料盘选择舵机同时把云台、夹爪摆到本步第一个目标，
+ * WAIT_TRAY 也确认过舵机到位，因此这里统一走 Prepared 入口，跳过动作
+ * 开头重复的舵机段。原料区视觉对准路径仍然从动态对准位直接下降。
+ */
 static bool start_step_action(void)
 {
     const ZoneStep_t *step = &active_program->steps[task_index];
-    ManipPose_t pose = step->pose;
-
-    if ((active_zone == ZONE_STORAGE) && (active_batch == 1U))
-    {
-        /* 第二批：叠放到 s_storage_l2_target 指定的第一层暂存位。 */
-        pose = s_storage_l2_pose[s_storage_l2_target[task_index]];
-    }
+    ManipPose_t pose = current_step_pose();
+    uint8_t align_color = current_align_color(step);
 
     if ((active_zone == ZONE_RAW) &&
-        (step->align_color != 0U) &&
+        (align_color != 0U) &&
         raw_aligned_pose_valid)
     {
         /* 二维视觉闭环已经把相机中心对准目标；滑台和云台仍停在
@@ -282,10 +406,10 @@ static bool start_step_action(void)
 
     if (step->flow == ZONE_STEP_TO_TRAY)
     {
-        return ManipulatorAction_StartToTrayAtPose(&pose);
+        return ManipulatorAction_StartToTrayAtPosePrepared(&pose);
     }
 
-    return ManipulatorAction_StartTrayToGroundAtPose(&pose);
+    return ManipulatorAction_StartTrayToGroundAtPosePrepared(&pose);
 }
 
 void ZoneTask_Init(void)
@@ -296,14 +420,32 @@ void ZoneTask_Init(void)
     active_batch = 0U;
     task_index = 0U;
     state_start_ms = 0U;
-    raw_aligned_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+    raw_aligned_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
     raw_aligned_slide_mm = RAW_VISION_SLIDE_START_MM;
     raw_aligned_pose_valid = false;
+    ZoneTask_ClearTaskCode();
+}
+
+bool ZoneTask_SetTaskCode(const MissionTaskCode_t *task)
+{
+    /*
+     * 只允许在区域动作空闲时整体复制任务，防止执行到一半被连续扫码改写。
+     * RobotApp也只在N6扫码状态调用本函数，形成上、下两层共同保护。
+     */
+    if (!task || !task->valid || ZoneTask_IsBusy()) return false;
+    s_task_code = *task;
+    return true;
+}
+
+void ZoneTask_ClearTaskCode(void)
+{
+    s_task_code.valid = 0U;
+    s_task_code.text[0] = '\0';
 }
 
 bool ZoneTask_Start(ZoneId_t zone, uint8_t batch)
 {
-    if (!task_can_start())
+    if (!task_can_start(zone))
     {
         return false;
     }
@@ -317,7 +459,7 @@ bool ZoneTask_Start(ZoneId_t zone, uint8_t batch)
     active_batch = batch;
     active_program = &s_zone_program[zone][batch];
     task_index = 0U;
-    raw_aligned_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+    raw_aligned_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
     raw_aligned_slide_mm = RAW_VISION_SLIDE_START_MM;
     raw_aligned_pose_valid = false;
 
@@ -335,6 +477,7 @@ bool ZoneTask_Start(ZoneId_t zone, uint8_t batch)
 void ZoneTask_Update(uint32_t now_ms)
 {
     const ZoneStep_t *step;
+    ManipPose_t pose;
 
     /* 每帧刷新镜像：task_index 自增后 Watch 立刻可见。 */
     sync_task_state();
@@ -354,14 +497,36 @@ void ZoneTask_Update(uint32_t now_ms)
             }
 
             step = &active_program->steps[task_index];
+            pose = current_step_pose();
+
+            /*
+             * 料盘选择舵机转动的同时把云台和夹爪也摆到本步第一个目标：
+             *   TO_TRAY   —— 转向外部取料角并张开大夹爪；
+             *   FROM_TRAY —— 转向料盘上方放料角并张开小夹爪。
+             * 三者都是“下发目标即返回”，平滑步进由主循环推进，因此料盘与
+             * 云台真正并行转动；WAIT_TRAY 等三者都到位再启动电机动作。
+             */
             TraySelectorServo_GotoSlot(step->tray_slot);
+
+            if (step->flow == ZONE_STEP_TO_TRAY)
+            {
+                CarouselServo_SetAngle(pose.carousel_deg);
+                GripperServo_Open_Large();
+            }
+            else
+            {
+                CarouselServo_ToPlace();
+                GripperServo_Open_Small();
+            }
 
             enter_state(ZONE_TASK_WAIT_TRAY, now_ms);
             break;
 
         case ZONE_TASK_WAIT_TRAY:
-            if ((now_ms - state_start_ms) >=
-                MANIP_PLACE_TRAY_WAIT_MS)
+            if (((now_ms - state_start_ms) >=
+                 MANIP_PLACE_TRAY_WAIT_MS) &&
+                CarouselServo_IsDone() &&
+                GripperServo_IsDone())
             {
                 /*
                  * 原料区每块料在夹之前都要重新识别一次颜色，
@@ -369,18 +534,39 @@ void ZoneTask_Update(uint32_t now_ms)
                  * 识别统一在取料位2姿态下做，相机装在夹爪上，所以先转云台
                  * 到该姿态并张开夹爪，再把滑台前伸到该位的前伸量，让取像
                  * 姿态和取像距离都对上——顺序见 SLIDE_OUT 那一段。
+                 *
+                 * 本区域第一步的齿条已经由 RawStationTask 在车体停靠平移
+                 * 的同一窗口里预伸到位，此时跳过 SLIDE_OUT 直接识别。
                  */
-                if (active_program->steps[task_index].align_color != 0U)
+                if (current_align_color(&active_program->steps[task_index]) != 0U)
                 {
-                    raw_aligned_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+                    raw_aligned_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
                     raw_aligned_slide_mm = RAW_VISION_SLIDE_START_MM;
                     raw_aligned_pose_valid = false;
-                    enter_state(ZONE_TASK_SLIDE_OUT, now_ms);
+
+                    if (raw_slide_prealigned_ready(active_zone))
+                    {
+                        enter_state(ZONE_TASK_ALIGN, now_ms);
+                    }
+                    else
+                    {
+                        enter_state(ZONE_TASK_SLIDE_OUT, now_ms);
+                    }
                 }
                 else
                 {
                     enter_state(ZONE_TASK_START_ACTION, now_ms);
                 }
+            }
+            else if ((now_ms - state_start_ms) >=
+                     MANIP_PLACE_MOTOR_TIMEOUT_MS)
+            {
+                /*
+                 * 料盘没有到位反馈，只靠 MANIP_PLACE_TRAY_WAIT_MS 兜底；
+                 * 云台/夹爪则有明确的 DONE 判定。这里保留一个统一上限，
+                 * 防止舵机异常时整个任务无限停在 WAIT_TRAY。
+                 */
+                task_fail(now_ms);
             }
             break;
 
@@ -399,7 +585,7 @@ void ZoneTask_Update(uint32_t now_ms)
              * 并张开，再把滑台前伸到识别位），这里只负责发 detect,<颜色号>
              * 并等识别到该颜色、微调到偏差容差内，才允许夹取。
              */
-            if (!RawMaterialAlign_Start(step->align_color, now_ms))
+            if (!RawMaterialAlign_Start(current_align_color(step), now_ms))
             {
                 task_fail(now_ms);
                 break;
@@ -567,4 +753,37 @@ uint8_t ZoneTask_GetStepCount(void)
     }
 
     return active_program->step_count;
+}
+
+uint8_t ZoneTask_GetCurrentColor(void)
+{
+    uint8_t item = current_item_index();
+
+    if (!s_task_code.valid || item >= TASK_CODE_ITEM_COUNT ||
+        active_batch >= TASK_CODE_BATCH_COUNT)
+    {
+        return 0U;
+    }
+
+    return s_task_code.batch[active_batch][item].color;
+}
+
+bool ZoneTask_GetFirstTraySlot(ZoneId_t zone, uint8_t batch, uint8_t *slot)
+{
+    const ZoneProgram_t *program;
+
+    if ((slot == NULL) || ((uint8_t)zone >= (uint8_t)ZONE_ID_COUNT) ||
+        (batch >= 2U))
+    {
+        return false;
+    }
+
+    program = &s_zone_program[(uint8_t)zone][batch];
+    if ((program->steps == NULL) || (program->step_count == 0U))
+    {
+        return false;
+    }
+
+    *slot = program->steps[0].tray_slot;
+    return true;
 }

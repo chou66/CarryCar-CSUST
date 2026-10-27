@@ -2,6 +2,30 @@
 #include "tim.h"
 #include "robot_config.h"
 
+/*
+ * 舵机运行时标定值
+ * ----------------
+ * robot_config.h 中的宏只负责提供可靠的上电默认值；正式动作读取下面这些
+ * RAM 变量。这样既保留了固定配置，又可以在 Keil Debug 的 Watch 窗口中
+ * 在线微调机械角度。
+ *
+ * Watch 中可直接添加：
+ *   g_carousel_place_deg  云台放料角度
+ *   g_tray_slot_deg[0]    物料盘1号位
+ *   g_tray_slot_deg[1]    物料盘2号位
+ *   g_tray_slot_deg[2]    物料盘3号位
+ *
+ * 修改只保存在 RAM，复位或重新上电后会恢复为宏定义的默认值。确认最终
+ * 标定值后，应同步更新 robot_config.h，保证下次上电仍使用正确角度。
+ */
+volatile float g_carousel_place_deg = CAROUSEL_PLACE_DEG;
+volatile float g_tray_slot_deg[TRAY_SELECTOR_SLOT_COUNT] =
+{
+    TRAY_SELECTOR_SLOT0_DEG,
+    TRAY_SELECTOR_SLOT1_DEG,
+    TRAY_SELECTOR_SLOT2_DEG
+};
+
 static uint16_t clamp_us(uint16_t us)
 {
     if (us < SERVO_MIN_US) return SERVO_MIN_US;
@@ -35,12 +59,12 @@ uint16_t Servo_AngleToUs(float angle_deg, float travel_deg)
 }
 
 #define CAROUSEL_STEP_PERIOD_MS     20U  //多久改变一次脉宽
-#define CAROUSEL_STEP_US            10U  //每次改变多少脉宽
-#define CAROUSEL_SETTLE_MS          150U //输出到达目标后的稳定时间
+#define CAROUSEL_STEP_US            30U  //每次改变多少脉宽
+#define CAROUSEL_SETTLE_MS          50U //输出到达目标后的稳定时间
 
 #define GRIPPER_STEP_PERIOD_MS      20U
-#define GRIPPER_STEP_US             15U
-#define GRIPPER_SETTLE_MS           150U
+#define GRIPPER_STEP_US             30U
+#define GRIPPER_SETTLE_MS           50U
 
 typedef enum
 {
@@ -76,7 +100,7 @@ void Servo_Init(void)
         Servo_AngleToUs(CAROUSEL_POWERON_DEG, CAROUSEL_TRAVEL_DEG);
 
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, SERVO_CENTER_US);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, carousel_poweron_us);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, SERVO_CENTER_US);
 	  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, SERVO_CENTER_US);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, SERVO_CENTER_US);
 	
@@ -271,19 +295,16 @@ void TraySelectorServo_SetAngle(float angle_deg)
 
 void TraySelectorServo_GotoSlot(uint8_t slot)
 {
-    static const float slot_deg[TRAY_SELECTOR_SLOT_COUNT] =
-    {
-        TRAY_SELECTOR_SLOT0_DEG,
-        TRAY_SELECTOR_SLOT1_DEG,
-        TRAY_SELECTOR_SLOT2_DEG
-    };
-
     if (slot >= TRAY_SELECTOR_SLOT_COUNT)
     {
         return;
     }
 
-    TraySelectorServo_SetAngle(slot_deg[slot]);
+    /*
+     * 不再使用函数内部的 const 数组：这里直接读取 RAM 中的运行时标定值，
+     * 因此在 Debug Watch 修改 g_tray_slot_deg[] 后，下一次转盘定位立即生效。
+     */
+    TraySelectorServo_SetAngle(g_tray_slot_deg[slot]);
 }
 
 /*夹爪旋转*/
@@ -420,7 +441,8 @@ void CarouselServo_ToPickupPos3(void)
 
 void CarouselServo_ToPlace(void)
 {
-    CarouselServo_SetAngle(CAROUSEL_PLACE_DEG);
+    /* 每次执行放料动作都重新读取 RAM，便于 Debug Watch 在线标定。 */
+    CarouselServo_SetAngle(g_carousel_place_deg);
 }
 
 void CarouselServo_ToMid(void)

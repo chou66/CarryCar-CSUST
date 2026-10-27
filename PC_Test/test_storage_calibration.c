@@ -33,6 +33,12 @@ static uint8_t s_slide_busy;
 static uint8_t s_slide_done;
 static float s_slide_mm;
 static float s_slide_target_mm;
+static float s_vision_drop_mm;
+static uint8_t s_rough_high_start_count;
+static uint8_t s_rough_low_start_count;
+static uint8_t s_storage_low_start_count;
+static uint8_t s_low_home_count;
+static uint8_t s_vision_height_jog_count;
 static uint8_t s_servo_done;
 static float s_carousel_deg;
 static uint8_t s_gripper_open_count;
@@ -217,6 +223,8 @@ bool ManipulatorAction_SlideJogIsBusy(void) { return s_slide_busy != 0U; }
 bool ManipulatorAction_SlideJogHasError(void) { return false; }
 bool ManipulatorAction_SlideJogIsDone(void) { return s_slide_done != 0U; }
 float ManipulatorAction_SlideJogGetPositionMm(void) { return s_slide_mm; }
+float ManipulatorAction_SlideJogGetVisionDropMm(void)
+{ return s_vision_drop_mm; }
 bool ManipulatorAction_SlideJogToPositionStart(float target_mm)
 {
     if (!s_slide_valid || s_slide_busy) return false;
@@ -225,14 +233,78 @@ bool ManipulatorAction_SlideJogToPositionStart(float target_mm)
     s_slide_done = 0U;
     return true;
 }
+bool ManipulatorAction_SlideJogToVisionPositionStart(float target_mm,
+                                                      float pre_drop_mm)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm != 0.0f ||
+        s_vision_drop_mm != 0.0f || target_mm <= 0.0f || pre_drop_mm <= 0.0f)
+    {
+        return false;
+    }
+    s_slide_target_mm = target_mm;
+    s_vision_drop_mm = -pre_drop_mm;
+    s_storage_low_start_count++;
+    s_slide_busy = 1U;
+    s_slide_done = 0U;
+    return true;
+}
+bool ManipulatorAction_SlideJogToVisionDropStart(float target_drop_mm)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm <= 0.0f ||
+        s_vision_drop_mm > 0.0f || target_drop_mm <= 0.0f)
+    {
+        return false;
+    }
+    s_vision_drop_mm = -target_drop_mm;
+    s_vision_height_jog_count++;
+    s_slide_busy = 1U;
+    s_slide_done = 0U;
+    return true;
+}
+bool ManipulatorAction_SlideJogRaiseGimbalOnlyStart(void)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm <= 0.0f ||
+        s_vision_drop_mm >= 0.0f)
+    {
+        return false;
+    }
+    s_vision_drop_mm = 0.0f;
+    s_slide_busy = 1U;
+    s_slide_done = 0U;
+    return true;
+}
+bool ManipulatorAction_SlideJogRetractSlideOnlyStart(void)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm <= 0.0f ||
+        s_vision_drop_mm != 0.0f)
+    {
+        return false;
+    }
+    return ManipulatorAction_SlideJogToPositionStart(0.0f);
+}
+bool ManipulatorAction_SlideJogToRoughAlignHighStart(void)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm != 0.0f) return false;
+    s_rough_high_start_count++;
+    return ManipulatorAction_SlideJogToPositionStart(
+        ROUGH_VISION_HIGH_SLIDE_POS2_MM);
+}
 bool ManipulatorAction_SlideJogToRoughAlignStart(void)
 {
     if (!s_slide_valid || s_slide_busy || s_slide_mm != 0.0f) return false;
-    return ManipulatorAction_SlideJogToPositionStart(ROUGH_SLIDE_POS2_MM);
+    s_rough_low_start_count++;
+    s_vision_drop_mm = -ROUGH_VISION_PRE_DROP_MM;
+    return ManipulatorAction_SlideJogToPositionStart(
+        ROUGH_VISION_LOW_SLIDE_POS2_MM);
 }
 bool ManipulatorAction_SlideJogHomeStart(void)
 {
     if (!s_slide_valid || s_slide_busy || s_slide_mm == 0.0f) return false;
+    if (s_vision_drop_mm != 0.0f)
+    {
+        s_vision_drop_mm = 0.0f;
+        s_low_home_count++;
+    }
     return ManipulatorAction_SlideJogToPositionStart(0.0f);
 }
 void ManipulatorAction_Update(uint32_t now_ms)
@@ -331,10 +403,12 @@ int main(void)
     s_imu.last_update_ms = 304U;
     StorageCalibration_Update(304U);
     check(StorageCalibration_GetState() == STORAGE_CAL_ROUGH_PRESET &&
-          nearf_local(s_slide_target_mm, ROUGH_SLIDE_POS2_MM, 0.01f) &&
+          nearf_local(s_slide_target_mm,
+                      ROUGH_VISION_HIGH_SLIDE_POS2_MM, 0.01f) &&
+          s_rough_high_start_count == 1U && s_rough_low_start_count == 0U &&
           nearf_local(StorageCalibration_GetCarouselTargetDeg(),
-                      K230_ALIGN_CAROUSEL_ANGLE_DEG, 0.01f),
-          "N2 +90 degrees starts the calibrated 205-degree/78-mm camera pose");
+                      CAROUSEL_PICKUP_POS2_DEG, 0.01f),
+          "Legacy storage command keeps the N2 camera at the high position");
 
     StorageCalibration_Update(305U);
     check(StorageCalibration_GetState() == STORAGE_CAL_ROUGH_VISION_ALIGN &&
@@ -377,14 +451,14 @@ int main(void)
     check(StorageCalibration_GetState() == STORAGE_CAL_ARM_READY,
           "Manual slide tuning unlocks after carousel and gripper are ready");
 
-    /* 使用正式2号位的90 mm实测值覆盖“输入->保存->视觉锁定后保持”整条链路。 */
+    /* 旧高位流程使用独立的90 mm相机参数，不借用新的70 mm夹爪落点。 */
     check(StorageCalibration_MoveSlideDeciMm(900U),
-          "Storage slide accepts the calibrated 90.0-mm ring-2 target");
+          "Legacy storage vision accepts the historical 90.0-mm camera target");
     StorageCalibration_Update(602U);
     check(StorageCalibration_GetState() == STORAGE_CAL_SLIDE_READY &&
-          nearf_local(s_slide_mm, STORAGE_SLIDE_POS2_MM, 0.01f) &&
+          nearf_local(s_slide_mm, STORAGE_VISION_HIGH_SLIDE_POS2_MM, 0.01f) &&
           StorageCalibration_AllowsManualVision(),
-          "At the requested length K230 observation is explicitly allowed");
+          "Legacy K230 observation stays separate from the formal gripper pose");
 
     check(StorageCalibration_StartStorageVisionAlign(603U) &&
           StorageCalibration_GetState() == STORAGE_CAL_STORAGE_VISION_ALIGN &&
@@ -401,7 +475,7 @@ int main(void)
     s_imu.last_update_ms = 806U;
     StorageCalibration_Update(806U);
     check(StorageCalibration_GetState() == STORAGE_CAL_SLIDE_READY &&
-          nearf_local(s_slide_mm, STORAGE_SLIDE_POS2_MM, 0.01f),
+          nearf_local(s_slide_mm, STORAGE_VISION_HIGH_SLIDE_POS2_MM, 0.01f),
           "Pose lock preserves the slide target when yaw is already correct");
 
     /*
@@ -440,8 +514,8 @@ int main(void)
     check(StorageCalibration_GetState() == STORAGE_CAL_SLIDE_READY,
           "The combined lock ends only when image and yaw are both valid");
 
-    check(StorageCalibration_MoveCarouselDeciDeg(1780U, 1510U) &&
-          nearf_local(StorageCalibration_GetCarouselTargetDeg(), 178.0f, 0.01f),
+    check(StorageCalibration_MoveCarouselDeciDeg(2373U, 1510U) &&
+          nearf_local(StorageCalibration_GetCarouselTargetDeg(), 237.3f, 0.01f),
           "Carousel angle can be fine-tuned while the slide is extended");
     s_servo_done = 1U;
     StorageCalibration_Update(1511U);
@@ -460,6 +534,97 @@ int main(void)
     StorageCalibration_Abort();
     check(StorageCalibration_GetState() == STORAGE_CAL_IDLE && !s_slide_valid,
           "Abort exits storage calibration and invalidates the slide reference");
+
+    /*
+     * 新低位流程必须同时覆盖途中N2基准和最终N4标定；两处分别使用各自的
+     * 预下降宏，不能只把N4改低而继续用旧高位N2作为路线基准。
+     */
+    s_imu.last_update_ms = 1600U;
+    s_world_yaw_deg = 0.0f;
+    check(StorageCalibration_StartFromBay2Low(0xA5U, 1600U) &&
+          StorageCalibration_IsLowVision(),
+          "Low storage command records the formal low-camera mode");
+    s_chassis_busy = 0U;
+    s_position_done = 1U;
+    StorageCalibration_Update(1601U);
+    StorageCalibration_Update(1602U);
+    StorageCalibration_Update(1603U);
+    s_world_yaw_deg = 90.0f;
+    s_imu.last_update_ms = 1804U;
+    StorageCalibration_Update(1804U);
+    check(StorageCalibration_GetState() == STORAGE_CAL_ROUGH_PRESET &&
+          s_rough_low_start_count == 1U &&
+          nearf_local(s_slide_target_mm,
+                      ROUGH_VISION_LOW_SLIDE_POS2_MM, 0.01f) &&
+          nearf_local(s_vision_drop_mm, -ROUGH_VISION_PRE_DROP_MM, 0.01f),
+          "Low storage route uses the formal lowered camera at N2");
+
+    StorageCalibration_Update(1805U);
+    s_k230_busy = 0U;
+    s_k230_done = 1U;
+    StorageCalibration_Update(1806U);
+    check(StorageCalibration_GetState() == STORAGE_CAL_ROUGH_RETRACT &&
+          s_low_home_count == 1U && s_vision_drop_mm == 0.0f,
+          "N2 low-camera alignment raises before retracting");
+    StorageCalibration_Update(1807U);
+    StorageCalibration_Update(1808U);
+    StorageCalibration_Update(1809U);
+    s_world_yaw_deg = 180.0f;
+    s_imu.last_update_ms = 2010U;
+    StorageCalibration_Update(2010U);
+    check(StorageCalibration_GetState() == STORAGE_CAL_HOME_READY,
+          "Low storage route reaches N4 with slide and gimbal restored high/home");
+
+    check(StorageCalibration_SelectRing(2U, 2011U),
+          "N4 low calibration selects ring 2 at the safe home pose");
+    s_servo_done = 1U;
+    StorageCalibration_Update(2012U);
+    check(StorageCalibration_MoveSlideDeciMm(950U),
+          "First N4 low-mode extension uses the 95 mm storage camera baseline");
+    StorageCalibration_Update(2013U);
+    check(s_storage_low_start_count == 1U &&
+          nearf_local(s_vision_drop_mm, -STORAGE_VISION_PRE_DROP_MM, 0.01f),
+          "N4 applies the storage low-camera drop exactly once");
+
+    check(StorageCalibration_MoveGimbalDropDeciMm(1850U),
+          "N4 accepts the verified direct 100-to-185 mm placement descent");
+    StorageCalibration_Update(2014U);
+    check(s_vision_height_jog_count == 1U &&
+          nearf_local(s_vision_drop_mm, MANIP_PICKUP_GROUND_MM, 0.01f) &&
+          StorageCalibration_GetState() == STORAGE_CAL_SLIDE_READY,
+          "N4 placement probe reaches the formal absolute ground height");
+
+    check(StorageCalibration_MoveSlideDeciMm(1050U),
+          "N4 placement-height slide tuning accepts a 10 mm adjustment");
+    StorageCalibration_Update(2015U);
+    check(nearf_local(s_slide_mm, 105.0f, 0.01f),
+          "N4 low slide tuning commits the requested absolute target");
+    check(!StorageCalibration_MoveSlideDeciMm(1160U) &&
+          StorageCalibration_GetError() == STORAGE_CAL_ERROR_PARAM,
+          "N4 placement-height slide tuning rejects more than 10 mm");
+    check(StorageCalibration_MoveCarouselDeciDeg(2933U, 2016U),
+          "N4 placement-height carousel accepts a large absolute angle change");
+    s_servo_done = 1U;
+    StorageCalibration_Update(2017U);
+    check(StorageCalibration_MoveCarouselDeciDeg(2733U, 2018U),
+          "N4 carousel can return directly to the ring-2 camera angle");
+    s_servo_done = 1U;
+    StorageCalibration_Update(2019U);
+    check(StorageCalibration_MoveSlideDeciMm(950U),
+          "N4 low slide can return to the 95 mm camera baseline");
+    StorageCalibration_Update(2020U);
+
+    check(StorageCalibration_MoveGimbalDropDeciMm(1000U),
+          "N4 placement probe returns to the low-camera height");
+    StorageCalibration_Update(2021U);
+    check(s_vision_height_jog_count == 2U &&
+          nearf_local(s_vision_drop_mm, -STORAGE_VISION_PRE_DROP_MM, 0.01f),
+          "N4 horizontal/K230 tuning is re-enabled after returning to 100 mm");
+
+    check(StorageCalibration_StartStorageVisionAlign(2022U),
+          "N4 K230 lock accepts the matching low-camera height");
+
+    StorageCalibration_Abort();
 
     printf("PASS: %d\nFAIL: %d\n", s_pass, s_fail);
     return s_fail ? 1 : 0;

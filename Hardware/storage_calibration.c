@@ -46,8 +46,10 @@ volatile uint8_t storage_cal_error = STORAGE_CAL_ERROR_NONE;
 volatile uint8_t storage_cal_current_node = 0U;
 volatile uint8_t storage_cal_selected_ring = 0U;
 volatile uint8_t storage_cal_home_confirmed = 0U;
+volatile uint8_t storage_cal_low_vision = 0U;
 volatile float storage_cal_target_slide_mm = 0.0f;
 volatile float storage_cal_target_carousel_deg = 0.0f;
+volatile float storage_cal_target_gimbal_drop_mm = 0.0f;
 volatile float storage_cal_world_yaw_deg = 0.0f;
 
 static float storage_absf(float x)
@@ -204,14 +206,23 @@ static void storage_alignment_done(uint32_t now_ms)
 
     if (s_align_node == MISSION_ROUGH_NODE)
     {
-        if (!ManipulatorAction_SlideJogToRoughAlignStart())
+        /*
+         * 途经N2时必须与本轮标定高度一致：旧入口复现高位相机姿态；低位
+         * 入口复现正式比赛的“伸到2号长度后下降电机5”姿态。两套参数不能
+         * 混在一次启停区2->N4路线中，否则N2底盘基准本身就不一致。
+         */
+        if (!(storage_cal_low_vision ?
+              ManipulatorAction_SlideJogToRoughAlignStart() :
+              ManipulatorAction_SlideJogToRoughAlignHighStart()))
         {
             storage_fail(STORAGE_CAL_ERROR_MANIPULATOR);
             return;
         }
 
-        storage_cal_target_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
-        storage_cal_target_slide_mm = ROUGH_SLIDE_POS2_MM;
+        storage_cal_target_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
+        storage_cal_target_slide_mm = storage_cal_low_vision ?
+                                      ROUGH_VISION_LOW_SLIDE_POS2_MM :
+                                      ROUGH_VISION_HIGH_SLIDE_POS2_MM;
         storage_set_state(STORAGE_CAL_ROUGH_PRESET);
         return;
     }
@@ -337,14 +348,17 @@ void StorageCalibration_Init(Chassis *chassis)
     storage_cal_current_node = 0U;
     storage_cal_selected_ring = 0U;
     storage_cal_home_confirmed = 0U;
+    storage_cal_low_vision = 0U;
     storage_cal_target_slide_mm = 0.0f;
     storage_cal_target_carousel_deg = 0.0f;
+    storage_cal_target_gimbal_drop_mm = 0.0f;
     storage_cal_world_yaw_deg = 0.0f;
     storage_set_state(STORAGE_CAL_IDLE);
 }
 
-uint8_t StorageCalibration_StartFromBay2(uint8_t confirm_key,
-                                         uint32_t now_ms)
+static uint8_t storage_start_from_bay2_internal(uint8_t confirm_key,
+                                                uint32_t now_ms,
+                                                uint8_t low_vision)
 {
     Hwt101 *imu = AppUart_GetImu();
     float park_x;
@@ -387,7 +401,13 @@ uint8_t StorageCalibration_StartFromBay2(uint8_t confirm_key,
      * 0x70接管会按急停语义作废滑台坐标。A5表示操作者已经确认滑台物理
      * 缩到底；这里只把它立为软件0 mm，不会驱动电机寻找原点。
      */
-    if (!ManipulatorAction_SlideJogRebaseHome())
+    /*
+     * 若上一轮低位标定被急停，电机5可能仍停在下降位置。不能仅凭A5把滑台
+     * 重新立零后继续，否则途经N2时会再次叠加预下降。应先人工恢复最高点
+     * 或复位控制器，使视觉下降记录回到0，再重新启动标定。
+     */
+    if (storage_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f ||
+        !ManipulatorAction_SlideJogRebaseHome())
     {
         storage_cal_error = STORAGE_CAL_ERROR_HOME;
         return 0U;
@@ -412,8 +432,10 @@ uint8_t StorageCalibration_StartFromBay2(uint8_t confirm_key,
     storage_cal_current_node = 0U;
     storage_cal_selected_ring = 0U;
     storage_cal_home_confirmed = 1U;
+    storage_cal_low_vision = low_vision ? 1U : 0U;
     storage_cal_target_slide_mm = 0.0f;
     storage_cal_target_carousel_deg = 0.0f;
+    storage_cal_target_gimbal_drop_mm = 0.0f;
     storage_cal_world_yaw_deg = 0.0f;
     s_deadline_ms = 0U;
     s_next_heading_update_ms = 0U;
@@ -449,6 +471,20 @@ uint8_t StorageCalibration_StartFromBay2(uint8_t confirm_key,
     return 1U;
 }
 
+uint8_t StorageCalibration_StartFromBay2(uint8_t confirm_key,
+                                         uint32_t now_ms)
+{
+    /* 旧高位识别流程原样保留，便于与已经记录的旧标定值做对照。 */
+    return storage_start_from_bay2_internal(confirm_key, now_ms, 0U);
+}
+
+uint8_t StorageCalibration_StartFromBay2Low(uint8_t confirm_key,
+                                            uint32_t now_ms)
+{
+    /* 新低位识别流程：N2途中基准和N4手工标定均复现正式预下降高度。 */
+    return storage_start_from_bay2_internal(confirm_key, now_ms, 1U);
+}
+
 uint8_t StorageCalibration_SelectRing(uint8_t ring, uint32_t now_ms)
 {
     float angle_deg = storage_ring_angle(ring);
@@ -463,6 +499,7 @@ uint8_t StorageCalibration_SelectRing(uint8_t ring, uint32_t now_ms)
     if (StorageCalibration_GetState() != STORAGE_CAL_HOME_READY ||
         !storage_cal_home_confirmed ||
         !ManipulatorAction_SlideJogPositionKnown() ||
+        storage_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f ||
         storage_absf(ManipulatorAction_SlideJogGetPositionMm()) > 0.05f)
     {
         storage_cal_error = STORAGE_CAL_ERROR_HOME;
@@ -516,6 +553,7 @@ uint8_t StorageCalibration_MoveCarouselDeciDeg(uint16_t target_deci_deg,
 uint8_t StorageCalibration_MoveSlideDeciMm(uint16_t target_deci_mm)
 {
     float target_mm = (float)target_deci_mm * 0.1f;
+    float current_mm = ManipulatorAction_SlideJogGetPositionMm();
     StorageCalibrationState_t state = StorageCalibration_GetState();
 
     if (target_mm < 0.0f || target_mm > MANIP_SLIDE_SOFT_MAX_MM)
@@ -533,13 +571,160 @@ uint8_t StorageCalibration_MoveSlideDeciMm(uint16_t target_deci_mm)
         return 0U;
     }
 
-    if (!ManipulatorAction_SlideJogToPositionStart(target_mm))
+    /*
+     * 与粗加工区保持相同调参手感：丝杆下降到实际落料高度后仍允许小步
+     * 调整齿条，以便直接观察夹爪中心。单条命令最多改变10 mm；回到0 mm
+     * 属于明确的安全回收动作，不受本步长限制，并仍会先抬丝杆再收齿条。
+     */
+    if (storage_cal_low_vision && state == STORAGE_CAL_SLIDE_READY &&
+        target_mm > 0.05f &&
+        storage_absf(ManipulatorAction_SlideJogGetVisionDropMm() +
+                      STORAGE_VISION_PRE_DROP_MM) > 0.1f &&
+         storage_absf(target_mm - current_mm) >
+             (STORAGE_LOW_CAL_MAX_SLIDE_STEP_MM + 0.05f))
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_PARAM;
+        return 0U;
+    }
+
+    /*
+     * ==================== 高位/低位识别分流 ====================
+     * 高位模式（旧0x87）只移动滑台；低位模式（新0x8A）第一次伸出后下降
+     * 电机5，后续细调只动滑台。低位回零必须使用HomeStart，确保顺序是
+     * “先抬回最高点，再收回齿条”，与正式任务完全相同。
+     */
+    if (storage_cal_low_vision && target_mm <= 0.05f &&
+        storage_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f)
+    {
+        if (!ManipulatorAction_SlideJogHomeStart())
+        {
+            storage_cal_error = STORAGE_CAL_ERROR_MANIPULATOR;
+            return 0U;
+        }
+        storage_cal_target_gimbal_drop_mm = 0.0f;
+    }
+    else if (storage_cal_low_vision && target_mm > 0.05f &&
+             storage_absf(ManipulatorAction_SlideJogGetVisionDropMm()) <= 0.05f)
+    {
+        if (!ManipulatorAction_SlideJogToVisionPositionStart(
+                target_mm, STORAGE_VISION_PRE_DROP_MM))
+        {
+            storage_cal_error = STORAGE_CAL_ERROR_MANIPULATOR;
+            return 0U;
+        }
+        storage_cal_target_gimbal_drop_mm = STORAGE_VISION_PRE_DROP_MM;
+    }
+    else if (!ManipulatorAction_SlideJogToPositionStart(target_mm))
     {
         storage_cal_error = STORAGE_CAL_ERROR_MANIPULATOR;
         return 0U;
     }
 
     storage_cal_target_slide_mm = target_mm;
+    storage_cal_error = STORAGE_CAL_ERROR_NONE;
+    storage_set_state(STORAGE_CAL_SLIDE_MOVING);
+    return 1U;
+}
+
+uint8_t StorageCalibration_MoveGimbalDropDeciMm(uint16_t target_deci_mm)
+{
+    float target_drop_mm = (float)target_deci_mm * 0.1f;
+    float max_drop_mm = -MANIP_PICKUP_GROUND_MM;
+    float current_drop_mm = -ManipulatorAction_SlideJogGetVisionDropMm();
+
+    /*
+     * 只接受0x8A低位流程。100 mm是当前正式取像高度，185 mm是第一层
+     * 地面放置高度；125 mm（-185+60）自然落在区间内，可验证第二层叠放。
+     * 上限硬锁在正式第一层高度，任何串口误码都不能让丝杆继续向地面下压。
+     */
+    if (!storage_cal_low_vision ||
+        target_drop_mm < (STORAGE_VISION_PRE_DROP_MM - 0.05f) ||
+        target_drop_mm > (max_drop_mm + 0.05f))
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_PARAM;
+        return 0U;
+    }
+
+    if (StorageCalibration_GetState() != STORAGE_CAL_SLIDE_READY ||
+        storage_cal_current_node != MISSION_STORAGE_NODE ||
+        storage_cal_selected_ring < 1U || storage_cal_selected_ring > 3U ||
+        !storage_cal_home_confirmed ||
+        !ManipulatorAction_SlideJogPositionKnown() ||
+        ManipulatorAction_SlideJogIsBusy() ||
+        chassis_motion_busy(s_chassis) || K230Align_IsBusy() ||
+        storage_cal_target_slide_mm <= 0.05f ||
+        /* 1/2/3号均允许从最高点或观察位直达100~185 mm绝对高度。 */
+        (current_drop_mm > 0.1f &&
+         current_drop_mm < (STORAGE_VISION_PRE_DROP_MM - 0.1f)))
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_BUSY;
+        return 0U;
+    }
+
+    if (!ManipulatorAction_SlideJogToVisionDropStart(target_drop_mm))
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_MANIPULATOR;
+        return 0U;
+    }
+
+    storage_cal_target_gimbal_drop_mm = target_drop_mm;
+    storage_cal_error = STORAGE_CAL_ERROR_NONE;
+    /* 复用已有非阻塞等待态；齿条目标保持不变，完成后仍回SLIDE_READY。 */
+    storage_set_state(STORAGE_CAL_SLIDE_MOVING);
+    return 1U;
+}
+
+uint8_t StorageCalibration_RaiseGimbalToTop(void)
+{
+    float current_drop_mm = -ManipulatorAction_SlideJogGetVisionDropMm();
+
+    if (!storage_cal_low_vision ||
+        StorageCalibration_GetState() != STORAGE_CAL_SLIDE_READY ||
+        storage_cal_current_node != MISSION_STORAGE_NODE ||
+        !storage_cal_home_confirmed ||
+        !ManipulatorAction_SlideJogPositionKnown() ||
+        ManipulatorAction_SlideJogIsBusy() ||
+        chassis_motion_busy(s_chassis) || K230Align_IsBusy() ||
+        current_drop_mm <= 0.05f)
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_BUSY;
+        return 0U;
+    }
+
+    if (!ManipulatorAction_SlideJogRaiseGimbalOnlyStart())
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_MANIPULATOR;
+        return 0U;
+    }
+
+    storage_cal_target_gimbal_drop_mm = 0.0f;
+    storage_cal_error = STORAGE_CAL_ERROR_NONE;
+    /* 齿条仍保持伸出，抬升完成后Update会重新回到SLIDE_READY。 */
+    storage_set_state(STORAGE_CAL_SLIDE_MOVING);
+    return 1U;
+}
+
+uint8_t StorageCalibration_RetractSlideOnly(void)
+{
+    if (StorageCalibration_GetState() != STORAGE_CAL_SLIDE_READY ||
+        storage_cal_current_node != MISSION_STORAGE_NODE ||
+        !storage_cal_home_confirmed ||
+        !ManipulatorAction_SlideJogPositionKnown() ||
+        ManipulatorAction_SlideJogIsBusy() ||
+        chassis_motion_busy(s_chassis) || K230Align_IsBusy() ||
+        storage_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f)
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_BUSY;
+        return 0U;
+    }
+
+    if (!ManipulatorAction_SlideJogRetractSlideOnlyStart())
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_MANIPULATOR;
+        return 0U;
+    }
+
+    storage_cal_target_slide_mm = 0.0f;
     storage_cal_error = STORAGE_CAL_ERROR_NONE;
     storage_set_state(STORAGE_CAL_SLIDE_MOVING);
     return 1U;
@@ -573,13 +758,28 @@ uint8_t StorageCalibration_StartStorageVisionAlign(uint32_t now_ms)
     }
 
     /*
-     * 2号环必须保持205 deg识别角；齿条则使用操作者本轮已经调好的当前值，
-     * 所以90 mm、95 mm等候选长度无需改宏或重新烧录即可分别验证。
+     * 2号环必须保持273.33 deg识别角；齿条则使用操作者本轮已经调好的当前值，
+     * 低位从95 mm相机基础值开始，后续候选长度无需改宏或重新烧录即可验证。
      */
     if (storage_absf(storage_cal_target_carousel_deg -
-                     K230_ALIGN_CAROUSEL_ANGLE_DEG) > 0.1f ||
+                     CAROUSEL_PICKUP_POS2_DEG) > 0.1f ||
         actual_slide_mm <= 0.05f ||
         storage_absf(actual_slide_mm - storage_cal_target_slide_mm) > 0.05f)
+    {
+        storage_cal_error = STORAGE_CAL_ERROR_PARAM;
+        return 0U;
+    }
+
+    /*
+     * 防止高/低标定入口和真实电机5高度串线：高位版必须仍在最高原点；
+     * 低位版必须已经完成与正式流程相同的STORAGE预下降。只有高度匹配后
+     * 才允许K230移动底盘，否则会把不同透视高度的像素中心混成一套参数。
+     */
+    if ((!storage_cal_low_vision &&
+         storage_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f) ||
+        (storage_cal_low_vision &&
+         storage_absf(ManipulatorAction_SlideJogGetVisionDropMm() +
+                      STORAGE_VISION_PRE_DROP_MM) > 0.1f))
     {
         storage_cal_error = STORAGE_CAL_ERROR_PARAM;
         return 0U;
@@ -623,8 +823,10 @@ void StorageCalibration_Abort(void)
     storage_cal_current_node = 0U;
     storage_cal_selected_ring = 0U;
     storage_cal_home_confirmed = 0U;
+    storage_cal_low_vision = 0U;
     storage_cal_target_slide_mm = 0.0f;
     storage_cal_target_carousel_deg = 0.0f;
+    storage_cal_target_gimbal_drop_mm = 0.0f;
     storage_cal_world_yaw_deg = 0.0f;
     s_align_node = 0U;
     s_storage_pose_lock_active = 0U;
@@ -913,6 +1115,11 @@ uint8_t StorageCalibration_GetSelectedRing(void)
     return storage_cal_selected_ring;
 }
 
+uint8_t StorageCalibration_IsLowVision(void)
+{
+    return storage_cal_low_vision;
+}
+
 float StorageCalibration_GetSlideTargetMm(void)
 {
     return storage_cal_target_slide_mm;
@@ -921,4 +1128,9 @@ float StorageCalibration_GetSlideTargetMm(void)
 float StorageCalibration_GetCarouselTargetDeg(void)
 {
     return storage_cal_target_carousel_deg;
+}
+
+float StorageCalibration_GetGimbalDropTargetMm(void)
+{
+    return storage_cal_target_gimbal_drop_mm;
 }

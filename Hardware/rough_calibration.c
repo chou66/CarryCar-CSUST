@@ -4,6 +4,7 @@
 #include "heading_control.h"
 #include "hmi_navigation.h"
 #include "hwt101_uart.h"
+#include "k230_align.h"
 #include "manipulator_action.h"
 #include "map_graph.h"
 #include "navigation.h"
@@ -36,8 +37,10 @@ volatile uint8_t rough_cal_error = ROUGH_CAL_ERROR_NONE;
 volatile uint8_t rough_cal_current_node = 0U;
 volatile uint8_t rough_cal_selected_ring = 0U;
 volatile uint8_t rough_cal_home_confirmed = 0U;
+volatile uint8_t rough_cal_low_vision = 0U;
 volatile float rough_cal_target_slide_mm = 0.0f;
 volatile float rough_cal_target_carousel_deg = 0.0f;
+volatile float rough_cal_target_gimbal_drop_mm = 0.0f;
 volatile float rough_cal_world_yaw_deg = 0.0f;
 
 static float rough_absf(float x)
@@ -115,6 +118,9 @@ static void rough_fail(uint8_t error)
     if (s_chassis)
         chassis_motion_stop(s_chassis);
     rough_restore_acceleration();
+
+    if (K230Align_IsBusy())
+        K230Align_Abort();
 
     /* 滑台运动中失败后真实位置不再可信，必须急停并要求人工重新回零。 */
     if (ManipulatorAction_SlideJogIsBusy())
@@ -251,14 +257,17 @@ void RoughCalibration_Init(Chassis *chassis)
     rough_cal_current_node = 0U;
     rough_cal_selected_ring = 0U;
     rough_cal_home_confirmed = 0U;
+    rough_cal_low_vision = 0U;
     rough_cal_target_slide_mm = 0.0f;
     rough_cal_target_carousel_deg = 0.0f;
+    rough_cal_target_gimbal_drop_mm = 0.0f;
     rough_cal_world_yaw_deg = 0.0f;
     s_start_corner = 0U;
     rough_set_state(ROUGH_CAL_IDLE);
 }
 
-uint8_t RoughCalibration_Start(uint8_t start_node, uint32_t now_ms)
+static uint8_t rough_start_internal(uint8_t start_node, uint32_t now_ms,
+                                    uint8_t low_vision)
 {
     Hwt101 *imu = AppUart_GetImu();
     uint8_t start_from_bay;
@@ -281,7 +290,8 @@ uint8_t RoughCalibration_Start(uint8_t start_node, uint32_t now_ms)
         return 0U;
     }
 
-    if (RoughCalibration_IsActive() || chassis_motion_busy(s_chassis))
+    if (RoughCalibration_IsActive() || chassis_motion_busy(s_chassis) ||
+        K230Align_IsBusy())
     {
         rough_cal_error = ROUGH_CAL_ERROR_BUSY;
         return 0U;
@@ -315,12 +325,17 @@ uint8_t RoughCalibration_Start(uint8_t start_node, uint32_t now_ms)
 
     EdgeMotion_Init(&s_edge, s_chassis, &s_nav);
 
+    /* RobotApp原先绑定的是正式底盘；VOFA接管后改绑本标定底盘对象。 */
+    K230Align_Init(s_chassis);
+
     rough_cal_error = ROUGH_CAL_ERROR_NONE;
     rough_cal_current_node = start_from_bay ? 0U : corner;
     rough_cal_selected_ring = 0U;
     rough_cal_home_confirmed = 0U;
+    rough_cal_low_vision = low_vision ? 1U : 0U;
     rough_cal_target_slide_mm = 0.0f;
     rough_cal_target_carousel_deg = 0.0f;
+    rough_cal_target_gimbal_drop_mm = 0.0f;
     rough_cal_world_yaw_deg = 0.0f;
     s_deadline_ms = 0U;
     s_next_heading_update_ms = 0U;
@@ -358,6 +373,21 @@ uint8_t RoughCalibration_Start(uint8_t start_node, uint32_t now_ms)
     return 1U;
 }
 
+uint8_t RoughCalibration_Start(uint8_t start_node, uint32_t now_ms)
+{
+    /*
+     * 高位识别兼容入口：完整保留旧的路线和调参手感，电机5始终停在最高点。
+     * 正式比赛已经改为低位识圆，新参数应优先使用StartLow对应的0x89标定。
+     */
+    return rough_start_internal(start_node, now_ms, 0U);
+}
+
+uint8_t RoughCalibration_StartLow(uint8_t start_node, uint32_t now_ms)
+{
+    /* 低位识别入口：后续0x83第一次伸出时自动追加正式流程的垂直预下降。 */
+    return rough_start_internal(start_node, now_ms, 1U);
+}
+
 uint8_t RoughCalibration_ConfirmSlideHome(uint8_t confirm_key)
 {
     if (confirm_key != 0xA5U)
@@ -373,7 +403,12 @@ uint8_t RoughCalibration_ConfirmSlideHome(uint8_t confirm_key)
         return 0U;
     }
 
-    if (!ManipulatorAction_SlideJogRebaseHome())
+    /*
+     * 机械急停若发生在低位，电机5可能仍然没有抬回最高原点。此时不能只把
+     * 滑台坐标重新立零后继续，否则下一次会在未知高度再下降一遍。
+     */
+    if (rough_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f ||
+        !ManipulatorAction_SlideJogRebaseHome())
     {
         rough_cal_error = ROUGH_CAL_ERROR_HOME;
         return 0U;
@@ -400,6 +435,7 @@ uint8_t RoughCalibration_SelectRing(uint8_t ring, uint32_t now_ms)
     if (RoughCalibration_GetState() != ROUGH_CAL_HOME_READY ||
         !rough_cal_home_confirmed ||
         !ManipulatorAction_SlideJogPositionKnown() ||
+        rough_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f ||
         rough_absf(ManipulatorAction_SlideJogGetPositionMm()) > 0.05f)
     {
         rough_cal_error = ROUGH_CAL_ERROR_HOME;
@@ -445,6 +481,12 @@ uint8_t RoughCalibration_MoveCarouselDeciDeg(uint16_t target_deci_deg,
         return 0U;
     }
 
+    /*
+     * 丝杆处在放置低位时也允许直接修改云台绝对角。实车舵机对1~2 deg的小
+     * 改变量不够灵敏，因此不再限制单次角度差；仍保留全局绝对角范围以及
+     * “机械臂静止、圆环已选、齿条位置可信”等状态互锁。
+     */
+
     CarouselServo_SetAngle(target_deg);
     rough_cal_target_carousel_deg = target_deg;
     s_arm_done_state = (state == ROUGH_CAL_SLIDE_READY) ?
@@ -458,6 +500,7 @@ uint8_t RoughCalibration_MoveCarouselDeciDeg(uint16_t target_deci_deg,
 uint8_t RoughCalibration_MoveSlideDeciMm(uint16_t target_deci_mm)
 {
     float target_mm = (float)target_deci_mm * 0.1f;
+    float current_mm = ManipulatorAction_SlideJogGetPositionMm();
     RoughCalibrationState_t state = RoughCalibration_GetState();
 
     if (target_mm < 0.0f || target_mm > MANIP_SLIDE_SOFT_MAX_MM)
@@ -475,7 +518,55 @@ uint8_t RoughCalibration_MoveSlideDeciMm(uint16_t target_deci_mm)
         return 0U;
     }
 
-    if (!ManipulatorAction_SlideJogToPositionStart(target_mm))
+    /*
+     * 放置低位允许小步调整齿条，供1/2/3号圆环找实际夹爪中心。为了防止
+     * 贴近圆环时一次伸缩几十毫米，每条命令最多改变10 mm；回到0 mm属于
+     * 明确的安全回收动作，不受此步长限制，并仍按“先抬丝杆、后收齿条”。
+     */
+    if (rough_cal_low_vision && state == ROUGH_CAL_SLIDE_READY &&
+        target_mm > 0.05f &&
+        rough_absf(ManipulatorAction_SlideJogGetVisionDropMm() +
+                   ROUGH_VISION_PRE_DROP_MM) > 0.1f &&
+        rough_absf(target_mm - current_mm) >
+            (ROUGH_LOW_CAL_MAX_SLIDE_STEP_MM + 0.05f))
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_PARAM;
+        return 0U;
+    }
+
+    /*
+     * ==================== 高位/低位识别分流 ====================
+     *
+     * 高位模式（旧0x80）：所有0x83都只移动滑台，电机5保持最高点。
+     *
+     * 低位模式（新0x89）：
+     *   1. 从0 mm第一次伸出时，先伸到目标，再下降正式配置的预取像高度；
+     *   2. 已经下降后继续发送0x83，只微调滑台，不重复下降电机5；
+     *   3. 目标为0时调用HomeStart，先抬升电机5，再安全收回滑台。
+     */
+    if (rough_cal_low_vision && target_mm <= 0.05f &&
+        rough_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f)
+    {
+        if (!ManipulatorAction_SlideJogHomeStart())
+        {
+            rough_cal_error = ROUGH_CAL_ERROR_MANIPULATOR;
+            return 0U;
+        }
+        rough_cal_target_gimbal_drop_mm = 0.0f;
+    }
+    else if (rough_cal_low_vision && target_mm > 0.05f &&
+             rough_absf(ManipulatorAction_SlideJogGetVisionDropMm()) <= 0.05f &&
+             rough_absf(current_mm) <= 0.05f)
+    {
+        if (!ManipulatorAction_SlideJogToVisionPositionStart(
+                target_mm, ROUGH_VISION_PRE_DROP_MM))
+        {
+            rough_cal_error = ROUGH_CAL_ERROR_MANIPULATOR;
+            return 0U;
+        }
+        rough_cal_target_gimbal_drop_mm = ROUGH_VISION_PRE_DROP_MM;
+    }
+    else if (!ManipulatorAction_SlideJogToPositionStart(target_mm))
     {
         rough_cal_error = ROUGH_CAL_ERROR_MANIPULATOR;
         return 0U;
@@ -487,9 +578,154 @@ uint8_t RoughCalibration_MoveSlideDeciMm(uint16_t target_deci_mm)
     return 1U;
 }
 
+uint8_t RoughCalibration_MoveGimbalDropDeciMm(uint16_t target_deci_mm)
+{
+    float target_drop_mm = (float)target_deci_mm * 0.1f;
+    float max_drop_mm = -MANIP_PICKUP_GROUND_MM;
+    float current_drop_mm = -ManipulatorAction_SlideJogGetVisionDropMm();
+
+    /*
+     * 这个入口只属于新低位识别流程。高位0x80没有建立电机5下降坐标，
+     * 不能借本命令突然下探；下限取本区正式取像高度，上限取正式第一层
+     * 地面放置高度，既覆盖第二层125 mm，也禁止越过185 mm继续撞地。
+     */
+    if (!rough_cal_low_vision ||
+        target_drop_mm < (ROUGH_VISION_PRE_DROP_MM - 0.05f) ||
+        target_drop_mm > (max_drop_mm + 0.05f))
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_PARAM;
+        return 0U;
+    }
+
+    if (RoughCalibration_GetState() != ROUGH_CAL_SLIDE_READY ||
+        rough_cal_selected_ring < 1U || rough_cal_selected_ring > 3U ||
+        !rough_cal_home_confirmed ||
+        !ManipulatorAction_SlideJogPositionKnown() ||
+        ManipulatorAction_SlideJogIsBusy() ||
+        rough_cal_target_slide_mm <= 0.05f ||
+        /* 1/2/3号均允许从最高点或观察位直达已验证的100~185 mm绝对高度。 */
+        (current_drop_mm > 0.1f &&
+         current_drop_mm < (ROUGH_VISION_PRE_DROP_MM - 0.1f)))
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_BUSY;
+        return 0U;
+    }
+
+    if (!ManipulatorAction_SlideJogToVisionDropStart(target_drop_mm))
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_MANIPULATOR;
+        return 0U;
+    }
+
+    rough_cal_target_gimbal_drop_mm = target_drop_mm;
+    rough_cal_error = ROUGH_CAL_ERROR_NONE;
+    /* 复用已有非阻塞等待态；滑台目标不变，完成后仍回SLIDE_READY。 */
+    rough_set_state(ROUGH_CAL_SLIDE_MOVING);
+    return 1U;
+}
+
+uint8_t RoughCalibration_RaiseGimbalToTop(void)
+{
+    float current_drop_mm = -ManipulatorAction_SlideJogGetVisionDropMm();
+
+    if (!rough_cal_low_vision ||
+        RoughCalibration_GetState() != ROUGH_CAL_SLIDE_READY ||
+        !rough_cal_home_confirmed ||
+        !ManipulatorAction_SlideJogPositionKnown() ||
+        ManipulatorAction_SlideJogIsBusy() || K230Align_IsBusy() ||
+        current_drop_mm <= 0.05f)
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_BUSY;
+        return 0U;
+    }
+
+    if (!ManipulatorAction_SlideJogRaiseGimbalOnlyStart())
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_MANIPULATOR;
+        return 0U;
+    }
+
+    rough_cal_target_gimbal_drop_mm = 0.0f;
+    rough_cal_error = ROUGH_CAL_ERROR_NONE;
+    /* 齿条目标仍非0，抬升完成后Update会回到SLIDE_READY。 */
+    rough_set_state(ROUGH_CAL_SLIDE_MOVING);
+    return 1U;
+}
+
+uint8_t RoughCalibration_RetractSlideOnly(void)
+{
+    if (RoughCalibration_GetState() != ROUGH_CAL_SLIDE_READY ||
+        !rough_cal_home_confirmed ||
+        !ManipulatorAction_SlideJogPositionKnown() ||
+        ManipulatorAction_SlideJogIsBusy() || K230Align_IsBusy() ||
+        rough_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f)
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_BUSY;
+        return 0U;
+    }
+
+    if (!ManipulatorAction_SlideJogRetractSlideOnlyStart())
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_MANIPULATOR;
+        return 0U;
+    }
+
+    rough_cal_target_slide_mm = 0.0f;
+    rough_cal_error = ROUGH_CAL_ERROR_NONE;
+    rough_set_state(ROUGH_CAL_SLIDE_MOVING);
+    return 1U;
+}
+
 uint8_t RoughCalibration_RetractSlide(void)
 {
     return RoughCalibration_MoveSlideDeciMm(0U);
+}
+
+uint8_t RoughCalibration_StartVisionAlign(uint32_t now_ms)
+{
+    float actual_slide_mm = ManipulatorAction_SlideJogGetPositionMm();
+
+    /*
+     * K230方向到车体平移的映射只在2号环固定识别角下成立。并且底盘对准
+     * 必须使用观察高度，不能拿实际放置高度下的另一套透视关系来修正底盘。
+     */
+    if (RoughCalibration_GetState() != ROUGH_CAL_SLIDE_READY ||
+        rough_cal_current_node != MISSION_ROUGH_NODE ||
+        rough_cal_selected_ring != K230_ALIGN_PLACE_ID ||
+        !rough_cal_home_confirmed ||
+        !ManipulatorAction_SlideJogPositionKnown() ||
+        ManipulatorAction_SlideJogIsBusy() ||
+        chassis_motion_busy(s_chassis) || K230Align_IsBusy())
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_BUSY;
+        return 0U;
+    }
+
+    if (rough_absf(rough_cal_target_carousel_deg -
+                   CAROUSEL_PICKUP_POS2_DEG) > 0.1f ||
+        actual_slide_mm <= 0.05f ||
+        rough_absf(actual_slide_mm - rough_cal_target_slide_mm) > 0.05f ||
+        (!rough_cal_low_vision &&
+         rough_absf(ManipulatorAction_SlideJogGetVisionDropMm()) > 0.05f) ||
+        (rough_cal_low_vision &&
+         rough_absf(ManipulatorAction_SlideJogGetVisionDropMm() +
+                    ROUGH_VISION_PRE_DROP_MM) > 0.1f))
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_PARAM;
+        return 0U;
+    }
+
+    if (!K230Align_StartPreset(K230_ALIGN_MODE_PLACE,
+                               K230_ALIGN_PLACE_ID,
+                               now_ms))
+    {
+        rough_cal_error = ROUGH_CAL_ERROR_K230;
+        return 0U;
+    }
+
+    rough_cal_error = ROUGH_CAL_ERROR_NONE;
+    rough_set_state(ROUGH_CAL_VISION_ALIGN);
+    return 1U;
 }
 
 void RoughCalibration_Abort(void)
@@ -505,6 +741,8 @@ void RoughCalibration_Abort(void)
         chassis_motion_stop(s_chassis);
     rough_restore_acceleration();
 
+    K230Align_Abort();
+
     /* 退出标定按急停语义处理：即使当前静止，也不再相信滑台软件坐标。 */
     ManipulatorAction_Abort();
     if (s_nav.initialized)
@@ -514,8 +752,10 @@ void RoughCalibration_Abort(void)
     rough_cal_current_node = 0U;
     rough_cal_selected_ring = 0U;
     rough_cal_home_confirmed = 0U;
+    rough_cal_low_vision = 0U;
     rough_cal_target_slide_mm = 0.0f;
     rough_cal_target_carousel_deg = 0.0f;
+    rough_cal_target_gimbal_drop_mm = 0.0f;
     rough_cal_world_yaw_deg = 0.0f;
     rough_set_state(ROUGH_CAL_IDLE);
 }
@@ -668,6 +908,24 @@ void RoughCalibration_Update(uint32_t now_ms)
             else
                 rough_set_state(ROUGH_CAL_SLIDE_READY);
         }
+        return;
+    }
+
+    if (state == ROUGH_CAL_VISION_ALIGN)
+    {
+        K230Align_Update(now_ms);
+
+        if (K230Align_HasError())
+        {
+            rough_fail(ROUGH_CAL_ERROR_K230);
+            return;
+        }
+
+        if (K230Align_IsDone())
+        {
+            /* 只移动底盘，机械臂保持2号环观察位，便于立即复核图像。 */
+            rough_set_state(ROUGH_CAL_SLIDE_READY);
+        }
     }
 }
 
@@ -701,6 +959,11 @@ uint8_t RoughCalibration_IsHomeConfirmed(void)
     return rough_cal_home_confirmed;
 }
 
+uint8_t RoughCalibration_IsLowVision(void)
+{
+    return rough_cal_low_vision;
+}
+
 float RoughCalibration_GetSlideTargetMm(void)
 {
     return rough_cal_target_slide_mm;
@@ -709,4 +972,9 @@ float RoughCalibration_GetSlideTargetMm(void)
 float RoughCalibration_GetCarouselTargetDeg(void)
 {
     return rough_cal_target_carousel_deg;
+}
+
+float RoughCalibration_GetGimbalDropTargetMm(void)
+{
+    return rough_cal_target_gimbal_drop_mm;
 }

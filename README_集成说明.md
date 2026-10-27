@@ -31,7 +31,7 @@
 2. main 中补上 fdcan2_UserInit()，真正配置 filter/start/interrupt。
 3. FDCAN PB12/PB13 GPIO speed 改为 VERY_HIGH。
 4. 串口屏已从 USART2 迁到 USART3：PE15 RX / PB10 TX；HMI 应用层统一使用 huart3。
-   （此前"链路验证临时切到 USART2"那一步已经作废，USART2 与应用层解耦，空闲可留给扫码模块。）
+   USART2（PA3 RX / PA2 TX，115200-8-N-1）现用于扫码模块持续接收任务码。
 5. 新增 UART4 PC10/PC11、UART5 PC12/PD2。
 6. 舵机从旧 TIM4/PD12~15 改为 PCB：
    PB4 TIM3_CH1 抓夹、PE3 TIM3_CH2 圆盘。
@@ -40,6 +40,9 @@
    会让底盘错误地认为位置运动已经完成。现在使用 CAN 0x3A 状态缓存真实判断。
 8. 去掉 can.c / HMI 显示中的 printf/snprintf 依赖，避免再次引入 semihosting。
 9. 所有 UART 接收由 app_uart.c 的唯一 HAL 回调统一分发，避免重复 callback。
+10. 二维码按固定 `CCC+PPP+CCC+PPP` 格式无包头包尾识别；重复扫描去重，
+    两批使用抽签确定的同三种颜色且顺序可不同；第四组只控制第二批粗加工区，
+    第二批暂存位置按颜色回查第一批位置，从而叠放在第一层同色物料上。
 
 ## 启动行为
 

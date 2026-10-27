@@ -8,6 +8,7 @@
 #include "k230.h"
 #include "k230_align.h"
 #include "qr_scanner.h"
+#include "task_code.h"
 #include "servo.h"
 #include "manipulator.h"
 #include "manipulator_action.h"
@@ -35,21 +36,21 @@ volatile uint8_t robot_app_vofa_override_ready = 0U;
 
 #if MISSION_ENABLE
 /*
- * Formal full mission.
+ * 正式比赛完整流程：
  *
- * HMI start bay -> N3/N9 road corner
- *   -> N6 QR
- *   -> N8 RAW-1
- *   -> N2 ROUGH-1
- *   -> N4 STORAGE-1
- *   -> N8 RAW-2
- *   -> N2 ROUGH-2
- *   -> N4 STORAGE-2
- *   -> HMI return road corner -> return bay
+ * HMI指定启停区 -> N3/N9道路角点
+ *   -> N6二维码区：等待USART2收到并校验完整任务码
+ *   -> N8原料区：按第一组颜色顺序抓取第一批
+ *   -> N2粗加工区：按第二组位置放下并按原顺序取回
+ *   -> N4暂存区：按第二组位置放到第一层
+ *   -> N8原料区：按第三组颜色顺序抓取第二批
+ *   -> N2粗加工区：按第四组位置放下并按原顺序取回
+ *   -> N4暂存区：按第一批同色物料所在位置放到第二层
+ *   -> HMI指定返回角点 -> 返回启停区。
  *
- * At each work node the robot first aligns to the node's fixed task yaw, then
- * enters vision/manipulator work. N6 QR remains a 2 s placeholder until the
- * scanner/task-code link is connected; N8/N2/N4 use the real zone state machines.
+ * 每个作业节点先用IMU对齐固定任务航向，再进入视觉/机械动作。粗加工区和
+ * 暂存区仍固定以2号圆做底盘视觉基准；二维码只决定每块物料最终选用哪一组
+ * 1/2/3号机械位姿，不改变已经完成的舵机角度和齿条长度标定。
  */
 typedef enum
 {
@@ -64,12 +65,14 @@ typedef enum
     MISSION_TASK_RUN,
     /* 追加在末尾，保持前面所有枚举值不变。 */
     MISSION_VISION_ALIGN,
-    MISSION_VISION_PRESET,   /* 对位前：云台先转到识别位，滑台再前伸到识别位 */
+    MISSION_VISION_PRESET,   /* 对位前：云台转向与滑台前伸同时进行，两者都到位才算完成 */
     MISSION_VISION_RETRACT,  /* 对位后：滑台退回原点 */
     MISSION_DONE,
     MISSION_ERROR,
     /* 原料区内部流程由 raw_station_task 封装。 */
-    MISSION_RAW_STATION
+    MISSION_RAW_STATION,
+    /* N6等待并解析真实二维码；追加在末尾以保持既有状态值不变。 */
+    MISSION_QR_SCAN
 } MissionState_t;
 
 volatile uint8_t robot_mission_state = MISSION_WAIT_MAP;
@@ -96,6 +99,14 @@ static uint8_t s_mission_align_saved_acceleration = 0U;
 static uint8_t s_mission_align_acceleration_saved = 0U;
 static uint32_t s_mission_align_last_sample_ms = 0U;
 static uint8_t s_mission_align_last_sample_valid = 0U;
+static MissionTaskCode_t s_mission_task_code;
+static uint8_t s_hmi_last_color = 0xFFU;
+
+/* 二维码解析镜像：Keil Watch 可直接检查两批颜色/粗加工位/暂存位。 */
+volatile uint8_t robot_task_code_valid = 0U;
+volatile uint8_t robot_task_color[2][3] = {{0U}};
+volatile uint8_t robot_task_rough_slot[2][3] = {{0U}};
+volatile uint8_t robot_task_storage_slot[2][3] = {{0U}};
 
 /* 区域机械动作进度：Keil Watch / VOFA 可观察，不占用 HMI 串口。 */
 volatile uint8_t robot_mission_task_step = 0U;
@@ -137,6 +148,48 @@ volatile uint8_t robot_mission_pose_lock_active = 0U;
 volatile uint8_t robot_mission_pose_lock_yaw_changed = 0U;
 
 static void mission_advance_stage(void);
+
+static const char *mission_color_text(uint8_t color)
+{
+    /* HMI当前使用英文显示字段，颜色号含义与比赛规则保持一致。 */
+    switch (color)
+    {
+        case 1U: return "RED";
+        case 2U: return "YELLOW";
+        case 3U: return "BLUE";
+        case 4U: return "GREEN";
+        case 5U: return "BLACK";
+        case 6U: return "CYAN";
+        default: return "--";
+    }
+}
+
+static void mission_show_color(uint8_t color)
+{
+    if (color == s_hmi_last_color) return;
+    s_hmi_last_color = color;
+    HMI_Race_SetColor(mission_color_text(color));
+}
+
+static void mission_sync_task_debug(const MissionTaskCode_t *task)
+{
+    uint8_t batch;
+    uint8_t i;
+
+    robot_task_code_valid = (task && task->valid) ? 1U : 0U;
+    for (batch = 0U; batch < 2U; ++batch)
+    {
+        for (i = 0U; i < 3U; ++i)
+        {
+            robot_task_color[batch][i] = robot_task_code_valid ?
+                                          task->batch[batch][i].color : 0U;
+            robot_task_rough_slot[batch][i] = robot_task_code_valid ?
+                                               task->batch[batch][i].rough_slot : 0U;
+            robot_task_storage_slot[batch][i] = robot_task_code_valid ?
+                                                 task->batch[batch][i].storage_slot : 0U;
+        }
+    }
+}
 
 static uint8_t mission_node_valid(uint8_t node)
 {
@@ -350,19 +403,23 @@ static void mission_enter_task_hold(uint32_t now_ms)
     ZoneId_t zone;
     uint8_t batch;
 
+    (void)now_ms;
+
     chassis_motion_stop(&s_chassis);
 
     if (!mission_zone_for_stage(robot_mission_stage, &zone, &batch))
     {
-        /*
-         * stage 0 (QR) 与 stage 7 (RETURN) 没有区域机械动作。
-         * 本版不接扫码，stage 0 继续保留 2 秒占位。
-         */
-        s_mission_deadline_ms = now_ms + MISSION_TASK_HOLD_MS;
-        robot_mission_state = MISSION_TASK_HOLD;
+        /* stage 0到达N6后停车等待有效任务码；扫码模块始终保持接收。 */
+        if (robot_mission_stage == 0U)
+        {
+            robot_mission_state = MISSION_QR_SCAN;
+            HMI_Race_SetAction("SCAN QR");
+            HMI_Race_SetResult("WAIT CODE");
+            return;
+        }
 
-        HMI_Race_SetAction("TASK WAIT");
-        HMI_Race_SetResult("PLACEHOLDER");
+        /* stage 7在导航抵达分支直接入库，正常情况下不会走到这里。 */
+        mission_fail(MISSION_ERROR_CONFIG);
         return;
     }
 
@@ -374,6 +431,7 @@ static void mission_enter_task_hold(uint32_t now_ms)
 
     robot_mission_task_step = 0U;
     robot_mission_task_steps = ZoneTask_GetStepCount();
+    mission_show_color(s_mission_task_code.batch[batch][0].color);
 
     robot_mission_state = MISSION_TASK_RUN;
 
@@ -414,9 +472,18 @@ static bool mission_start_ring_align(uint32_t now_ms)
 
     if ((zone == ZONE_STORAGE) && (batch == 1U))
     {
+        uint8_t anchor_color;
+
+        if (!TaskCode_GetStorageColor(&s_mission_task_code,
+                                      K230_ALIGN_PLACE_ID,
+                                      &anchor_color))
+        {
+            return false;
+        }
+
         return K230Align_StartStackPreset(
             K230_ALIGN_PLACE_ID,
-            K230_STORAGE_STACK_ANCHOR_COLOR,
+            anchor_color,
             now_ms);
     }
 
@@ -463,6 +530,7 @@ static void mission_begin_vision_align(uint32_t now_ms)
         robot_mission_task_step = 0U;
         robot_mission_task_steps = 3U;
         robot_mission_state = MISSION_RAW_STATION;
+        mission_show_color(s_mission_task_code.batch[batch][0].color);
         HMI_Race_SetAction("RAW TASK");
         HMI_Race_SetResult("RUNNING");
         return;
@@ -472,10 +540,11 @@ static void mission_begin_vision_align(uint32_t now_ms)
      * 粗加工区 / 暂存区：整区域动作之前对准一次放置位。
      *
      * 粗加工区的基准来自实车标定：标定阶段信任“启停区2直达N2”的物理
-     * 停靠位，固定底盘，只调齿条得到 ROUGH_SLIDE_POS2_MM，使K230中心正好
+     * 停靠位，固定底盘，只调齿条得到ROUGH_VISION_LOW_SLIDE_POS2_MM，使K230中心正好
      * 对准2号圆环。正式比赛经过多轮行驶后再复现这组2号相机位姿，反过来
-     * 根据K230偏差平移底盘；对准后1号/3号全部走固定机械位姿，不再视觉。
-     * 暂存区使用独立的 STORAGE_SLIDE_POS2_MM；它会由专用VOFA流程在经过
+     * 根据K230偏差平移底盘；对准并将齿条回零后，1/2/3号全部改走各自的
+     * 固定夹爪位姿（2号当前90 mm），不把相机对准用的95 mm带进放料动作。
+     * 暂存区使用独立的STORAGE_VISION_LOW_SLIDE_POS2_MM；它会由专用VOFA流程在经过
      * 粗加工2号环校准底盘后标定，因而不会再借用原料区的旧通用距离。
      */
     if (!((zone == ZONE_ROUGH) ?
@@ -692,6 +761,49 @@ static uint8_t mission_plan_current_stage(void)
     return 1U;
 }
 
+/*
+ * 多步并行：在底盘起步之前，先把下一次作业的机械姿态摆好。
+ *
+ * 触发时机是阶段推进的那一刻——上一段区域动作刚刚收尾，齿条在原点、
+ * 电机5在最高机械原点、主动作空闲，此时回转夹爪不会碰到料盘或场地结构。
+ * 之后整车开往下一个作业节点，舵机由 CarouselServo_Update /
+ * GripperServo_Update 在行驶途中自行平滑到位，到站后
+ * SlideJogToXXXAlignStart() 往往一调用就能直接伸齿条：粗加工区/暂存区
+ * 的前伸本来就和云台转向并行，这里舵机通常早已 DONE，并行等待立即通过。
+ *
+ * 三个作业区的取像姿态本来都是 CAROUSEL_PICKUP_POS2_DEG，料盘槽位取该区域
+ * 步骤表首步的槽位，因此预置结果与到站流程完全一致，只是把时间挪到了
+ * 行驶途中。预置失败（主动作未收尾、齿条不在原点等）不让任务失败，
+ * 到站后的原有流程仍会把同样的姿态摆好。
+ */
+static void mission_preposition_next_stage(void)
+{
+#if MISSION_CHASSIS_ONLY
+    /* 纯底盘路线测试不摆机械臂，保持“只验证行驶链路”的原意。 */
+    return;
+#else
+    ZoneId_t zone;
+    uint8_t batch;
+    uint8_t slot;
+
+    if (!mission_zone_for_stage(robot_mission_stage, &zone, &batch))
+    {
+        return; /* stage 7 返回节点没有区域动作。 */
+    }
+
+    /*
+     * 任务码在 N6 扫码时已由 ZoneTask_SetTaskCode() 装载，步骤表的料盘
+     * 槽位此后固定，因此这里查到的就是到站后真正要用的槽位。
+     */
+    if (!ZoneTask_GetFirstTraySlot(zone, batch, &slot))
+    {
+        return;
+    }
+
+    (void)ManipulatorAction_PrepositionForNextZone(slot);
+#endif
+}
+
 /* 一个 stage 的任务结束（区域动作完成，或占位计时到期）后推进到下一段。 */
 static void mission_advance_stage(void)
 {
@@ -701,6 +813,12 @@ static void mission_advance_stage(void)
         mission_done();
         return;
     }
+
+    /*
+     * 必须在规划/起步之前预置：这一帧底盘还没动，机械臂也刚收尾，
+     * 预置完成后接下来的整段行驶都可以和舵机动作并行。
+     */
+    mission_preposition_next_stage();
 
     (void)mission_plan_current_stage();
 }
@@ -773,6 +891,7 @@ static void mission_update(uint32_t now_ms)
         robot_mission_state = MISSION_START_DELAY;
 
         HMI_Race_SetTaskCode("--");
+        HMI_Debug_SetTaskCode("--");
         HMI_Race_SetColor("--");
         HMI_Race_SetStage("MISSION");
         HMI_Race_SetAction("READY");
@@ -940,6 +1059,7 @@ static void mission_update(uint32_t now_ms)
     if (robot_mission_state == MISSION_RAW_STATION)
     {
         uint8_t zone_step_count;
+        uint8_t expected_batch = (robot_mission_stage >= 4U) ? 1U : 0U;
 
         if (RawStationTask_HasError())
         {
@@ -958,6 +1078,11 @@ static void mission_update(uint32_t now_ms)
         robot_mission_vision_iteration =
             (RawMaterialAlign_GetIteration() > 255U) ?
             255U : (uint8_t)RawMaterialAlign_GetIteration();
+        if (robot_zone_task_zone == (uint8_t)ZONE_RAW &&
+            robot_zone_task_batch == expected_batch)
+        {
+            mission_show_color(ZoneTask_GetCurrentColor());
+        }
 
         if (!RawStationTask_IsDone())
             return;
@@ -971,7 +1096,11 @@ static void mission_update(uint32_t now_ms)
         return;
     }
 
-    /* 对位前：等云台转到位、滑台前伸到识别位，两件都就位后才发 place 命令。 */
+    /*
+     * 对位前：云台转向与滑台前伸是并行下发的，SlideJogIsDone() 只在
+     * 「滑台到位 + 两路舵机 DONE（或舵机超时兜底）」同时满足后才为真，
+     * 所以这里开始发 place/detect 时，前伸和转向都已经完成，识别不会提前。
+     */
     if (robot_mission_state == MISSION_VISION_PRESET)
     {
         if (ManipulatorAction_SlideJogHasError())
@@ -1050,6 +1179,49 @@ static void mission_update(uint32_t now_ms)
         return;
     }
 
+    if (robot_mission_state == MISSION_QR_SCAN)
+    {
+        char qr_text[QR_CODE_MAX + 1U];
+        MissionTaskCode_t parsed;
+
+        if (!QRScanner_GetNewCode(qr_text, sizeof(qr_text)))
+            return;
+
+        /*
+         * 无论候选码最终是否合法，都先原样显示到比赛页和调试页，便于现场
+         * 判断是串口没数据、字符错位，还是颜色/位置组合违反规则。
+         */
+        HMI_Race_SetTaskCode(qr_text);
+        HMI_Debug_SetTaskCode(qr_text);
+
+        /*
+         * 非法码不启动小车，也不使用写死顺序兜底；保持停在N6继续扫码。
+         * 扫到内容不同的新码时，QRScanner才会再次产生更新事件。
+         */
+        if (!TaskCode_Parse(qr_text, &parsed))
+        {
+            HMI_Race_SetResult("QR INVALID");
+            return;
+        }
+
+        /*
+         * 先把完整映射复制到ZoneTask，再更新RobotApp正式任务副本；这样后续
+         * 连续扫码即使仍有数据进入，也不会改写本轮已经锁定的搬运顺序。
+         */
+        if (!ZoneTask_SetTaskCode(&parsed))
+        {
+            mission_fail(MISSION_ERROR_TASK);
+            return;
+        }
+
+        s_mission_task_code = parsed;
+        mission_sync_task_debug(&s_mission_task_code);
+        HMI_Race_SetAction("QR OK");
+        HMI_Race_SetResult("OK");
+        mission_advance_stage();
+        return;
+    }
+
     if (robot_mission_state == MISSION_TASK_RUN)
     {
         if (ZoneTask_HasError())
@@ -1060,6 +1232,7 @@ static void mission_update(uint32_t now_ms)
 
         robot_mission_task_step = ZoneTask_GetStep();
         robot_mission_task_steps = ZoneTask_GetStepCount();
+        mission_show_color(ZoneTask_GetCurrentColor());
 
         if (ZoneTask_IsDone())
         {
@@ -1119,6 +1292,10 @@ void RobotApp_Init(void)
     s_mission_advance_after_alignment = 0U;
     robot_mission_pose_lock_active = 0U;
     robot_mission_pose_lock_yaw_changed = 0U;
+    s_mission_task_code.valid = 0U;
+    s_mission_task_code.text[0] = '\0';
+    s_hmi_last_color = 0xFFU;
+    mission_sync_task_debug(NULL);
     heading_init(&s_mission_align_controller,
                  MISSION_ALIGN_KP,
                  MISSION_ALIGN_KD,
@@ -1166,6 +1343,14 @@ void RobotApp_Update(uint32_t now_ms)
         {
             HMI_Page_Race();
         }
+
+#if MISSION_ENABLE
+        if (s_mission_task_code.valid)
+        {
+            HMI_Race_SetTaskCode(s_mission_task_code.text);
+            HMI_Debug_SetTaskCode(s_mission_task_code.text);
+        }
+#endif
 
         HMI_Mode_ClearUpdated();
     }

@@ -38,6 +38,60 @@ static uint32_t last_tx_ms;
 static VofaPacket txp;
 static uint8_t k230_telemetry_enable;
 
+/*
+ * ==================== Keil Watch 直接标定面板 ====================
+ *
+ * 这些变量不是“当前状态镜像”，而是一组可在 Keil Watch 中
+ * 直接操作的调试按钮和参数。设计上特意将“参数”与“执行”分开：
+ *
+ *   1. 先修改 cal_dbg_ring / *_deg / *_mm 目标值；
+ *   2. 再把对应的 *_req 改成 1；
+ *   3. 主循环只执行一次，并立即把 *_req 自动清回 0。
+ *
+ * 这样即使 Watch 窗口持续刷新，也不会重复向电机下发同一动作。
+ * 所有 Watch 请求最终仍转换成原 VOFA 命令，统一走 process_cmd()，
+ * 因此原有的 RobotApp 接管、状态机忙判断、参数范围和低位互锁
+ * 全部保留，不会因为从 Watch 调参而绕过安全检查。
+ */
+volatile uint8_t cal_dbg_takeover_req;
+volatile uint8_t cal_dbg_rough_start_req;
+volatile uint8_t cal_dbg_storage_start_req;
+volatile uint8_t cal_dbg_home_confirm_req;
+volatile uint8_t cal_dbg_ring;
+volatile uint8_t cal_dbg_select_ring_req;
+volatile float cal_dbg_carousel_deg;
+volatile uint8_t cal_dbg_apply_carousel_req;
+volatile float cal_dbg_slide_mm;
+volatile uint8_t cal_dbg_apply_slide_req;
+volatile float cal_dbg_drop_mm;
+volatile uint8_t cal_dbg_apply_drop_req;
+/*
+ * 观察高度和放置高度分开保存，二者都是“从丝杆最高原点累计向下”的
+ * 绝对距离，不是从当前位置继续下降的相对距离。
+ */
+volatile float cal_dbg_observe_drop_mm;
+volatile float cal_dbg_place_drop_mm;
+volatile uint8_t cal_dbg_apply_observe_drop_req;
+volatile uint8_t cal_dbg_apply_place_drop_req;
+volatile uint8_t cal_dbg_raise_only_req;
+volatile uint8_t cal_dbg_slide_retract_only_req;
+/* 正数读回：当前累计下降量；last_delta正数=本次向下，负数=本次向上。 */
+volatile float cal_dbg_current_drop_mm;
+volatile float cal_dbg_last_gimbal_delta_mm;
+volatile uint8_t cal_dbg_retract_req;
+volatile uint8_t cal_dbg_k230_start_req;
+volatile uint8_t cal_dbg_k230_stop_req;
+volatile uint8_t cal_dbg_storage_align_req;
+volatile uint8_t cal_dbg_chassis_align_req;
+volatile uint8_t cal_dbg_abort_req;
+volatile uint8_t cal_dbg_estop_req;
+volatile uint8_t cal_dbg_last_action;
+volatile uint8_t cal_dbg_last_result;
+volatile uint32_t cal_dbg_execute_count;
+
+/* process_cmd()中的0x8C~0x8F会读取Watch浮点参数，实现放在文件后部。 */
+static uint8_t cal_dbg_float_to_deci(float value, uint16_t *deci);
+
 /* Independent chassis object used only by this bench/debug build.
  * It validates the same chassis_motion -> chassis -> mecanum stack
  * that navigation will use later.
@@ -71,6 +125,84 @@ static uint8_t debug_yaw_velocity_active;
 static uint8_t valid_id(uint8_t id)
 {
     return (id >= 1U && id <= 6U) ? 1U : 0U;
+}
+
+/*
+ * 0x82成功选中新圆环后，把Watch调参值同步为该圆环的当前配置。
+ *
+ * cal_dbg_slide_mm会在选环后装入该环“夹爪落点”的基础值。如果
+ * 操作者选中1号后忘记先改这个Watch值，0x8D会合法地伸到2号
+ * 旧长度，看起来就像“自己回了2号位”。因此只在0x82真正被状态机
+ * 接受后才自动装入新圆环的候选值；82被拒绝时保留原值，不伪装切换成功。
+ */
+static void cal_dbg_load_ring_defaults(uint8_t storage_area, uint8_t ring)
+{
+    cal_dbg_ring = ring;
+
+    if (storage_area)
+    {
+        if (ring == 1U)
+        {
+            cal_dbg_carousel_deg = STORAGE_CAROUSEL_POS1_DEG;
+            cal_dbg_slide_mm = STORAGE_SLIDE_POS1_MM;
+        }
+        else if (ring == 2U)
+        {
+            cal_dbg_carousel_deg = STORAGE_CAROUSEL_POS2_DEG;
+            cal_dbg_slide_mm = STORAGE_SLIDE_POS2_MM;
+        }
+        else
+        {
+            cal_dbg_carousel_deg = STORAGE_CAROUSEL_POS3_DEG;
+            cal_dbg_slide_mm = STORAGE_SLIDE_POS3_MM;
+        }
+        cal_dbg_drop_mm = STORAGE_VISION_PRE_DROP_MM;
+        cal_dbg_observe_drop_mm = STORAGE_VISION_PRE_DROP_MM;
+        /* 暂存区与粗加工区统一：185 mm是已验证的第一层绝对放置高度。 */
+        cal_dbg_place_drop_mm = -MANIP_PICKUP_GROUND_MM;
+    }
+    else
+    {
+        if (ring == 1U)
+        {
+            cal_dbg_carousel_deg = ROUGH_CAROUSEL_POS1_DEG;
+            cal_dbg_slide_mm = ROUGH_SLIDE_POS1_MM;
+        }
+        else if (ring == 2U)
+        {
+            cal_dbg_carousel_deg = ROUGH_CAROUSEL_POS2_DEG;
+            cal_dbg_slide_mm = ROUGH_SLIDE_POS2_MM;
+        }
+        else
+        {
+            cal_dbg_carousel_deg = ROUGH_CAROUSEL_POS3_DEG;
+            cal_dbg_slide_mm = ROUGH_SLIDE_POS3_MM;
+        }
+        cal_dbg_drop_mm = ROUGH_VISION_PRE_DROP_MM;
+        cal_dbg_observe_drop_mm = ROUGH_VISION_PRE_DROP_MM;
+        /* 粗加工正式抓放高度185 mm已在旧跑图中验证，可直接作为候选。 */
+        cal_dbg_place_drop_mm = -MANIP_PICKUP_GROUND_MM;
+    }
+}
+
+/*
+ * 0x8C~0x91把P1作为“操作者认为当前选中的圆环号”。
+ * 必须同时等于状态机内部的selected_ring才允许动作，防止0x82因回收未完成
+ * 被拒绝后，下一条命令仍在旧的2号位上执行。P1不再允许填0；这是一道
+ * 专门针对实车误操作增加的交叉校验，不依赖Watch显示是否及时刷新。
+ */
+static uint8_t cal_dbg_selected_ring_matches(uint8_t ring)
+{
+    if (ring < 1U || ring > 3U)
+        return 0U;
+
+    if (StorageCalibration_IsActive())
+        return StorageCalibration_GetSelectedRing() == ring ? 1U : 0U;
+
+    if (RoughCalibration_IsActive())
+        return RoughCalibration_GetSelectedRing() == ring ? 1U : 0U;
+
+    return 0U;
 }
 
 static uint8_t k230_direction_code(char direction)
@@ -514,6 +646,43 @@ void VofaDebug_Init(void)
     txp.p.tail = 0x7F800000UL; /* 00 00 80 7F on Cortex-M */
 
     /*
+     * Watch 标定面板上电默认值。
+     * 任意 *_req=0 都表示“不执行”，因此上电不会自行转动。
+     * 默认数值选择当前低位标定的2号环常用起点，仅用于减少
+     * Watch 手工输入；仍必须由操作者将对应 *_req 写 1 才会动作。
+     */
+    cal_dbg_takeover_req = 0U;
+    cal_dbg_rough_start_req = 0U;
+    cal_dbg_storage_start_req = 0U;
+    cal_dbg_home_confirm_req = 0U;
+    cal_dbg_ring = 2U;
+    cal_dbg_select_ring_req = 0U;
+    cal_dbg_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
+    cal_dbg_apply_carousel_req = 0U;
+    cal_dbg_slide_mm = ROUGH_VISION_LOW_SLIDE_POS2_MM;
+    cal_dbg_apply_slide_req = 0U;
+    cal_dbg_drop_mm = ROUGH_VISION_PRE_DROP_MM;
+    cal_dbg_apply_drop_req = 0U;
+    cal_dbg_observe_drop_mm = ROUGH_VISION_PRE_DROP_MM;
+    cal_dbg_place_drop_mm = -MANIP_PICKUP_GROUND_MM;
+    cal_dbg_apply_observe_drop_req = 0U;
+    cal_dbg_apply_place_drop_req = 0U;
+    cal_dbg_raise_only_req = 0U;
+    cal_dbg_slide_retract_only_req = 0U;
+    cal_dbg_current_drop_mm = 0.0f;
+    cal_dbg_last_gimbal_delta_mm = 0.0f;
+    cal_dbg_retract_req = 0U;
+    cal_dbg_k230_start_req = 0U;
+    cal_dbg_k230_stop_req = 0U;
+    cal_dbg_storage_align_req = 0U;
+    cal_dbg_chassis_align_req = 0U;
+    cal_dbg_abort_req = 0U;
+    cal_dbg_estop_req = 0U;
+    cal_dbg_last_action = CAL_DBG_ACTION_NONE;
+    cal_dbg_last_result = 0U;
+    cal_dbg_execute_count = 0U;
+
+    /*
      * Use the real calibrated chassis configuration.
      * This is the same motion/kinematics layer used by navigation.
      */
@@ -570,7 +739,7 @@ static uint8_t vofa_cmd_needs_manual_override(uint8_t cmd)
     if (cmd == 0x01U) return 1U;
     if (cmd >= 0x10U && cmd <= 0x23U) return 1U;
     if (cmd >= 0x30U && cmd <= 0x60U) return 1U;
-    if (cmd >= 0x80U && cmd <= 0x88U) return 1U;
+    if (cmd >= 0x80U && cmd <= 0x91U) return 1U;
     return 0U;
 }
 
@@ -605,19 +774,26 @@ static void process_cmd(void)
     /*
      * 任一工位标定启动后，底盘/云台/滑台都归标定状态机独占。只放行：
      *   0x01       全局急停；
+     *   0x20       夹爪开/中/关，用于完整模拟夹取和放置；
      *   0x72/0x73  K230观察命令（暂存流程到N4前均禁止，避免干扰自动对准）；
      *   0x74       切换遥测页；
-     *   0x81~0x86  标定状态机自己的控制命令。
-     *   0x88       仅暂存区N4手动调参态可用的二号环底盘位置锁定。
+     *   0x81~0x86  标定状态机自己的水平调参/回收命令；
+     *   0x88       粗加工N2/暂存区N4的二号环底盘视觉位置锁定。
+     *   0x8B       低位模式的电机5绝对下降量，用于验证真实落料点。
+     *   0x8C~0x8F 读取Keil Watch中的十进制目标值并执行，不再需要
+     *               手工把角度/毫米换算成VOFA十六进制参数。
+     *   0x90/0x91 分别只抬丝杆、只收齿条，供分轴验证回程。
      * 这样可避免旧的直接电机命令和状态机同时向同一执行器下发动作。
      */
     if ((RoughCalibration_IsActive() || StorageCalibration_IsActive()) &&
         c != 0x01U &&
+        c != 0x20U &&
         c != 0x74U &&
         !((c == 0x72U || c == 0x73U) &&
           (RoughCalibration_IsActive() ||
            StorageCalibration_AllowsManualVision())) &&
-        !(c == 0x88U && StorageCalibration_AllowsManualVision()) &&
+        c != 0x88U &&
+        (c < 0x8BU || c > 0x91U) &&
         (c < 0x81U || c > 0x86U))
     {
         last_result = 17U;
@@ -730,6 +906,11 @@ static void process_cmd(void)
         if (p1 == 0U) GripperServo_Open_Small();
         else if (p1 == 1U) GripperServo_Mid();
         else if (p1 == 2U) GripperServo_Close();
+        /*
+         * 正式夹取流程下降前使用大张开；原0/1/2命令编码
+         * 保持不变，在末尾追加3，避免破坏已有VOFA按钮。
+         */
+        else if (p1 == 3U) GripperServo_Open_Large();
         else last_result = 2U;
         break;
 
@@ -1030,7 +1211,7 @@ static void process_cmd(void)
             k230_telemetry_enable = p1;
             break;
 
-        case 0x80U: /* 粗加工标定：P1=节点1..9，A1/A2=对应启停区，自动到 N2。 */
+        case 0x80U: /* 旧粗加工高位识别：电机5保持最高点，自动到N2。 */
             if (formal_motion_active ||
                 debug_nav_is_running() ||
                 debug_edge_active ||
@@ -1041,6 +1222,20 @@ static void process_cmd(void)
             }
 
             if (!RoughCalibration_Start(p1, HAL_GetTick()))
+                last_result = 18U;
+            break;
+
+        case 0x89U: /* 新粗加工低位识别：路线同0x80，0x83伸出后自动预下降。 */
+            if (formal_motion_active ||
+                debug_nav_is_running() ||
+                debug_edge_active ||
+                chassis_motion_busy(&s_debug_chassis))
+            {
+                last_result = 2U;
+                break;
+            }
+
+            if (!RoughCalibration_StartLow(p1, HAL_GetTick()))
                 last_result = 18U;
             break;
 
@@ -1055,11 +1250,17 @@ static void process_cmd(void)
             {
                 if (!StorageCalibration_SelectRing(p1, HAL_GetTick()))
                     last_result = 18U;
+                else
+                    cal_dbg_load_ring_defaults(1U, p1);
             }
             else if (!RoughCalibration_IsActive() ||
                      !RoughCalibration_SelectRing(p1, HAL_GetTick()))
             {
                 last_result = 18U;
+            }
+            else
+            {
+                cal_dbg_load_ring_defaults(0U, p1);
             }
             break;
 
@@ -1121,7 +1322,7 @@ static void process_cmd(void)
             }
             break;
 
-        case 0x87U: /* 暂存区标定全流程；P1=A5确认齿条已在机械原点。 */
+        case 0x87U: /* 旧暂存区高位识别全流程；P1=A5确认齿条机械原点。 */
             if (formal_motion_active ||
                 debug_nav_is_running() ||
                 debug_edge_active ||
@@ -1136,9 +1337,239 @@ static void process_cmd(void)
                 last_result = 18U;
             break;
 
-        case 0x88U: /* N4二号环：保持当前机械位姿，K230平移底盘并复核180°。 */
-            if (!StorageCalibration_IsActive() ||
-                !StorageCalibration_StartStorageVisionAlign(HAL_GetTick()))
+        case 0x8AU: /* 新暂存区低位识别全流程；路径同0x87并复现正式预下降。 */
+            if (formal_motion_active ||
+                debug_nav_is_running() ||
+                debug_edge_active ||
+                RoughCalibration_IsActive() ||
+                chassis_motion_busy(&s_debug_chassis))
+            {
+                last_result = 2U;
+                break;
+            }
+
+            if (!StorageCalibration_StartFromBay2Low(p1, HAL_GetTick()))
+                last_result = 18U;
+            break;
+
+        case 0x88U: /* 当前区二号环：保持观察位姿，K230实际平移底盘对准。 */
+            if (StorageCalibration_IsActive())
+            {
+                if (!StorageCalibration_StartStorageVisionAlign(HAL_GetTick()))
+                    last_result = 18U;
+            }
+            else if (RoughCalibration_IsActive())
+            {
+                if (!RoughCalibration_StartVisionAlign(HAL_GetTick()))
+                    last_result = 18U;
+            }
+            else
+            {
+                last_result = 18U;
+            }
+            break;
+
+        case 0x8BU: /* 低位落料点验证：P1:P2=从最高原点累计下降0.1 mm。 */
+            {
+                uint16_t target_deci_mm =
+                    (uint16_t)(((uint16_t)p1 << 8) | p2);
+
+                if (StorageCalibration_IsActive())
+                {
+                    if (!StorageCalibration_MoveGimbalDropDeciMm(
+                            target_deci_mm))
+                    {
+                        last_result = 18U;
+                    }
+                }
+                else if (!RoughCalibration_IsActive() ||
+                         !RoughCalibration_MoveGimbalDropDeciMm(
+                             target_deci_mm))
+                {
+                    last_result = 18U;
+                }
+            }
+            break;
+
+        case 0x8CU: /* P1=当前圆环；执行Watch中的cal_dbg_carousel_deg。 */
+            {
+                uint16_t target_deci_deg;
+
+                if (!cal_dbg_selected_ring_matches(p1))
+                {
+                    last_result = (p1 >= 1U && p1 <= 3U) ? 18U : 2U;
+                    break;
+                }
+
+                if (!cal_dbg_float_to_deci(cal_dbg_carousel_deg,
+                                            &target_deci_deg))
+                {
+                    last_result = 2U;
+                    break;
+                }
+
+                if (StorageCalibration_IsActive())
+                {
+                    if (!StorageCalibration_MoveCarouselDeciDeg(
+                            target_deci_deg, HAL_GetTick()))
+                    {
+                        last_result = 18U;
+                    }
+                }
+                else if (!RoughCalibration_IsActive() ||
+                         !RoughCalibration_MoveCarouselDeciDeg(
+                             target_deci_deg, HAL_GetTick()))
+                {
+                    last_result = 18U;
+                }
+            }
+            break;
+
+        case 0x8DU: /* P1=当前圆环；执行Watch中的cal_dbg_slide_mm。 */
+            {
+                uint16_t target_deci_mm;
+
+                if (!cal_dbg_selected_ring_matches(p1))
+                {
+                    last_result = (p1 >= 1U && p1 <= 3U) ? 18U : 2U;
+                    break;
+                }
+
+                if (!cal_dbg_float_to_deci(cal_dbg_slide_mm,
+                                            &target_deci_mm))
+                {
+                    last_result = 2U;
+                    break;
+                }
+
+                if (StorageCalibration_IsActive())
+                {
+                    if (!StorageCalibration_MoveSlideDeciMm(target_deci_mm))
+                        last_result = 18U;
+                }
+                else if (!RoughCalibration_IsActive() ||
+                         !RoughCalibration_MoveSlideDeciMm(target_deci_mm))
+                {
+                    last_result = 18U;
+                }
+            }
+            break;
+
+        case 0x8EU: /* P1=当前圆环；丝杆到Watch观察高度（相对最高原点）。 */
+            {
+                uint16_t target_deci_mm;
+
+                if (!cal_dbg_selected_ring_matches(p1))
+                {
+                    last_result = (p1 >= 1U && p1 <= 3U) ? 18U : 2U;
+                    break;
+                }
+
+                if (!cal_dbg_float_to_deci(cal_dbg_observe_drop_mm,
+                                            &target_deci_mm))
+                {
+                    last_result = 2U;
+                    break;
+                }
+
+                cal_dbg_current_drop_mm =
+                    -ManipulatorAction_SlideJogGetVisionDropMm();
+                cal_dbg_last_gimbal_delta_mm =
+                    cal_dbg_observe_drop_mm - cal_dbg_current_drop_mm;
+
+                if (StorageCalibration_IsActive())
+                {
+                    if (!StorageCalibration_MoveGimbalDropDeciMm(
+                            target_deci_mm))
+                    {
+                        last_result = 18U;
+                    }
+                }
+                else if (!RoughCalibration_IsActive() ||
+                         !RoughCalibration_MoveGimbalDropDeciMm(
+                             target_deci_mm))
+                {
+                    last_result = 18U;
+                }
+            }
+            break;
+
+        case 0x8FU: /* P1=当前圆环；丝杆到Watch放置绝对高度（两区均可直达185）。 */
+            {
+                uint16_t target_deci_mm;
+
+                if (!cal_dbg_selected_ring_matches(p1))
+                {
+                    last_result = (p1 >= 1U && p1 <= 3U) ? 18U : 2U;
+                    break;
+                }
+
+                if (!cal_dbg_float_to_deci(cal_dbg_place_drop_mm,
+                                            &target_deci_mm))
+                {
+                    last_result = 2U;
+                    break;
+                }
+
+                cal_dbg_current_drop_mm =
+                    -ManipulatorAction_SlideJogGetVisionDropMm();
+                cal_dbg_last_gimbal_delta_mm =
+                    cal_dbg_place_drop_mm - cal_dbg_current_drop_mm;
+
+                if (StorageCalibration_IsActive())
+                {
+                    if (!StorageCalibration_MoveGimbalDropDeciMm(
+                            target_deci_mm))
+                    {
+                        last_result = 18U;
+                    }
+                }
+                else if (!RoughCalibration_IsActive() ||
+                         !RoughCalibration_MoveGimbalDropDeciMm(
+                             target_deci_mm))
+                {
+                    last_result = 18U;
+                }
+            }
+            break;
+
+        case 0x90U: /* P1=当前圆环；只把丝杆抬回最高原点，齿条保持伸出。 */
+            if (!cal_dbg_selected_ring_matches(p1))
+            {
+                last_result = (p1 >= 1U && p1 <= 3U) ? 18U : 2U;
+                break;
+            }
+
+            cal_dbg_current_drop_mm =
+                -ManipulatorAction_SlideJogGetVisionDropMm();
+            cal_dbg_last_gimbal_delta_mm = -cal_dbg_current_drop_mm;
+
+            if (StorageCalibration_IsActive())
+            {
+                if (!StorageCalibration_RaiseGimbalToTop())
+                    last_result = 18U;
+            }
+            else if (!RoughCalibration_IsActive() ||
+                     !RoughCalibration_RaiseGimbalToTop())
+            {
+                last_result = 18U;
+            }
+            break;
+
+        case 0x91U: /* P1=当前圆环；只收齿条到0 mm，要求丝杆已经最高。 */
+            if (!cal_dbg_selected_ring_matches(p1))
+            {
+                last_result = (p1 >= 1U && p1 <= 3U) ? 18U : 2U;
+                break;
+            }
+
+            if (StorageCalibration_IsActive())
+            {
+                if (!StorageCalibration_RetractSlideOnly())
+                    last_result = 18U;
+            }
+            else if (!RoughCalibration_IsActive() ||
+                     !RoughCalibration_RetractSlideOnly())
             {
                 last_result = 18U;
             }
@@ -1148,6 +1579,258 @@ static void process_cmd(void)
         last_result = 3U;
         break;
     }
+}
+
+/*
+ * 将 Watch 中输入的浮点物理量转为原 VOFA 协议使用的0.1单位整数。
+ *
+ * 例如：78.5 mm -> 785，205.0 deg -> 2050。
+ * 利用“value >= 0”的比较同时拒绝 NaN；先做范围判断再强转，
+ * 避免 Watch 误输负数或超大值时发生无符号整数回绕。
+ */
+static uint8_t cal_dbg_float_to_deci(float value, uint16_t *deci)
+{
+    if (deci == NULL || !(value >= 0.0f) || value > 6553.5f)
+        return 0U;
+
+    *deci = (uint16_t)(value * 10.0f + 0.5f);
+    return 1U;
+}
+
+/*
+ * 清除所有可能产生后续动作的 Watch 请求。
+ * 当操作者按下“急停”或“退出标定”时，如果 Watch 里还有其他
+ * *_req 刚好也被写成1，必须一并丢弃，不能在下一个主循环又启动。
+ */
+static void cal_dbg_clear_motion_requests(void)
+{
+    cal_dbg_rough_start_req = 0U;
+    cal_dbg_storage_start_req = 0U;
+    cal_dbg_home_confirm_req = 0U;
+    cal_dbg_select_ring_req = 0U;
+    cal_dbg_apply_carousel_req = 0U;
+    cal_dbg_apply_slide_req = 0U;
+    cal_dbg_apply_drop_req = 0U;
+    cal_dbg_apply_observe_drop_req = 0U;
+    cal_dbg_apply_place_drop_req = 0U;
+    cal_dbg_raise_only_req = 0U;
+    cal_dbg_slide_retract_only_req = 0U;
+    cal_dbg_retract_req = 0U;
+    cal_dbg_k230_start_req = 0U;
+    cal_dbg_k230_stop_req = 0U;
+    cal_dbg_storage_align_req = 0U;
+    cal_dbg_chassis_align_req = 0U;
+}
+
+/*
+ * 每次主循环最多消费一个 Watch 请求。
+ *
+ * 优先级从高到低为：急停 -> 退出 -> 接管 -> 其他标定动作。
+ * 除了急停/退出会主动丢弃其他待执行请求外，普通请求只清零自己。
+ * 最终仍把动作写入 cmd_v/p1_v...并调用 process_cmd()，这是保证
+ * Watch 途径与 VOFA 途径安全行为完全一致的关键。
+ */
+static void cal_dbg_process_watch_request(void)
+{
+    uint8_t action = CAL_DBG_ACTION_NONE;
+    uint8_t command = 0U;
+    uint8_t p1 = 0U;
+    uint8_t p2 = 0U;
+    uint16_t deci = 0U;
+
+    if (cal_dbg_estop_req != 0U)
+    {
+        cal_dbg_estop_req = 0U;
+        cal_dbg_abort_req = 0U;
+        cal_dbg_clear_motion_requests();
+        action = CAL_DBG_ACTION_ESTOP;
+        command = 0x01U;
+    }
+    else if (cal_dbg_abort_req != 0U)
+    {
+        cal_dbg_abort_req = 0U;
+        cal_dbg_clear_motion_requests();
+        action = CAL_DBG_ACTION_ABORT;
+        command = 0x85U;
+    }
+    else if (cal_dbg_takeover_req != 0U)
+    {
+        cal_dbg_takeover_req = 0U;
+        action = CAL_DBG_ACTION_TAKEOVER;
+        command = 0x70U;
+    }
+    else if (cal_dbg_rough_start_req != 0U)
+    {
+        cal_dbg_rough_start_req = 0U;
+        action = CAL_DBG_ACTION_ROUGH_START;
+        command = 0x89U;
+        /* 直接调参面板固定复现比赛路线：从启停区2到粗加工N2。 */
+        p1 = ROUGH_CAL_START_BAY2;
+    }
+    else if (cal_dbg_storage_start_req != 0U)
+    {
+        cal_dbg_storage_start_req = 0U;
+        action = CAL_DBG_ACTION_STORAGE_START;
+        command = 0x8AU;
+        /* 暂存区入口固定从启停区2出发，A5表示齿条已在机械原点。 */
+        p1 = STORAGE_CAL_HOME_CONFIRM_KEY;
+    }
+    else if (cal_dbg_home_confirm_req != 0U)
+    {
+        cal_dbg_home_confirm_req = 0U;
+        action = CAL_DBG_ACTION_HOME_CONFIRM;
+        command = 0x81U;
+        p1 = 0xA5U;
+    }
+    else if (cal_dbg_select_ring_req != 0U)
+    {
+        cal_dbg_select_ring_req = 0U;
+        action = CAL_DBG_ACTION_SELECT_RING;
+        command = 0x82U;
+        p1 = cal_dbg_ring;
+    }
+    else if (cal_dbg_apply_carousel_req != 0U)
+    {
+        cal_dbg_apply_carousel_req = 0U;
+        action = CAL_DBG_ACTION_APPLY_CAROUSEL;
+        if (!cal_dbg_float_to_deci(cal_dbg_carousel_deg, &deci))
+        {
+            cal_dbg_last_action = action;
+            cal_dbg_last_result = 2U;
+            cal_dbg_execute_count++;
+            return;
+        }
+        command = 0x86U;
+        p1 = (uint8_t)(deci >> 8);
+        p2 = (uint8_t)deci;
+    }
+    else if (cal_dbg_apply_slide_req != 0U)
+    {
+        cal_dbg_apply_slide_req = 0U;
+        action = CAL_DBG_ACTION_APPLY_SLIDE;
+        if (!cal_dbg_float_to_deci(cal_dbg_slide_mm, &deci))
+        {
+            cal_dbg_last_action = action;
+            cal_dbg_last_result = 2U;
+            cal_dbg_execute_count++;
+            return;
+        }
+        command = 0x83U;
+        p1 = (uint8_t)(deci >> 8);
+        p2 = (uint8_t)deci;
+    }
+    else if (cal_dbg_apply_drop_req != 0U)
+    {
+        cal_dbg_apply_drop_req = 0U;
+        action = CAL_DBG_ACTION_APPLY_DROP;
+        if (!cal_dbg_float_to_deci(cal_dbg_drop_mm, &deci))
+        {
+            cal_dbg_last_action = action;
+            cal_dbg_last_result = 2U;
+            cal_dbg_execute_count++;
+            return;
+        }
+        command = 0x8BU;
+        p1 = (uint8_t)(deci >> 8);
+        p2 = (uint8_t)deci;
+    }
+    else if (cal_dbg_apply_observe_drop_req != 0U)
+    {
+        cal_dbg_apply_observe_drop_req = 0U;
+        action = CAL_DBG_ACTION_APPLY_OBSERVE_DROP;
+        command = 0x8EU;
+        p1 = cal_dbg_ring;
+    }
+    else if (cal_dbg_apply_place_drop_req != 0U)
+    {
+        cal_dbg_apply_place_drop_req = 0U;
+        action = CAL_DBG_ACTION_APPLY_PLACE_DROP;
+        command = 0x8FU;
+        p1 = cal_dbg_ring;
+    }
+    else if (cal_dbg_raise_only_req != 0U)
+    {
+        cal_dbg_raise_only_req = 0U;
+        action = CAL_DBG_ACTION_RAISE_ONLY;
+        command = 0x90U;
+        p1 = cal_dbg_ring;
+    }
+    else if (cal_dbg_slide_retract_only_req != 0U)
+    {
+        cal_dbg_slide_retract_only_req = 0U;
+        action = CAL_DBG_ACTION_SLIDE_RETRACT_ONLY;
+        command = 0x91U;
+        p1 = cal_dbg_ring;
+    }
+    else if (cal_dbg_retract_req != 0U)
+    {
+        cal_dbg_retract_req = 0U;
+        action = CAL_DBG_ACTION_RETRACT;
+        command = 0x84U;
+    }
+    else if (cal_dbg_k230_start_req != 0U)
+    {
+        cal_dbg_k230_start_req = 0U;
+        action = CAL_DBG_ACTION_K230_START;
+        command = 0x72U;
+        p1 = cal_dbg_ring;
+    }
+    else if (cal_dbg_k230_stop_req != 0U)
+    {
+        cal_dbg_k230_stop_req = 0U;
+        action = CAL_DBG_ACTION_K230_STOP;
+        command = 0x73U;
+    }
+    else if (cal_dbg_storage_align_req != 0U)
+    {
+        cal_dbg_storage_align_req = 0U;
+        /* 旧名与新通用名是同一个动作，同时置1时也只允许执行一次。 */
+        cal_dbg_chassis_align_req = 0U;
+        action = CAL_DBG_ACTION_STORAGE_ALIGN;
+        command = 0x88U;
+    }
+    else if (cal_dbg_chassis_align_req != 0U)
+    {
+        cal_dbg_chassis_align_req = 0U;
+        cal_dbg_storage_align_req = 0U;
+        action = CAL_DBG_ACTION_CHASSIS_ALIGN;
+        command = 0x88U;
+    }
+
+    if (action == CAL_DBG_ACTION_NONE)
+        return;
+
+    /*
+     * process_cmd()在主循环中运行，此处与UART接收中断共享命令槽。
+     * 写入的几个字节很少，但仍使用临界区保证不会与新到的VOFA帧
+     * 交叉。如果此刻刚好已有一帧VOFA等待处理，Watch请求本周期
+     * 记为忙（2），不会覆盖串口命令。
+     */
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        if (cmd_ready)
+        {
+            if (!primask) __enable_irq();
+            cal_dbg_last_action = action;
+            cal_dbg_last_result = 2U;
+            cal_dbg_execute_count++;
+            return;
+        }
+
+        cmd_v = command;
+        p1_v = p1;
+        p2_v = p2;
+        p3_v = 0U;
+        p4_v = 0U;
+        cmd_ready = 1U;
+        if (!primask) __enable_irq();
+    }
+
+    process_cmd();
+    cal_dbg_last_action = action;
+    cal_dbg_last_result = last_result;
+    cal_dbg_execute_count++;
 }
 
 static void send_telemetry(uint32_t now_ms)
@@ -1236,11 +1919,28 @@ static void send_telemetry(uint32_t now_ms)
 
 void VofaDebug_Update(uint32_t now_ms)
 {
+    /*
+     * Watch读回始终使用正的“从最高原点累计下降量”。底层为兼容电机方向
+     * 保存的是负数，因此只在调试界面边界转换一次，避免操作者混淆符号。
+     */
+    cal_dbg_current_drop_mm =
+        -ManipulatorAction_SlideJogGetVisionDropMm();
+
     process_cmd();
+
+    /*
+     * UART VOFA帧处理完后再查看 Keil Watch 按钮。
+     * 这样旧VOFA工具和新Watch面板可以并存，但不会相互覆盖命令。
+     */
+    cal_dbg_process_watch_request();
 
     /* 标定状态机先生成本周期的新指令，下面统一调用一次chassis_update()。 */
     RoughCalibration_Update(now_ms);
     StorageCalibration_Update(now_ms);
+
+    /* 动作状态机本周期可能刚提交新高度，再刷新一次供断点/Watch读取。 */
+    cal_dbg_current_drop_mm =
+        -ManipulatorAction_SlideJogGetVisionDropMm();
 
     /*
      * Required by the non-blocking chassis state machine.

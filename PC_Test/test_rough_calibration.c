@@ -5,6 +5,7 @@
 #include "app_uart.h"
 #include "edge_motion.h"
 #include "hmi_navigation.h"
+#include "k230_align.h"
 #include "manipulator_action.h"
 #include "map_graph.h"
 #include "robot_config.h"
@@ -31,10 +32,18 @@ static uint8_t s_slide_busy;
 static uint8_t s_slide_done;
 static float s_slide_mm;
 static float s_slide_target_mm;
+static float s_vision_drop_mm;
+static uint8_t s_low_vision_start_count;
+static uint8_t s_low_vision_home_count;
+static uint8_t s_vision_height_jog_count;
 static uint8_t s_servo_done;
 static float s_carousel_deg;
 static uint8_t s_gripper_open_count;
 static uint8_t s_planned_target;
+static uint8_t s_k230_busy;
+static uint8_t s_k230_done;
+static uint8_t s_k230_error;
+static Chassis *s_k230_chassis;
 static int s_pass;
 static int s_fail;
 
@@ -221,10 +230,75 @@ bool ManipulatorAction_SlideJogIsBusy(void) { return s_slide_busy != 0U; }
 bool ManipulatorAction_SlideJogHasError(void) { return false; }
 bool ManipulatorAction_SlideJogIsDone(void) { return s_slide_done != 0U; }
 float ManipulatorAction_SlideJogGetPositionMm(void) { return s_slide_mm; }
+float ManipulatorAction_SlideJogGetVisionDropMm(void)
+{ return s_vision_drop_mm; }
 bool ManipulatorAction_SlideJogToPositionStart(float target_mm)
 {
     if (!s_slide_valid || s_slide_busy) return false;
     s_slide_target_mm = target_mm;
+    s_slide_busy = 1U;
+    s_slide_done = 0U;
+    return true;
+}
+bool ManipulatorAction_SlideJogToVisionPositionStart(float target_mm,
+                                                      float pre_drop_mm)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm != 0.0f ||
+        s_vision_drop_mm != 0.0f || target_mm <= 0.0f || pre_drop_mm <= 0.0f)
+    {
+        return false;
+    }
+    s_slide_target_mm = target_mm;
+    s_vision_drop_mm = -pre_drop_mm;
+    s_low_vision_start_count++;
+    s_slide_busy = 1U;
+    s_slide_done = 0U;
+    return true;
+}
+bool ManipulatorAction_SlideJogToVisionDropStart(float target_drop_mm)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm <= 0.0f ||
+        s_vision_drop_mm > 0.0f || target_drop_mm <= 0.0f)
+    {
+        return false;
+    }
+    s_vision_drop_mm = -target_drop_mm;
+    s_vision_height_jog_count++;
+    s_slide_busy = 1U;
+    s_slide_done = 0U;
+    return true;
+}
+bool ManipulatorAction_SlideJogRaiseGimbalOnlyStart(void)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm <= 0.0f ||
+        s_vision_drop_mm >= 0.0f)
+    {
+        return false;
+    }
+    s_vision_drop_mm = 0.0f;
+    s_slide_busy = 1U;
+    s_slide_done = 0U;
+    return true;
+}
+bool ManipulatorAction_SlideJogRetractSlideOnlyStart(void)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm <= 0.0f ||
+        s_vision_drop_mm != 0.0f)
+    {
+        return false;
+    }
+    return ManipulatorAction_SlideJogToPositionStart(0.0f);
+}
+bool ManipulatorAction_SlideJogHomeStart(void)
+{
+    if (!s_slide_valid || s_slide_busy || s_slide_mm == 0.0f ||
+        s_vision_drop_mm == 0.0f)
+    {
+        return false;
+    }
+    s_vision_drop_mm = 0.0f;
+    s_slide_target_mm = 0.0f;
+    s_low_vision_home_count++;
     s_slide_busy = 1U;
     s_slide_done = 0U;
     return true;
@@ -246,6 +320,37 @@ void ManipulatorAction_Abort(void)
     s_slide_valid = 0U;
 }
 bool ManipulatorAction_IsBusy(void) { return false; }
+
+/* ---- K230Align orchestration stubs ---- */
+void K230Align_Init(Chassis *chassis)
+{
+    s_k230_chassis = chassis;
+    s_k230_busy = 0U;
+    s_k230_done = 0U;
+    s_k230_error = 0U;
+}
+bool K230Align_StartPreset(K230AlignMode_t mode, uint8_t target_id,
+                           uint32_t now_ms)
+{
+    (void)now_ms;
+    if (!s_k230_chassis || mode != K230_ALIGN_MODE_PLACE || target_id != 2U ||
+        s_k230_busy)
+    {
+        return false;
+    }
+    s_k230_busy = 1U;
+    s_k230_done = 0U;
+    return true;
+}
+void K230Align_Update(uint32_t now_ms) { (void)now_ms; }
+void K230Align_Abort(void)
+{
+    s_k230_busy = 0U;
+    s_k230_done = 0U;
+}
+bool K230Align_IsBusy(void) { return s_k230_busy != 0U; }
+bool K230Align_IsDone(void) { return s_k230_done != 0U; }
+bool K230Align_HasError(void) { return s_k230_error != 0U; }
 
 int main(void)
 {
@@ -366,6 +471,123 @@ int main(void)
     RoughCalibration_Abort();
     check(RoughCalibration_GetState() == ROUGH_CAL_IDLE && !s_slide_valid,
           "Abort exits calibration and invalidates the slide reference");
+
+    /*
+     * 新低位流程与旧高位流程共用路线和调参命令，但第一次伸出必须只下降
+     * 一次，连续绝对位置细调不能叠加下降，回零必须走“先抬升、后收回”。
+     */
+    s_imu.last_update_ms = 600U;
+    s_world_yaw_deg = 90.0f;
+    check(RoughCalibration_StartLow(2U, 600U) &&
+          RoughCalibration_IsLowVision(),
+          "Low rough calibration records the formal low-camera mode");
+    RoughCalibration_Update(600U);
+    RoughCalibration_Update(601U);
+    s_imu.last_update_ms = 802U;
+    RoughCalibration_Update(802U);
+    check(RoughCalibration_ConfirmSlideHome(0xA5U),
+          "Low mode still requires explicit slide-home confirmation");
+    check(RoughCalibration_SelectRing(2U, 803U),
+          "Low mode selects the ring while slide and gimbal are high/home");
+    s_servo_done = 1U;
+    RoughCalibration_Update(804U);
+
+    check(RoughCalibration_MoveSlideDeciMm(900U),
+          "First low-mode extension starts slide plus gimbal pre-drop");
+    RoughCalibration_Update(805U);
+    check(s_low_vision_start_count == 1U &&
+          nearf_local(s_vision_drop_mm, -ROUGH_VISION_PRE_DROP_MM, 0.01f),
+          "Low rough calibration applies the configured drop exactly once");
+
+    check(RoughCalibration_MoveSlideDeciMm(910U),
+          "Low-mode fine adjustment is accepted at the lowered height");
+    RoughCalibration_Update(806U);
+    check(s_low_vision_start_count == 1U &&
+          nearf_local(s_slide_mm, 91.0f, 0.01f),
+          "Fine adjustment does not stack a second gimbal drop");
+
+    check(RoughCalibration_MoveGimbalDropDeciMm(1850U),
+          "Verified rough-area placement height accepts direct 100-to-185 mm descent");
+    RoughCalibration_Update(807U);
+    check(s_vision_height_jog_count == 1U &&
+          nearf_local(s_vision_drop_mm, MANIP_PICKUP_GROUND_MM, 0.01f) &&
+          RoughCalibration_GetState() == ROUGH_CAL_SLIDE_READY,
+          "Direct placement probe reaches the formal absolute ground height");
+
+    check(RoughCalibration_MoveSlideDeciMm(920U),
+          "Placement-height slide tuning accepts a small 1 mm step");
+    RoughCalibration_Update(808U);
+    check(nearf_local(s_slide_mm, 92.0f, 0.01f),
+          "Low slide tuning commits the requested absolute target");
+    check(RoughCalibration_MoveSlideDeciMm(1000U),
+          "Placement-height slide tuning accepts a step up to 10 mm");
+    RoughCalibration_Update(809U);
+    check(nearf_local(s_slide_mm, 100.0f, 0.01f),
+          "Expanded low slide limit commits an 8 mm adjustment");
+    check(!RoughCalibration_MoveSlideDeciMm(1110U) &&
+          RoughCalibration_GetError() == ROUGH_CAL_ERROR_PARAM,
+          "Placement-height slide tuning still rejects a step larger than 10 mm");
+    check(RoughCalibration_MoveSlideDeciMm(910U),
+          "Low slide can return with a 9 mm adjustment");
+    RoughCalibration_Update(810U);
+
+    check(RoughCalibration_MoveCarouselDeciDeg(2743U, 810U),
+          "Placement-height carousel tuning accepts a small 1 degree step");
+    s_servo_done = 1U;
+    RoughCalibration_Update(811U);
+    check(RoughCalibration_MoveCarouselDeciDeg(2933U, 812U),
+          "Placement-height carousel has no single-step angle-delta limit");
+    s_servo_done = 1U;
+    RoughCalibration_Update(813U);
+    check(RoughCalibration_MoveCarouselDeciDeg(2733U, 813U),
+          "Low carousel can move directly back to the K230 ring-2 angle");
+    s_servo_done = 1U;
+    RoughCalibration_Update(814U);
+
+    check(RoughCalibration_MoveGimbalDropDeciMm(1000U),
+          "Placement probe can return to the formal low-camera height");
+    RoughCalibration_Update(809U);
+    check(s_vision_height_jog_count == 2U &&
+          nearf_local(s_vision_drop_mm, -ROUGH_VISION_PRE_DROP_MM, 0.01f),
+          "Returning to 100 mm restores the horizontal tuning height");
+
+    check(!RoughCalibration_MoveGimbalDropDeciMm(1900U) &&
+          RoughCalibration_GetError() == ROUGH_CAL_ERROR_PARAM,
+          "Placement probe rejects descent below the formal ground height");
+
+    check(RoughCalibration_StartVisionAlign(809U) && s_k230_busy,
+          "Rough ring-2 observation pose can start real chassis alignment");
+    s_k230_busy = 0U;
+    s_k230_done = 1U;
+    RoughCalibration_Update(809U);
+    check(RoughCalibration_GetState() == ROUGH_CAL_SLIDE_READY,
+          "Rough chassis alignment returns control without moving the arm");
+
+    check(RoughCalibration_RaiseGimbalToTop(),
+          "Split recovery first raises only motor 5 to the top origin");
+    RoughCalibration_Update(810U);
+    check(s_vision_drop_mm == 0.0f &&
+          nearf_local(s_slide_mm, 91.0f, 0.01f) &&
+          RoughCalibration_GetState() == ROUGH_CAL_SLIDE_READY,
+          "Raise-only keeps the rack extended for inspection");
+
+    check(RoughCalibration_MoveGimbalDropDeciMm(1000U),
+          "Observation command can descend again from top while rack stays out");
+    RoughCalibration_Update(811U);
+    check(nearf_local(s_vision_drop_mm, -ROUGH_VISION_PRE_DROP_MM, 0.01f),
+          "Re-entering observation uses the absolute 100 mm target");
+    check(RoughCalibration_RaiseGimbalToTop(),
+          "Gimbal can be raised to top again before rack retraction");
+    RoughCalibration_Update(812U);
+
+    check(RoughCalibration_RetractSlideOnly(),
+          "Split recovery then retracts only the rack");
+    RoughCalibration_Update(813U);
+    check(nearf_local(s_slide_mm, 0.0f, 0.01f) &&
+          RoughCalibration_GetState() == ROUGH_CAL_HOME_READY,
+          "Split recovery restores slide home after gimbal is already high");
+
+    RoughCalibration_Abort();
 
     printf("PASS: %d\nFAIL: %d\n", s_pass, s_fail);
     return s_fail ? 1 : 0;

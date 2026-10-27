@@ -32,7 +32,7 @@ static uint32_t s_state_start_ms = 0U;
 static K230AlignMode_t s_mode = K230_ALIGN_MODE_DETECT;
 static uint8_t s_target_id = 0U;
 static uint8_t s_anchor_color_id = 0U; /* STACK：目标位第一层物料的颜色号 */
-static float s_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG; /* 对位时的夹爪朝向 */
+static float s_carousel_deg = CAROUSEL_PICKUP_POS2_DEG; /* 对位时的夹爪朝向 */
 static uint8_t s_iteration = 0U;
 static uint8_t s_color_ok = 0U;   /* DETECT：已确认 K230 识别到目标颜色 */
 static uint8_t s_grab_seen = 0U;  /* DETECT：已收到 K230 的 grab（识别成功可直接夹） */
@@ -40,6 +40,22 @@ static uint8_t s_place_seen = 0U; /* PLACE：已收到 K230 的 place（已对�
 static uint8_t s_target_ok = 0U;  /* STACK：K230锁定的位置号与s_target_id一致 */
 static uint8_t s_pending_exit_reason = K230_ALIGN_EXIT_NONE;
 static uint32_t s_stop_last_tx_ms = 0U;
+
+/*
+ * K230仍沿用现有的两行偏差协议：一行属于X轴，一行属于Y轴。STM32必须保证：
+ *   1. 两根轴都是进入WAIT_OFFSET之后收到的新数据；
+ *   2. 每根轴的时间戳相对上一组都发生了变化，缓存值不能重复计数；
+ *   3. 两根轴在K230_ALIGN_PAIR_WINDOW_MS内到齐，孤立轴绝不再补0。
+ * consumed_ms保存已经消费/丢弃到哪个时间戳；进入每轮WAIT_OFFSET时会快照
+ * 当前缓存，从而自然丢掉底盘运动期间到达的旧视觉数据。
+ */
+static uint32_t s_axis_x_consumed_ms = 0U;
+static uint32_t s_axis_y_consumed_ms = 0U;
+
+/* STM32几何兜底的连续稳定状态。K230的place/grab完成通路不依赖这些量。 */
+static uint8_t s_center_stable_count = 0U;
+static uint32_t s_center_stable_start_ms = 0U;
+static uint32_t s_center_stable_last_ms = 0U;
 
 /*
  * 本次对位是不是「云台已由上层摆好」（K230Align_StartPreset 入口）。
@@ -72,11 +88,25 @@ volatile char    robot_k230_align_last_dir = '\0';
 volatile int32_t robot_k230_align_last_px = 0;
 volatile int32_t robot_k230_align_px_x = 0;  /* 本轮合成用的 ±X 像素偏差，带符号 */
 volatile int32_t robot_k230_align_px_y = 0;  /* 本轮合成用的 ±Y 像素偏差，带符号 */
+volatile uint8_t robot_k230_align_stable_samples = 0U;
+volatile uint32_t robot_k230_align_stable_ms = 0U;
+volatile uint16_t robot_k230_align_complete_pairs = 0U;
+volatile uint16_t robot_k230_align_dropped_axes = 0U;
 volatile uint16_t robot_k230_align_stop_requests = 0U;
 volatile uint16_t robot_k230_align_stop_tx_failures = 0U;
 volatile uint32_t robot_k230_align_stop_wait_ms = 0U;
 volatile uint32_t robot_k230_align_stop_ack_ms = 0U;
 volatile uint8_t robot_k230_align_stop_ack_received = 0U;
+
+/* 清掉STM32兜底的连续合格计数；底盘一旦需要移动或视觉数据断档就调用。 */
+static void reset_center_stability(void)
+{
+    s_center_stable_count = 0U;
+    s_center_stable_start_ms = 0U;
+    s_center_stable_last_ms = 0U;
+    robot_k230_align_stable_samples = 0U;
+    robot_k230_align_stable_ms = 0U;
+}
 
 static void enter_state(K230AlignState_t new_state, uint32_t now_ms)
 {
@@ -92,6 +122,14 @@ static void enter_state(K230AlignState_t new_state, uint32_t now_ms)
     if (new_state == K230_ALIGN_WAIT_OFFSET)
     {
         s_offset_epoch_ms = now_ms;
+
+        /*
+         * 快照进入WAIT_OFFSET之前的轴缓存。只有时间戳随后更新的行才算新数据，
+         * 这样主循环再快也不会把同一组偏差重复累计成5组；底盘运动期间收到的
+         * 行也会在这里一并作废。
+         */
+        s_axis_x_consumed_ms = g_k230_status.axis_x_ms;
+        s_axis_y_consumed_ms = g_k230_status.axis_y_ms;
     }
 }
 
@@ -150,12 +188,6 @@ static bool target_id_valid(K230AlignMode_t mode, uint8_t target_id)
     return (target_id >= 1U) && (target_id <= 6U);
 }
 
-/* 偏差像素取绝对值。 */
-static uint32_t abs_px(int32_t px)
-{
-    return (uint32_t)((px < 0) ? (-px) : px);
-}
-
 static void send_stop_request(uint32_t now_ms)
 {
     /* HAL忙时不直接失败；STOPPING会按固定周期重试。 */
@@ -190,14 +222,23 @@ static void align_done(uint8_t exit_reason, uint32_t now_ms)
  * dir == '\0' 表示该轴还没收到过任何偏差行。
  * 时间戳用有符号差比较，避免 HAL_GetTick() 回绕时判错。
  */
-static bool axis_line_usable(char dir, uint32_t line_ms)
+static bool axis_line_usable(char dir, uint32_t line_ms,
+                             uint32_t consumed_ms)
 {
     if (dir == '\0')
     {
         return false;
     }
 
-    return ((int32_t)(line_ms - s_offset_epoch_ms) >= 0);
+    return (((int32_t)(line_ms - s_offset_epoch_ms) >= 0) &&
+            (line_ms != consumed_ms));
+}
+
+/* 两根轴时间戳的绝对间隔；这里只比较同一小窗口附近的数据。 */
+static uint32_t axis_time_gap_ms(uint32_t x_ms, uint32_t y_ms)
+{
+    int32_t gap = (int32_t)(x_ms - y_ms);
+    return (uint32_t)((gap < 0) ? (-gap) : gap);
 }
 
 /*
@@ -254,25 +295,62 @@ static bool identity_ready(void)
 }
 
 /*
- * 用一对正交偏差决定：对准了 / 用满次数 / 继续微调。
+ * 用一对完整、全新的正交偏差决定：累计稳定 / 用满次数 / 继续微调。
  * px_x / px_y 是带符号像素值，正方向分别是车体 +X（右）和 +Y（前）；
- * 某轴缺席时传 0，等价于“该轴偏差已在容差内”。
+ * 本函数永远不会收到“缺席轴补0”的数据，调用前已经完成双轴配对。
  */
 static void handle_offset_pair(int32_t px_x, int32_t px_y, uint32_t now_ms)
 {
     float dx_m = 0.0f;
     float dy_m = 0.0f;
+    int64_t error_sq;
+    int64_t tolerance_sq;
 
     robot_k230_align_px_x = px_x;
     robot_k230_align_px_y = px_y;
 
-    /* 两轴都进容差才算对准；缺席轴为 0，自动满足。 */
-    if ((abs_px(px_x) <= K230_ALIGN_TOLERANCE_PX) &&
-        (abs_px(px_y) <= K230_ALIGN_TOLERANCE_PX))
+    /*
+     * 使用与K230一致的圆形容差，而不是“X/Y分别小于阈值”的方形容差。
+     * 例如(2,2)到中心的实际距离约2.83 px，在2 px容差下不能算对准。
+     */
+    error_sq = (int64_t)px_x * (int64_t)px_x +
+               (int64_t)px_y * (int64_t)px_y;
+    tolerance_sq = (int64_t)K230_ALIGN_TOLERANCE_PX *
+                   (int64_t)K230_ALIGN_TOLERANCE_PX;
+
+    if (error_sq <= tolerance_sq)
     {
-        align_done(K230_ALIGN_EXIT_TOLERANCE, now_ms);
+        /* 数据间隔过大就不是连续帧，从当前这一组重新作为第1组。 */
+        if ((s_center_stable_count == 0U) ||
+            ((now_ms - s_center_stable_last_ms) >
+             K230_ALIGN_STABLE_MAX_GAP_MS))
+        {
+            reset_center_stability();
+            s_center_stable_start_ms = now_ms;
+        }
+
+        if (s_center_stable_count < K230_ALIGN_STABLE_FRAMES)
+        {
+            s_center_stable_count++;
+        }
+        s_center_stable_last_ms = now_ms;
+        robot_k230_align_stable_samples = s_center_stable_count;
+        robot_k230_align_stable_ms = now_ms - s_center_stable_start_ms;
+
+        /*
+         * 帧数与持续时间必须同时满足。未满足时保持WAIT_OFFSET，不移动底盘，
+         * 继续等待K230下一组全新的双轴偏差；place若先到仍可立即正常完成。
+         */
+        if ((s_center_stable_count >= K230_ALIGN_STABLE_FRAMES) &&
+            (robot_k230_align_stable_ms >= K230_ALIGN_STABLE_MIN_MS))
+        {
+            align_done(K230_ALIGN_EXIT_TOLERANCE, now_ms);
+        }
         return;
     }
+
+    /* 任一完整新偏差超出容差，连续合格必须从头开始。 */
+    reset_center_stability();
 
     if (s_iteration >= K230_ALIGN_MAX_ITER)
     {
@@ -306,7 +384,7 @@ void K230Align_Init(Chassis *chassis)
     s_mode = K230_ALIGN_MODE_DETECT;
     s_target_id = 0U;
     s_anchor_color_id = 0U;
-    s_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+    s_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
     s_servo_preset = false;
     s_iteration = 0U;
     s_color_ok = 0U;
@@ -314,6 +392,9 @@ void K230Align_Init(Chassis *chassis)
     s_place_seen = 0U;
     s_target_ok = 0U;
     s_offset_epoch_ms = 0U;
+    s_axis_x_consumed_ms = 0U;
+    s_axis_y_consumed_ms = 0U;
+    reset_center_stability();
     s_pending_exit_reason = K230_ALIGN_EXIT_NONE;
     s_stop_last_tx_ms = 0U;
 
@@ -330,6 +411,8 @@ void K230Align_Init(Chassis *chassis)
     robot_k230_align_last_px = 0;
     robot_k230_align_px_x = 0;
     robot_k230_align_px_y = 0;
+    robot_k230_align_complete_pairs = 0U;
+    robot_k230_align_dropped_axes = 0U;
     robot_k230_align_stop_requests = 0U;
     robot_k230_align_stop_tx_failures = 0U;
     robot_k230_align_stop_wait_ms = 0U;
@@ -371,6 +454,9 @@ static bool align_start(K230AlignMode_t mode, uint8_t target_id,
     s_place_seen = 0U;
     s_target_ok = 0U;
     s_offset_epoch_ms = 0U;
+    s_axis_x_consumed_ms = 0U;
+    s_axis_y_consumed_ms = 0U;
+    reset_center_stability();
     s_pending_exit_reason = K230_ALIGN_EXIT_NONE;
     s_stop_last_tx_ms = 0U;
 
@@ -394,6 +480,8 @@ static bool align_start(K230AlignMode_t mode, uint8_t target_id,
     robot_k230_align_last_px = 0;
     robot_k230_align_px_x = 0;
     robot_k230_align_px_y = 0;
+    robot_k230_align_complete_pairs = 0U;
+    robot_k230_align_dropped_axes = 0U;
     robot_k230_align_stop_requests = 0U;
     robot_k230_align_stop_tx_failures = 0U;
     robot_k230_align_stop_wait_ms = 0U;
@@ -410,7 +498,8 @@ static bool align_start(K230AlignMode_t mode, uint8_t target_id,
      *
      * servo_preset 为真时（上层已在 ManipulatorAction 的视觉预置里转过
      * 云台并张开），这里不再重发同一目标：重发不会让舵机动，只会多等
-     * 一个稳定期；而且识别前那段本来就是「云台先转、滑台后伸」。
+     * 一个稳定期；而且识别前那段预置已经确认过舵机 DONE（粗加工区/
+     * 暂存区还要同时等滑台前伸到位），这里不必再等。
      */
     if (!s_servo_preset)
     {
@@ -443,10 +532,10 @@ bool K230Align_StartPreset(K230AlignMode_t mode, uint8_t target_id,
 {
     /*
      * carousel_deg 只作为记录保存：本入口不会用它去驱动舵机，姿态已经由
-     * 上层摆成 K230_ALIGN_CAROUSEL_ANGLE_DEG 了，w/a/s/d 也是在这个姿态下
+     * 上层摆成 CAROUSEL_PICKUP_POS2_DEG 了，w/a/s/d 也是在这个姿态下
      * 定义的（见 robot_config.h）。
      */
-    return align_start(mode, target_id, 0U, K230_ALIGN_CAROUSEL_ANGLE_DEG,
+    return align_start(mode, target_id, 0U, CAROUSEL_PICKUP_POS2_DEG,
                        true, now_ms);
 }
 
@@ -454,7 +543,7 @@ bool K230Align_StartStackPreset(uint8_t position_id, uint8_t anchor_color_id,
                                 uint32_t now_ms)
 {
     return align_start(K230_ALIGN_MODE_STACK, position_id, anchor_color_id,
-                       K230_ALIGN_CAROUSEL_ANGLE_DEG, true, now_ms);
+                       CAROUSEL_PICKUP_POS2_DEG, true, now_ms);
 }
 
 void K230Align_Update(uint32_t now_ms)
@@ -546,6 +635,7 @@ void K230Align_Update(uint32_t now_ms)
         {
             /* 重新搜索若报成相邻位置，旧place也不能继续生效。 */
             s_place_seen = 0U;
+            reset_center_stability();
         }
     }
 
@@ -619,9 +709,11 @@ void K230Align_Update(uint32_t now_ms)
 
         case K230_ALIGN_WAIT_OFFSET:
             have_x = axis_line_usable(g_k230_status.axis_x_dir,
-                                      g_k230_status.axis_x_ms);
+                                      g_k230_status.axis_x_ms,
+                                      s_axis_x_consumed_ms);
             have_y = axis_line_usable(g_k230_status.axis_y_dir,
-                                      g_k230_status.axis_y_ms);
+                                      g_k230_status.axis_y_ms,
+                                      s_axis_y_consumed_ms);
 
             px_x = have_x ? ((g_k230_status.axis_x_dir == 'w') ?
                              g_k230_status.axis_x_px :
@@ -635,9 +727,9 @@ void K230Align_Update(uint32_t now_ms)
              * 偏差帧要先过身份闸：DETECT确认目标颜色；STACK确认位置号；
              * 普通PLACE无需身份报文。闸门通过后才允许拿偏差推动底盘。
              *
-             * 两轴到齐就立刻合成一次斜向平移；只到一轴（另一轴偏差本来
-             * 就是 0、K230 不发那一行）则等满配对窗口再按单轴走，免得
-             * 每轮都空等一整个窗口。
+             * 当前K230每轮明确发送两根轴，0偏差也会发送，因此这里必须等
+             * 两轴都成为新数据才能合成一组。只到一轴时绝不补0；等待超时后
+             * 丢弃该孤立轴并清连续稳定计数，下一轮重新配完整双轴。
              */
             /*
              * 两条“K230 说不用再调了”的路，按模式各认一条：
@@ -665,15 +757,77 @@ void K230Align_Update(uint32_t now_ms)
              * 收工信号优先于同一帧的 offset。K230 常在最后一帧同时发
              * “偏差 + grab/place”；旧顺序会先开始下一次运动并清掉 grab。
              */
-            if (identity_ready() &&
-                ((have_x && have_y) ||
-                 ((have_x || have_y) &&
-                  ((now_ms - s_state_start_ms) >= K230_ALIGN_PAIR_WINDOW_MS))))
+            /* 长时间没有下一组完整数据时，旧的“连续合格”资格自动失效。 */
+            if ((s_center_stable_count != 0U) &&
+                ((now_ms - s_center_stable_last_ms) >
+                 K230_ALIGN_STABLE_MAX_GAP_MS))
             {
-                s_grab_seen = 0U;
-                s_place_seen = 0U;
-                handle_offset_pair(px_x, px_y, now_ms);
-                break;
+                reset_center_stability();
+            }
+
+            if (identity_ready() && have_x && have_y)
+            {
+                uint32_t pair_gap = axis_time_gap_ms(
+                    g_k230_status.axis_x_ms,
+                    g_k230_status.axis_y_ms);
+
+                if (pair_gap <= K230_ALIGN_PAIR_WINDOW_MS)
+                {
+                    /* 先标记已消费，再处理；即使本组进入容差但尚未满5组，
+                     * 下一次主循环也不会重复累计这组缓存。 */
+                    s_axis_x_consumed_ms = g_k230_status.axis_x_ms;
+                    s_axis_y_consumed_ms = g_k230_status.axis_y_ms;
+                    if (robot_k230_align_complete_pairs < 65535U)
+                    {
+                        robot_k230_align_complete_pairs++;
+                    }
+
+                    s_grab_seen = 0U;
+                    s_place_seen = 0U;
+                    handle_offset_pair(px_x, px_y, now_ms);
+                    break;
+                }
+
+                /*
+                 * 两轴都更新了但相差超过窗口，说明它们不是同一轮。只丢较旧
+                 * 的那根轴，保留较新的轴等待下一根匹配，避免前后帧错配。
+                 */
+                if ((int32_t)(g_k230_status.axis_x_ms -
+                              g_k230_status.axis_y_ms) > 0)
+                {
+                    s_axis_y_consumed_ms = g_k230_status.axis_y_ms;
+                }
+                else
+                {
+                    s_axis_x_consumed_ms = g_k230_status.axis_x_ms;
+                }
+                if (robot_k230_align_dropped_axes < 65535U)
+                {
+                    robot_k230_align_dropped_axes++;
+                }
+                reset_center_stability();
+            }
+            else if (identity_ready() && (have_x || have_y))
+            {
+                uint32_t lone_ms = have_x ? g_k230_status.axis_x_ms :
+                                            g_k230_status.axis_y_ms;
+
+                if ((now_ms - lone_ms) >= K230_ALIGN_PAIR_WINDOW_MS)
+                {
+                    if (have_x)
+                    {
+                        s_axis_x_consumed_ms = g_k230_status.axis_x_ms;
+                    }
+                    else
+                    {
+                        s_axis_y_consumed_ms = g_k230_status.axis_y_ms;
+                    }
+                    if (robot_k230_align_dropped_axes < 65535U)
+                    {
+                        robot_k230_align_dropped_axes++;
+                    }
+                    reset_center_stability();
+                }
             }
 
             /*

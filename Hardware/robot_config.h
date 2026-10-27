@@ -14,7 +14,14 @@
  * The yellow forbidden square is 450 x 450 mm; that is NOT the node spacing.
  */
 #define ROUTE_GRID_STEP_M           0.850f
-#define ROUTE_EDGE_SPEED_MPS        2.200f
+
+/*
+ * 导航直线速度。按 120 rpm 反算：
+ *   v = rpm × 2π × 轮半径 / 60 = 120 × 2π × 0.0385 / 60 ≈ 0.484 m/s
+ * （换算系数见 mecanum_kinematics.c：rpm = v × 60 / (2π × 轮半径)，当前约
+ * 248 rpm 每 m/s。改轮径后本值必须重算。）
+ */
+#define ROUTE_EDGE_SPEED_MPS        0.8f
 
 /*
  * 拓扑边只允许车身纵向运动，不再用大距离横移：
@@ -29,10 +36,10 @@
 #define ROUTE_TURN_TOLERANCE_DEG                 0.80f
 #define ROUTE_ALLOW_REVERSE                         1U
 #define ROUTE_REVERSE_MIN_TURN_SAVING_DEG         5.00f
-#define ROUTE_TURN_SETTLE_MS           200U
+#define ROUTE_TURN_SETTLE_MS           150U
 #define ROUTE_TURN_MAX_ATTEMPTS          3U
-#define ROUTE_TURN_SPEED_MPS           0.20f
-#define ROUTE_TURN_ACC                   50U
+#define ROUTE_TURN_SPEED_MPS           0.50f
+#define ROUTE_TURN_ACC                  130U
 
 /* Route preference: N5 is the central four-way intersection.  The planner
  * uses this only as a secondary criterion after total distance, so a longer
@@ -54,16 +61,25 @@
  *   pulse_us = SERVO_MIN_US
  *            + angle_deg / travel_deg * (SERVO_MAX_US - SERVO_MIN_US)
  *
- * PWM2/PWM4 are 270-degree positional servos; PWM3 is a 360-degree
- * positional servo.  SERVO_MIN_US/SERVO_MAX_US are electrical limits, not
- * mechanical-position calibration values, so they remain expressed in us.
+ * PWM4 is a 270-degree positional servo; PWM2 and PWM3 are both 360-degree
+ * positional servos, so their calibrated angles are true mechanical degrees
+ * (0..360 maps to 500..2500 us).  SERVO_MIN_US/SERVO_MAX_US are electrical
+ * limits, not mechanical-position calibration values, so they stay in us.
+ *
+ * 2026-10-25: PWM2 (carousel) changed from a 270-degree to a 360-degree
+ * servo.  Every carousel calibration value below was rescaled by 360/270
+ * (= 4/3) when this changed, so the emitted pulse widths — and therefore the
+ * real mechanical poses — are identical to the previous build.  When copying
+ * old bench notes that say "205 deg", multiply by 4/3 to get this file's
+ * value.  Vision PID output is in carousel degrees too, so RAW_VISION_ANGLE_*
+ * was rescaled alongside the angles.
  */
 #define SERVO_MIN_US                500U
 #define SERVO_MAX_US                2500U
 #define SERVO_CENTER_US             1500U
 
 #define GRIPPER_TRAVEL_DEG          270.0f
-#define CAROUSEL_TRAVEL_DEG         270.0f
+#define CAROUSEL_TRAVEL_DEG         360.0f
 #define TRAY_SELECTOR_TRAVEL_DEG    360.0f
 
 /* ---------- Gripper open/close servo: PWM4 ---------- */
@@ -72,19 +88,31 @@
 #define GRIPPER_CLOSE_DEG           130.0f /* VOFA PWM4: AA 55 22 03 05 DC 00 (1500 us) */
 #define GRIPPER_MID_DEG             135.0f /* VOFA PWM4: AA 55 22 03 05 DC 00 (1500 us) */
 
-/* ---------- Gripper rotating servo: PWM2 ---------- */
-#define CAROUSEL_PICKUP_POS1_DEG  230.0f  /* 2204 us */
-#define CAROUSEL_PICKUP_POS2_DEG  205.0f  /* 2019 us */
-#define CAROUSEL_PICKUP_POS3_DEG  180.1f  /*    */
-#define CAROUSEL_PLACE_DEG        108.0f /* VOFA PWM2:											 */
-#define CAROUSEL_MID_DEG          135.0f /* VOFA PWM2: AA 55 22 01 05 DC 00 (1500 us) */
+/* ---------- Gripper rotating servo: PWM2 ---------- *///云台参数
+/*
+ * CAROUSEL_PLACE_DEG 是云台放料角度的上电默认值。
+ * 运行中真正使用的是 servo.c 的 g_carousel_place_deg，可在 Debug Watch 调节；
+ * 调好后再把最终值写回本宏，确保重新上电后仍保留标定结果。
+ */
+/* 360° 舵机刻度：0..360 对应 500..2500 us（每度 5.556 us）。
+ * 数值 = 旧 270° 刻度值 × 4/3，脉宽与实车姿态保持不变。 */
+#define CAROUSEL_PICKUP_POS1_DEG  316.67f /* 2259 us（旧刻度 237.5；2204 us 是更早 POS1=230° 时的注释） */
+#define CAROUSEL_PICKUP_POS2_DEG  273.33f /* 2019 us */
+#define CAROUSEL_PICKUP_POS3_DEG  232.67f /* 1793 us */
+#define CAROUSEL_PLACE_DEG        145.33f /* 1307 us；云台偏转到物料盘上方的放料角度 */
+#define CAROUSEL_MID_DEG          180.00f /* VOFA PWM2: AA 55 22 01 05 DC 00 (1500 us) */
 #define CAROUSEL_POWERON_DEG        CAROUSEL_PICKUP_POS3_DEG /* 上电初始：停在夹取位3 */
 
-/* ---------- Material tray selector servo: PWM3 ---------- */
+/* ---------- Material tray selector servo: PWM3 ---------- *///料盘参数
+/*
+ * 下面三个宏是物料盘1/2/3号位的上电默认值。
+ * 运行时分别对应 g_tray_slot_deg[0]/[1]/[2]，可在 Debug Watch 直接调节；
+ * 调好后再把最终值写回对应宏，避免复位后丢失本次标定结果。
+ */
 #define TRAY_SELECTOR_SLOT_COUNT        3U
-#define TRAY_SELECTOR_SLOT0_DEG  130.4f /* 1号位：1297 us，AA 55 22 02 05 11 00 */
-#define TRAY_SELECTOR_SLOT1_DEG  250.3f /* 2号位：1963 us，AA 55 22 02 07 AB 00 */
-#define TRAY_SELECTOR_SLOT2_DEG   10.3f /* 3号位： 629 us，AA 55 22 02 02 75 00 */
+#define TRAY_SELECTOR_SLOT0_DEG  78.0f /* 1号位理论初值：以2号位为基准减120度 */
+#define TRAY_SELECTOR_SLOT1_DEG  198.0f /* 2号位当前实车标定基准 */
+#define TRAY_SELECTOR_SLOT2_DEG  318.4f /* 3号位理论初值：以2号位为基准加120度 */
 #define TRAY_SELECTOR_MID_DEG        180.0f /* VOFA PWM3: AA 55 22 02 05 DC 00 (1500 us) */
 
 
@@ -119,16 +147,16 @@
  */
 #define MANIP_GIMBAL_RPM            3000U  /* 电机5 升降转速 */
 #define MANIP_GIMBAL_ACC               0U     /* 电机5 加速度档位 */
-#define MANIP_SLIDE_RPM             2000U  /* 电机6 前伸转速 */
-#define MANIP_SLIDE_ACC             200U     /* 电机6 加速度档位 */
+#define MANIP_SLIDE_RPM              120U  /* 电机6 前伸转速 */
+#define MANIP_SLIDE_ACC              220U     /* 电机6 加速度档位 */
 
 /* Manipulator placement timing. */
 #define MANIP_PLACE_TRAY_WAIT_MS         800U
 /* 调试期临时放宽（原 15000U）：电机5全程接近15s，避免超时早停掩盖真实到位时间。 */
 #define MANIP_PLACE_MOTOR_TIMEOUT_MS     40000U
-#define MANIP_PLACE_STATUS_PERIOD_MS     50U
+#define MANIP_PLACE_STATUS_PERIOD_MS     20U
 /* 到位确认守卫窗：段启动后经过该时间的新鲜 0x3A 应答才采信（同底盘 CHASSIS_STATUS_QUERY_GUARD_MS）。 */
-#define MANIP_MOTOR_FEEDBACK_GUARD_MS    80U
+#define MANIP_MOTOR_FEEDBACK_GUARD_MS    50U
 
 /* 0x37 位置误差回读阈值（单位：电机脉冲）。到位确认已改回底盘式只看 0x02 标志，
  * 这组参数仅供必要时重新启用 perr 诊断/兜底。 */
@@ -142,9 +170,9 @@
 /* ---------- Manipulator relative movement ---------- */
 
 /* Pickup movement*/
-#define MANIP_PICKUP_GROUND_MM           -185.0f//从最高点下降到地面取料高度
-#define MANIP_PICKUP_TABLE_MM            -105.0f//从最高点下降到原料台取料高度
-#define MANIP_PICKUP_TRAY_MM             -42.0f //从最高点下降到物料盘取料高度
+#define MANIP_PICKUP_GROUND_MM           -183.0f//从最高点下降到地面取料高度
+#define MANIP_PICKUP_TABLE_MM            -103.0f//从最高点下降到原料台取料高度
+#define MANIP_PICKUP_TRAY_MM             -50.0f //从最高点下降到物料盘取料高度
 
 /*
  * 暂存区识别前的垂直预下降量（正数=下降）。
@@ -166,7 +194,7 @@
 /*
  * 粗加工区识别前的垂直预下降量（正数=下降），与暂存区使用相同的 100 mm。
  *
- * SlideJogToRoughAlignStart() 先把滑台伸到 ROUGH_SLIDE_POS2_MM，再下降
+ * SlideJogToRoughAlignStart() 先把滑台伸到ROUGH_VISION_LOW_SLIDE_POS2_MM，再下降
  * 电机5到本高度，然后发 K230 place 做2号环底盘对位；对位和航向复核结束后
  * SlideJogHomeStart() 会先抬回最高原点，再回缩滑台，之后 1/2/3 号圆环
  * 仍按 ROUGH_* 固定位姿执行。
@@ -175,93 +203,153 @@
  */
 #define ROUGH_VISION_PRE_DROP_MM         100.0f
 
+/*
+ * 低位标定高度均以丝杆最高机械原点为0 mm，向下用正的累计下降量表示。
+ * 例如185 mm表示“从最高点累计下降185 mm”，绝不能理解为从100 mm观察位
+ * 再下降185 mm。该绝对高度已经过正式跑图验证，粗加工区和暂存区调试都
+ * 可以从最高点或100 mm观察位直接到达，底层会自动换算本次相对行程。
+ */
+
 /* 电机6前伸距离：这里只保留原料区的原有值。
  * 数值是「从机械原点量起的绝对伸出量」，不是增量。原料区视觉识别前会
  * 先伸到识别位；识别/对准完成后直接从当前伸出量下降抓取，不再退回原点。
  * 粗加工区和暂存区仍在视觉对位后退回原点，再从原点执行固定位姿动作。
  * 两个区域都在下方拥有各自的独立参数，后续实车调其中一个区域不会再连带
  * 改变另外两个区域。 */
-#define MANIP_PICKUP_SLIDE_POS1_MM       125.0f
-#define MANIP_PICKUP_SLIDE_POS2_MM        115.0f
-#define MANIP_PICKUP_SLIDE_POS3_MM       125.0f
+#define MANIP_PICKUP_SLIDE_POS1_MM       130.0f
+#define MANIP_PICKUP_SLIDE_POS2_MM        80.0f
+#define MANIP_PICKUP_SLIDE_POS3_MM       130.0f
 
 /*
  * 粗加工区固定圆环的独立标定位姿。
  *
  * 标定与正式运行的因果顺序不能颠倒：
  *   标定：信任“启停区2直达N2”的底盘位置，绝不做视觉底盘修正；固定底盘，
- *         调 ROUGH_SLIDE_POS2_MM 直到 K230 中心对准2号圆环，再调1/3号
- *         各自的固定云台角和齿条长度。
+ *         先调ROUGH_VISION_LOW_SLIDE_POS2_MM直到K230中心对准2号圆环；再用
+ *         VOFA 0x8B把夹爪下降到实际放置高度，分别标定1/2/3号夹爪中心的
+ *         ROUGH_CAROUSEL_POSn_DEG和ROUGH_SLIDE_POSn_MM。
  *   正式：经过多轮任务到达N2后，复现已标定的2号相机位姿，用K230偏差
  *         平移底盘回到上述准确位置；之后底盘不动，1/2/3号全部按写死
  *         位姿放置和取回，1/3号不再视觉对位。
  *
  * 因此这些值必须是粗加工区专用值，不能借用原料区/暂存区参数。2号识别
- * 角默认固定为205 deg（K230方向映射据此定义），通常只标定它的齿条长度；
- * 1号/3号联合标定角度和长度。放料与取回共用同一组位姿。
+ * 角固定为273.33 deg（旧270°刻度记作205 deg；K230方向映射据此定义），但相机取像滑台长度与夹爪实际
+ * 放置滑台长度必须分开保存：相机光心和夹爪中心不保证机械同轴。
  */
 /*
- * 2026-10-17 实车标定结果（启停区2直达N2、航向+90 deg，底盘固定不动）：
+ * 注意：以下历史记录中的角度都是 270° 旧刻度下的实测值；下面的宏已按
+ * 360° 新刻度换算（×4/3），脉宽与实测姿态一致。阅读老记录请自行换算。
+ *
+ * 2026-10-17 高位识别实车标定结果（电机5位于最高原点，启停区2直达N2、
+ * 航向+90 deg，底盘固定不动）：
  *   1号圆环：云台 228 deg，齿条绝对伸出 120 mm；
- *   2号圆环：云台保持 K230 方向映射所用的 205 deg，齿条绝对伸出 78 mm；
+ *   2号圆环：云台保持 K230 方向映射所用的 205 deg，旧高位齿条伸出78 mm；
  *   3号圆环：云台 178 deg，齿条绝对伸出 120 mm。
  *
- * ROUGH_SLIDE_POS2_MM 还有第二个关键用途：正式任务经过多轮行驶到达N2后，
- * 会先复现“205 deg + 78 mm”的相机位姿，再根据 K230 的2号圆环偏差平移
- * 底盘，恢复到本次标定时的准确位置。对准完成并收回齿条后，1/2/3号的
- * 放置与取回都直接使用下面的固定值，不再针对1号、3号启动视觉对位。
+ * 重要：正式逻辑现已改成电机5下降ROUGH_VISION_PRE_DROP_MM后识圆，透视
+ * 和圆心像素可能与这组高位结果不同。旧高位复核仍可使用0x80，正式任务
+ * 只使用下面单独保存的低位相机参数和夹爪落点参数。
+ *
+ * 2026-10-23低位实车复测结果（丝杆下降到185 mm观察夹爪中心）：
+ *   K230对准2号圆环：云台205 deg，齿条95 mm；
+ *   夹爪对准1号圆环：云台232 deg，齿条119 mm；
+ *   夹爪对准2号圆环：云台205 deg，齿条 90 mm；
+ *   夹爪对准3号圆环：云台180 deg，齿条110 mm。
+ * 机械设计上相机光心与夹爪中心追求同轴，当前实测也只剩小量误差；但
+ * “相机取像基准”和“夹爪实际落点”仍分别保存。这样以后继续精调其中一项
+ * 时不会连带改变另一项，不能只因二者数值接近就共用同一个宏。
+ *
+ * 三组参数的用途必须严格区分：
+ *   ROUGH_VISION_HIGH_SLIDE_POS2_MM：旧0x80高位识别，仅作历史对照；
+ *   ROUGH_VISION_LOW_SLIDE_POS2_MM ：0x89和正式任务的低位K230取像基准，
+ *                                    当前实车值为95 mm；
+ *   ROUGH_SLIDE_POS1/2/3_MM        ：夹爪下到-185 mm后的真实放置/取回位姿；
+ *                                    2号当前为90 mm，不是相机的95 mm。
+ * 正式任务经过多轮行驶到达N2后，只复现LOW取像参数做底盘纠偏；收回齿条后
+ * 再使用ROUGH_SLIDE_POSn_MM抓放，因此即使仍有小量安装偏差也不会互相覆盖。
  */
-#define ROUGH_CAROUSEL_POS1_DEG          228.0f
-#define ROUGH_CAROUSEL_POS2_DEG          205.0f
-#define ROUGH_CAROUSEL_POS3_DEG          178.0f
+#define ROUGH_VISION_HIGH_SLIDE_POS2_MM    90.0f//旧的高识别伸长量
+#define ROUGH_VISION_LOW_SLIDE_POS2_MM     90.0f
 
-#define ROUGH_SLIDE_POS1_MM              120.0f
-#define ROUGH_SLIDE_POS2_MM               78.0f
-#define ROUGH_SLIDE_POS3_MM              120.0f
+#define ROUGH_CAROUSEL_POS1_DEG          308.0f /* 旧 228.5 → 2193 us */
+#define ROUGH_CAROUSEL_POS2_DEG          273.7f /* 旧 205.0 → 2019 us，K230 方向映射基准 */
+#define ROUGH_CAROUSEL_POS3_DEG          239.5f /* 旧 181.0 → 1841 us */
+
+#define ROUGH_SLIDE_POS1_MM              132.5f
+#define ROUGH_SLIDE_POS2_MM               87.5f//10.23
+#define ROUGH_SLIDE_POS3_MM              128.0f
 
 /*
  * 仅用于 VOFA 手工标定命令 0x86 的安全角度窗口。
  * 正式任务仍只会使用上面的三个固定角；这里在两端各留约 20 deg 调整余量，
- * 既便于实车找中心，也避免误发 0/270 deg 让伸出的夹爪扫过整车。
+ * 既便于实车找中心，也避免误发 0/360 deg 让伸出的夹爪扫过整车。
+ * 窗口随刻度换算（旧 160..250 → ×4/3）。
  */
-#define ROUGH_CAROUSEL_CAL_MIN_DEG       160.0f
-#define ROUGH_CAROUSEL_CAL_MAX_DEG       250.0f
+#define ROUGH_CAROUSEL_CAL_MIN_DEG       213.33f
+#define ROUGH_CAROUSEL_CAL_MAX_DEG       333.33f
 
 /*
- * 暂存区固定圆环的独立位姿（2026-10-17实车标定结果）。
+ * 粗加工区低位落点微调保护。
+ * 丝杆已经下降到放置高度时，允许继续用8C/8D调整1/2/3号圆环。云台舵机
+ * 对很小角度变化不灵敏，因此不限制单次角度差；角度仍受上面的绝对范围
+ * 约束。齿条单条命令最多改变20 mm，更大的改变量应分次执行并观察干涉。
+ */
+#define ROUGH_LOW_CAL_MAX_SLIDE_STEP_MM   20.0f
+
+/*
+ * 暂存区固定圆环的独立位姿。
  *
  * 标定路径为“启停区2 -> 粗加工区2号环视觉校准 -> 暂存区”，先借助固定的
  * 粗加工2号环消除长距离行驶累积误差，再在暂存区确定下列三组水平位姿：
- *   1号：云台230 deg，齿条从机械原点绝对伸出130 mm；
- *   2号：云台205 deg，齿条从机械原点绝对伸出 90 mm；
- *   3号：云台178 deg，齿条从机械原点绝对伸出133 mm。
+ * 2026-10-23暂时以粗加工区最新低位结果作为N4重新标定的基础值
+ *（以下角度同样是 270° 旧刻度记录，宏已 ×4/3 换算）：
+ *   1号：云台232 deg，齿条从机械原点绝对伸出119 mm；
+ *   2号：云台205 deg，夹爪齿条绝对伸出90 mm；
+ *   3号：云台180 deg，齿条从机械原点绝对伸出110 mm。
+ *
+ * 正式逻辑会下降STORAGE_VISION_PRE_DROP_MM后识圆。暂存区也把2号环
+ * “高位相机基准、低位相机基准、夹爪实际落料位姿”拆开保存，原因同粗加工：
+ * 机械设计目标是同轴，但仍给实车的小量安装误差保留独立标定能力。低位相机
+ * 基准先用95 mm，2号夹爪基础值为90 mm；0x87只复核旧高位，0x8A标定正式低位。
  *
  * 第一批与第二批物料落在相同的三个圆环中心，因此两批共用这里的云台角和
  * 齿条伸长量；第二批仅通过位姿中的layer=1叠加竖直高度补偿，不能再为第二批
  * 另改水平参数。第二层高度由MANIP_LAYER_STEP_MM单独标定。
  */
-#define STORAGE_CAROUSEL_POS1_DEG        230.0f
-#define STORAGE_CAROUSEL_POS2_DEG        205.0f
-#define STORAGE_CAROUSEL_POS3_DEG        178.0f
+#define STORAGE_VISION_HIGH_SLIDE_POS2_MM  90.0f
+#define STORAGE_VISION_LOW_SLIDE_POS2_MM   90.0f
 
-#define STORAGE_SLIDE_POS1_MM            130.0f
-#define STORAGE_SLIDE_POS2_MM             90.0f
-#define STORAGE_SLIDE_POS3_MM            133.0f
+#define STORAGE_CAROUSEL_POS1_DEG        308.0f /* 旧 228.5 → 2193 us */
+#define STORAGE_CAROUSEL_POS2_DEG        273.7f /* 旧 205.0 → 2019 us */
+#define STORAGE_CAROUSEL_POS3_DEG        239.5f /* 旧 181.0 → 1841 us */
 
-/* VOFA暂存区手工角度命令的安全窗口；正式任务只使用上面的三个固定值。 */
-#define STORAGE_CAROUSEL_CAL_MIN_DEG     160.0f
-#define STORAGE_CAROUSEL_CAL_MAX_DEG     250.0f
+#define STORAGE_SLIDE_POS1_MM            132.5f
+#define STORAGE_SLIDE_POS2_MM             87.5f//10.23
+#define STORAGE_SLIDE_POS3_MM            128.0f//10.23
+
+/* VOFA暂存区手工角度命令的安全窗口；正式任务只使用上面的三个固定值。
+ * 窗口随刻度换算（旧 160..250 → ×4/3）。 */
+#define STORAGE_CAROUSEL_CAL_MIN_DEG     213.33f
+#define STORAGE_CAROUSEL_CAL_MAX_DEG     333.33f
+
+/*
+ * 暂存区在185 mm放置高度调齿条时的单次改变量上限。调参方式与粗加工区
+ * 一致：云台不限制单次角度差，齿条每条命令最多改变20 mm。
+ */
+#define STORAGE_LOW_CAL_MAX_SLIDE_STEP_MM  20.0f
 
 /* 原料区旧的通用识别预伸量：在取料位2(POS2)姿态下使用
- * （见本文件末尾的 K230_ALIGN_CAROUSEL_ANGLE_DEG），相机装在夹爪上，
+ * （直接使用 CAROUSEL_PICKUP_POS2_DEG），相机装在夹爪上，
  * 所以识别前先把滑台伸到 POS2 的伸出量，让取像距离与识别姿态自洽。
- * 识别前的机械预置顺序固定为「云台先转、滑台后伸」：先把夹爪转到 POS2
- * 并张开，再把滑台伸到这里给的值；两件都就位后才发 detect/place。
+ * 识别前的机械预置分两种节奏：通用/原料区是「云台先转、滑台后伸」，先把
+ * 夹爪转到 POS2 并张开，再把滑台伸到这里给的值；粗加工区/暂存区则把转向
+ * 与前伸并行下发，两者都完成才算就位。不论哪种，两件事都完成后才发
+ * detect/place。
  * 原料区识别结束后不再退回原点：视觉闭环已经把滑台停在相机验证过的
  * 伸出量上，抓取动作直接从该位置下降。粗加工区/暂存区的底盘对位仍会
  * 在视觉完成后由 SlideJogHomeStart() 退回原点。
- * 粗加工区由 SlideJogToRoughAlignStart() 读取 ROUGH_SLIDE_POS2_MM；
- * 暂存区由 SlideJogToStorageAlignStart() 读取 STORAGE_SLIDE_POS2_MM；
+ * 粗加工区由SlideJogToRoughAlignStart()读取ROUGH_VISION_LOW_SLIDE_POS2_MM；
+ * 暂存区由SlideJogToStorageAlignStart()读取STORAGE_VISION_LOW_SLIDE_POS2_MM；
  * 原料区使用 RAW_VISION_SLIDE_START_MM。 */
 #define MANIP_PICKUP_SLIDE_ALIGN_MM      MANIP_PICKUP_SLIDE_POS2_MM
 
@@ -329,7 +417,8 @@
  *
  * Task actions are now connected at N8/N2/N4 through zone_task.c
  * (ZONE_RAW / ZONE_ROUGH / ZONE_STORAGE step programs, see ZONE_*_POSE above).
- * N6 (QR) still uses the 2 s placeholder because the scanner link is not wired.
+ * N6停车等待USART2扫码并通过task_code.c校验后才继续；区域机械位姿仍以
+ * 固定2号圆环做视觉基准，1/2/3目标位由任务码动态选择。
  */
 #define MISSION_ENABLE                       1U
 #define MISSION_CHASSIS_ONLY                 0U
@@ -397,10 +486,10 @@
  * 验证 125 mm 会限制远端物料的对准，因此把软件上限放宽到 160 mm，仍给
  * 机械末端保留约 90 mm 余量。继续增大前要重新检查线束、夹爪和圆盘干涉。
  */
-#define RAW_VISION_SLIDE_MIN_MM                 55.0f
+#define RAW_VISION_SLIDE_MIN_MM                 0.0f
 /* 滑台统一软件绝对位置上限。视觉追踪、VOFA 标定和通用绝对点动都必须遵守；
  * 这是软件保护，不代替机械限位/原点开关。 */
-#define MANIP_SLIDE_SOFT_MAX_MM                160.0f
+#define MANIP_SLIDE_SOFT_MAX_MM                210.0f
 
 /* 保留旧名字供原料区视觉位置环使用，避免同一个物理上限出现两份数值。 */
 #define RAW_VISION_SLIDE_MAX_MM                MANIP_SLIDE_SOFT_MAX_MM
@@ -419,11 +508,11 @@
  *
  * 摄像头装在夹爪上：图像朝向随夹爪旋转，所以 w/a/s/d 只有在夹爪处于
  * 约定姿态时才有确定含义。对位的第一步就是把夹爪转到
- * K230_ALIGN_CAROUSEL_ANGLE_DEG 指定的起始姿态（POS2），转到位之前不发检测
+ * CAROUSEL_PICKUP_POS2_DEG 指定的起始姿态（POS2），转到位之前不发检测
  * 命令。PLACE 保持该角度，DETECT 允许在安全范围内继续转舵机跟踪物料。
- * 这一步现在由上层的视觉预置做掉（ManipulatorAction_SlideJogToAlignStart，
- * 顺序是云台先转、滑台后伸），本模块从 K230Align_StartPreset 进去后不再
- * 重复发初始舵机目标；用同一个宏，两处必须一致。
+ * 这一步现在由上层的视觉预置做掉（ManipulatorAction_SlideJogToXXXAlignStart；
+ * 粗加工区/暂存区是转向与前伸并行，两者都完成才算就位），本模块从
+ * K230Align_StartPreset 进去后不再重复发初始舵机目标；用同一个宏，两处必须一致。
  * 换一个基准姿态必须重推 offset_to_body()。
  *
  * 启动命令按区域分派：
@@ -451,7 +540,16 @@
                                                     * 1/3号随后完全使用 ZONE_ROUGH_POS1/3_POSE，
                                                     * 不再次启动视觉。暂存区目前也沿用位置号2。 */
 //#define K230_ALIGN_MM_PER_PX                0.5f   
-#define K230_ALIGN_TOLERANCE_PX              1U    /* 偏差 <= 此值即认为对准 */
+#define K230_ALIGN_TOLERANCE_PX              1U    /* STM32几何兜底使用的圆形半径容差（px）。
+                                                    * K230的place/grab仍是首选完成信号；STM32只有
+                                                    * 完整收到同一轮X/Y偏差并连续稳定后才会使用本值。 */
+#define K230_ALIGN_STABLE_FRAMES             5U    /* STM32兜底至少连续收到5组完整双轴中心偏差。
+                                                    * 这里数的是不同的新偏差组，不会在主循环里把
+                                                    * 同一组缓存重复累计多次。 */
+#define K230_ALIGN_STABLE_MIN_MS           300U    /* 从第一组合格偏差到兜底完成至少持续300 ms，
+                                                    * 防止高帧率下5组数据在很短时间内瞬间放行。 */
+#define K230_ALIGN_STABLE_MAX_GAP_MS       200U    /* 连续合格组之间允许的最大间隔；超过后从1重新计数，
+                                                    * 防止中途长时间丢圆后沿用旧的稳定次数。 */
 #define K230_ALIGN_MAX_ITER                  255U  /* 微调次数上限：255 是 uint8_t 上限，标定阶段等同于取消次数限制，
                                                     * 不再因为“调了几次”就失败；代价是失去次数兜底。 */
 #define K230_ALIGN_STEP_MAX_MM             100.0f   /* 单次位移钳位，防 mm_per_px 标错时冲过头 */
@@ -459,12 +557,10 @@
                                                     * 就失败”的上限：颜色识别和偏差帧想等多久
                                                     * 就等多久，到点只补发一次命令催一催。
                                                     * 调大=催得慢，调小=催得勤。 */
-#define K230_ALIGN_PAIR_WINDOW_MS            150U  /* 等另一正交轴偏差行的窗口。K230 一帧发两行
-                                                    * （如 d,136.00 / w,102.50），两行到齐就合成为
-                                                    * 一次斜向平移；若某轴偏差恰为 0 而 K230 不发
-                                                    * 那一行，等满这个窗口就按单轴纠偏继续走，免得
-                                                    * 每轮都空等。调大=更愿意等齐（一步到位但每轮慢），
-                                                    * 调小=更容易退化成单轴处理（可能多走一轮）。 */
+#define K230_ALIGN_PAIR_WINDOW_MS            150U  /* 等同一轮另一正交轴偏差行的窗口。当前K230每轮都会
+                                                    * 发送X/Y两行（0偏差也发送），因此缺一轴不能再按0
+                                                    * 使用；超过窗口就丢弃孤立轴并清稳定计数，等待下一组
+                                                    * 完整双轴数据，避免“只收到近中心轴就误判到位”。 */
 #define K230_ALIGN_SETTLE_MS                 0U  /* 底盘/舵机自身报告停稳后，再取新偏差 */
 #define K230_ALIGN_SPEED_MPS               0.12f   /* 视觉微调速度，慢于导航 */
 
@@ -502,12 +598,15 @@
  */
 #define RAW_VISION_STOP_RETRY_MS                100U
 
+/* 输出单位是“云台角度单位”。2026-10-25 云台刻度由 270° 改为 360°，
+ * 同样的物理转角对应的数值变大 4/3，故 Kp/Kd/限幅一起 ×4/3，单像素对应的
+ * 实际机械修正量与改刻度前完全一致。 */
 #define RAW_VISION_ANGLE_SIGN                    1.0f
-#define RAW_VISION_ANGLE_KP                      0.10f
+#define RAW_VISION_ANGLE_KP                      0.1333f /* 旧 0.10 */
 #define RAW_VISION_ANGLE_KI                      0.00f
-#define RAW_VISION_ANGLE_KD                      0.005f
+#define RAW_VISION_ANGLE_KD                      0.0067f /* 旧 0.005 */
 #define RAW_VISION_ANGLE_I_LIMIT_PX_S          200.0f
-#define RAW_VISION_ANGLE_STEP_MAX_DEG            8.0f
+#define RAW_VISION_ANGLE_STEP_MAX_DEG           10.667f /* 旧 8.0 */
 
 #define RAW_VISION_SLIDE_SIGN                    1.0f
 #define RAW_VISION_SLIDE_KP                      0.50f
@@ -529,36 +628,36 @@
  * 识别后滑台先退回原点，正式夹取再重放同一位姿。三块料不再靠底盘逐块
  * 横移区分。
  *
- * 颜色号本该由任务码给出：第一批取第一组、第二批取第三组三位数
- * （见设计文档《智能搬运机器人总体状态机流程设计.md》）；
- * 扫码链未接，先写死。颜色编号：1红 2黄 3蓝 4绿 5黑 6浅蓝。
- * 接入任务码后，把这两组宏换成解析结果即可，zone_task 不改。 */
+ * 正式任务颜色由task_code.c解析：第一批取第一组、第二批取第三组，并校验
+ * 两批包含同一组三种颜色。下面故意用1~6覆盖六色的宏，只供不经过
+ * RobotApp扫码流程的独立识别测试使用，不能当作合法比赛任务码示例。
+ * 颜色编号：1红 2黄 3蓝 4绿 5黑 6浅蓝。 */
 #define K230_RAW_ALIGN_B1_COLOR_1            1U    /* 第一批第1块要找的颜色 */
 #define K230_RAW_ALIGN_B1_COLOR_2            2U    /* 第一批第2块 */
 #define K230_RAW_ALIGN_B1_COLOR_3            3U    /* 第一批第3块 */
-#define K230_RAW_ALIGN_B2_COLOR_1            4U    /* 第二批第1块：绿色；不再重复抓第一批的红色 */
-#define K230_RAW_ALIGN_B2_COLOR_2            5U    /* 第二批第2块：黑色；不再重复抓第一批的黄色 */
-#define K230_RAW_ALIGN_B2_COLOR_3            6U    /* 第二批第3块：浅蓝；不再重复抓第一批的蓝色 */
+#define K230_RAW_ALIGN_B2_COLOR_1            4U    /* 独立六色识别测试第4块：绿色 */
+#define K230_RAW_ALIGN_B2_COLOR_2            5U    /* 独立六色识别测试第5块：黑色 */
+#define K230_RAW_ALIGN_B2_COLOR_3            6U    /* 独立六色识别测试第6块：浅蓝 */
 
 /*
  * 第二轮暂存区在2号位做底盘联合定位时，数字2已经被第一层物料遮住，不能再
- * 依赖数字识别。第一批固定按1/2/3号颜色放到1/2/3号位，因此2号位第一层是
- * K230_RAW_ALIGN_B1_COLOR_2（当前为黄色2）。K230用它只确认“哪个框是2号位”，
+ * 依赖数字识别。正式任务会按二维码第二组查出2号位第一层的实际颜色；K230
+ * 用它只确认“哪个框是2号位”，
  * 随后仍以该位外层圆环的圆心计算偏差；物料自身有少量放偏不会成为定位基准。
- * 将来接入二维码并重排第一批颜色时，只需把本宏同步到“第一层2号位颜色”。
+ * 下面的宏同样只保留给未装载任务码的独立调试。
  */
 #define K230_STORAGE_STACK_ANCHOR_COLOR      K230_RAW_ALIGN_B1_COLOR_2
 
-/* 对位起始时夹爪的统一朝向：识别前一律先转到取料位2（POS2）。
+/* 对位起始时夹爪的统一朝向直接使用 CAROUSEL_PICKUP_POS2_DEG。
  * 原料区、粗加工区、暂存区都用这一个姿态——识别阶段不靠转夹爪区分目标，
  * K230 只按颜色号/位置号去找。原料区随后可在安全范围内跟踪并沿用动态角度；
  * 粗加工区/暂存区夹取时才各自转 ZONE_ROUGH_/ZONE_STORAGE_POSn_POSE 里的
- * carousel_deg。三个取料位约差 65°，POS2 居中，识别位选它视野覆盖最均。
- * 注意：换掉这个姿态必须重推 k230_align.c 的 offset_to_body()，
- * 因为 w/a/s/d 是在这个姿态下定义的。 */
-#define K230_ALIGN_CAROUSEL_ANGLE_DEG       CAROUSEL_PICKUP_POS2_DEG
+ * carousel_deg。三个取料位跨度约 84°，POS2 居中，识别位选它视野覆盖最均。
+ * 注意：修改 CAROUSEL_PICKUP_POS2_DEG 必须重推 k230_align.c 的
+ * offset_to_body()，因为 w/a/s/d 是在这个姿态下定义的。 */
 /* 等夹爪转到位并张开；舵机无位置反馈，到时即继续。
- * 两处用同一个值、同一个动作：manipulator_action.c 的视觉预置（云台先转）
+ * 两处用同一个值、同一个动作：manipulator_action.c 的视觉预置（等云台转到位；
+ * 粗加工区/暂存区并行预置里它还是「滑台已到、舵机还没 DONE」的兜底超时）
  * 和 k230_align.c 的 ROTATE（K230Align_Start 自己转云台时）。 */
 #define K230_ALIGN_ROTATE_TIMEOUT_MS        2500U
 

@@ -18,7 +18,7 @@ static uint32_t s_now;
 static uint32_t s_events;
 static float s_slide_mm = RAW_VISION_SLIDE_START_MM;
 static float s_slide_target_mm = RAW_VISION_SLIDE_START_MM;
-static float s_carousel_target_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+static float s_carousel_target_deg = CAROUSEL_PICKUP_POS2_DEG;
 static int s_slide_busy;
 static int s_slide_error;
 static int s_carousel_done = 1;
@@ -119,7 +119,7 @@ int main(void)
                       RAW_VISION_SLIDE_START_MM + 10.0f, 0.01f),
           "Positive radial pixels extend the slide by PID output");
     check(nearf_local(s_carousel_target_deg,
-                      K230_ALIGN_CAROUSEL_ANGLE_DEG + 1.0f, 0.01f),
+                      CAROUSEL_PICKUP_POS2_DEG + 1.333f, 0.01f),
           "Positive tangential pixels increase carousel angle");
 
     s_slide_mm = s_slide_target_mm;

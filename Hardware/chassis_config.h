@@ -131,12 +131,24 @@
  *   MOTION_CAL_Y_NEG_TO_THETA = -(-0.5*pi/180)/0.45 = +0.0194
  *   （命令正 theta 即 CCW 自转抵消 CW 漂移）。
  *
+ * 2026-10-27 复测（VOFA 0x40/0x41 各 0.9 m，2.20 m/s / acc150，3 次平均）：
+ *   前进：+2.0 deg（CCW 左偏），即 2.22 deg/m
+ *     MOTION_CAL_Y_POS_TO_THETA = -(2.0*pi/180)/0.9 = -0.0388
+ *   后退：-1.6 deg（CW 右偏），即 1.78 deg/m
+ *     MOTION_CAL_Y_NEG_TO_THETA = +(1.6*pi/180)/0.9 = +0.0310
+ *   两者方向相反、量级接近，符合“左右轮有效行程差”的几何失配特征
+ *   （0.9 m 上等效左右差约 4.5~5.4 mm，即 0.5~0.6%）。
+ *   10-15 曾把这组前馈清零，清零后裸漂移就是这个量级，因此恢复前馈。
+ *   注意：本次标定工况是 VOFA 的 2.20 m/s / acc150（0.9 m 内实际峰值约
+ *   0.83 m/s）；导航边是 0.8 m/s / acc100，峰值约 0.66 m/s。若任务中仍残差
+ *   明显，按导航工况复测后再微调。
+ *
  * 车体坐标约定：+theta = CCW，-theta = CW。
  */
 //#define MOTION_CAL_Y_POS_TO_THETA          (-0.0349f)
 //#define MOTION_CAL_Y_NEG_TO_THETA          (0.0194f)
-#define MOTION_CAL_Y_POS_TO_THETA  (0.0f)
-#define MOTION_CAL_Y_NEG_TO_THETA  (0.0f)
+#define MOTION_CAL_Y_POS_TO_THETA  (-0.0388f) /* 2026-10-27：前进 0.9 m 左偏 2° */
+#define MOTION_CAL_Y_NEG_TO_THETA  (0.0310f)  /* 2026-10-27：后退 0.9 m 右偏 1.6° */
 /*
  * 横移 -> 偏航串扰补偿，单位 rad(theta correction) / m(strafe command)。
  *

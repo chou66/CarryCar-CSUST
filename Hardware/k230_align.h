@@ -19,10 +19,12 @@
  *
  * 常规入口按「云台姿态由谁摆」二选一，不要混用：
  *   K230Align_Start()       本模块自己转云台并张开夹爪，再去取像。
- *   K230Align_StartPreset() 上层已经用 ManipulatorAction_SlideJogToAlignStart()
- *                           把云台转到识别姿态并张开（识别前那一段是
- *                           「云台先转、滑台后伸」，见 manipulator_action.h），
- *                           这里不再动舵机，只清残帧、发命令、开始纠偏。
+ *   K230Align_StartPreset() 上层已经用 ManipulatorAction_SlideJogToXXXAlignStart()
+ *                           把云台转到识别姿态并张开、滑台伸到识别位
+ *                           （粗加工区/暂存区是「转向与前伸并行、都完成才就位」，
+ *                           原料区/通用是「云台先转、滑台后伸」，见
+ *                           manipulator_action.h），这里不再动舵机，
+ *                           只清残帧、发命令、开始纠偏。
  *   K230Align_StartStackPreset() 是第二轮暂存区的预置入口，机械前提与
  *                           StartPreset相同，另外携带第一层物料颜色做身份锚点。
  * 当前只有 robot_app 的粗加工区/暂存区放置对位走 StartPreset；原料区
@@ -34,7 +36,7 @@
  *
  * 摄像头装在夹爪上，图像朝向随夹爪旋转，所以必须先转到调用方给的
  * carousel_deg 姿态，之后的 w/a/s/d 才有确定含义。当前约定识别阶段
- * 一律先转取料位2（K230_ALIGN_CAROUSEL_ANGLE_DEG），本模块对位期间保持
+ * 一律先转取料位2（CAROUSEL_PICKUP_POS2_DEG），本模块对位期间保持
  * 该姿态；原料区动态云台跟踪在 raw_material_align.c 中实现。
  * 同一步还要张开夹爪（合拢的夹爪会挡住摄像头），张开度取
  * GripperServo_Open_Large()，与取料姿态一致。
@@ -43,10 +45,11 @@
  * 收工条件按模式分：
  *   DETECT（原料区）：先等 K230 报回目标颜色（整行一个字符 1~6），颜色对了
  *     才开始用偏差帧纠偏；颜色确认之前进来的偏差帧不消费、grab 也不算数。
- *     收工两条路——偏差进入容差，或收到 grab；达成其一即发 stop，收到
- *     stopped 确认后才 DONE。
+ *     收工两条路——完整双轴偏差连续稳定进入容差，或收到 grab；达成其一即
+ *     发 stop，收到 stopped 确认后才 DONE。
  *   PLACE（粗加工区/暂存区）：K230 不报颜色，直接用偏差帧纠偏。
- *     收工两条路——偏差进入容差，或收到 place；同样等 stopped 后才 DONE。
+ *     收工两条路——完整双轴偏差连续稳定进入容差，或收到 place；同样等
+ *     stopped 后才 DONE。STM32不会把缺失轴当0，也不会重复累计同一组缓存。
  *   STACK（第二轮暂存区）：先等匹配的 target,<位置号>，才接受偏差；K230用
  *     第一层物料颜色选择目标外圆，但偏差仍由外圆产生。最终只接受带匹配
  *     位置号的 place,<位置号>，不会因为邻近圆环误检而提前收工。
@@ -101,7 +104,7 @@ typedef enum
  * 不必再从 state/error/grab 几个量反推。由 K230Align_Start() 清成 NONE。
  */
 #define K230_ALIGN_EXIT_NONE       0U  /* 尚未结束（对位进行中或刚启动） */
-#define K230_ALIGN_EXIT_TOLERANCE  1U  /* 偏差 <= 容差，正常收工 */
+#define K230_ALIGN_EXIT_TOLERANCE  1U  /* 完整双轴偏差连续稳定进入容差，正常收工 */
 #define K230_ALIGN_EXIT_GRAB       2U  /* DETECT 收到 grab，正常收工（要求颜色已确认） */
 #define K230_ALIGN_EXIT_PLACE      3U  /* PLACE 收到 place，正常收工 */
 #define K230_ALIGN_EXIT_FAIL       4U  /* align_fail()：原因看 robot_k230_align_error */
@@ -121,6 +124,10 @@ extern volatile char     robot_k230_align_last_dir;
 extern volatile int32_t  robot_k230_align_last_px;
 extern volatile int32_t  robot_k230_align_px_x;   /* 本轮合成用的 ±X 像素偏差，带符号 */
 extern volatile int32_t  robot_k230_align_px_y;   /* 本轮合成用的 ±Y 像素偏差，带符号 */
+extern volatile uint8_t  robot_k230_align_stable_samples; /* 当前连续合格双轴组数 */
+extern volatile uint32_t robot_k230_align_stable_ms; /* 当前连续合格持续时间 */
+extern volatile uint16_t robot_k230_align_complete_pairs; /* 本次任务已消费的完整双轴组数 */
+extern volatile uint16_t robot_k230_align_dropped_axes; /* 超时/错帧而丢弃的孤立轴数 */
 extern volatile uint16_t robot_k230_align_stop_requests; /* stop发送次数；>1表示发生重试 */
 extern volatile uint16_t robot_k230_align_stop_tx_failures; /* K230_Stop返回非HAL_OK的次数 */
 extern volatile uint32_t robot_k230_align_stop_wait_ms; /* 当前/最终等待stopped的毫秒数 */
@@ -138,7 +145,7 @@ void K230Align_Init(Chassis *chassis);
  *                    模式为 PLACE/STACK 时是位置号 1~3
  * @param carousel_deg 对位时夹爪旋转舵机的目标角度。摄像头装在夹爪上，
  *                    这个值决定图像朝向；识别阶段一律传
- *                    K230_ALIGN_CAROUSEL_ANGLE_DEG（取料位2），换掉必须重推
+ *                    CAROUSEL_PICKUP_POS2_DEG（取料位2），换掉必须重推
  *                    k230_align.c 的 offset_to_body()。
  * @return false 表示参数非法或当前正在对位；此时不改变任何状态。
  */

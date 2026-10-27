@@ -556,6 +556,16 @@
               <FilePath>..\Hardware\qr_scanner.c</FilePath>
             </File>
             <File>
+              <FileName>task_code.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Hardware\task_code.c</FilePath>
+            </File>
+            <File>
+              <FileName>task_code.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Hardware\task_code.h</FilePath>
+            </File>
+            <File>
               <FileName>app_uart.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Hardware\app_uart.c</FilePath>

@@ -5,6 +5,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/*
+ * 舵机运行时标定参数
+ * ------------------
+ * 这几个变量故意不声明为 const，并增加 volatile：
+ * 1. 可在 Keil Debug 的 Watch 窗口中直接修改角度，无需反复编译、下载；
+ * 2. volatile 可确保正式动作每次执行时都从 RAM 重新读取调试后的数值；
+ * 3. 变量只在本次上电期间有效，复位后会恢复 robot_config.h 中的默认宏值。
+ *
+ * 调试时请在机械机构停止后修改，避免舵机运动过程中改变目标角度造成碰撞。
+ */
+extern volatile float g_carousel_place_deg;       /* 云台抓取后转向物料盘的放料角度 */
+extern volatile float g_tray_slot_deg[];          /* [0]/[1]/[2] 分别对应物料盘1/2/3号位 */
+
 void CarouselServo_Update(uint32_t now_ms);
 bool CarouselServo_IsBusy(void);
 bool CarouselServo_IsDone(void);

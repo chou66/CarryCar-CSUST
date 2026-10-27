@@ -16,16 +16,23 @@
  * 特殊流程收在一起，避免主任务状态机继续膨胀：
  *
  *   N8航向已对准
- *       -> DOCKING：机械臂确认收回后，车体 +X 固定靠近 40 mm
+ *       -> DOCKING：机械臂确认收回后，车体 +X 固定靠近 40 mm，并在同一
+ *                    窗口启动滑台前伸到原料识别位（两者并行）
  *       -> DOCK_SETTLE：等待底盘停稳
+ *       -> WAIT_PRESLIDE：等并行的滑台前伸到位（通常已提前完成）
  *       -> START/RUN_ZONE：启动 ZoneTask，完成三次“识别—抓取—放料盘”
  *       -> UNDOCKING：再次确认机械臂在原点，车体 -X 固定退回 40 mm
  *       -> UNDOCK_SETTLE
  *       -> DONE：RobotApp 再用原有航向 PD 校正，然后规划下一条边
  *
  * 为什么仍保留固定底盘停靠：它只在整批任务前后各运动一次，位移可逆；三块
- * 物料之间的跟踪全部交给云台和滑台，避免逐块横移误差累积。任何机械臂动作
- * 未结束、滑台不在原点或位置基准失效时，都禁止移动底盘。
+ * 物料之间的跟踪全部交给云台和滑台，避免逐块横移误差累积。
+ *
+ * 停靠与滑台前伸为什么可以同时进行：RAW_VISION_SLIDE_START_MM 已经把车体
+ * 靠近的 RAW_DOCK_BODY_X_M 从齿条伸出量里扣除，两项在世界坐标中互相抵消。
+ * 同时运动时相机相对圆盘的径向位置从 0 单调走向旧版 115 mm 取像位，
+ * 不会越过已经跑通的取像距离；除此之外的任何“机械臂动作未结束/滑台不在
+ * 原点”仍然禁止移动底盘。
  *
  * 调用/更新关系：RobotApp 每个主循环先更新 ManipulatorAction、
  * RawMaterialAlign、ZoneTask，再更新本模块。因此本模块只观察和启动子任务，
@@ -73,6 +80,15 @@ static void task_fail(uint8_t error)
         chassis_motion_stop(s_chassis);
     }
 
+    /*
+     * 停靠平移窗口里可能还有正在进行的滑台前伸：它不是 ZoneTask 的子任务，
+     * 必须在这里单独收掉，否则错误状态下车还在走、齿条还在伸。
+     */
+    if (ManipulatorAction_SlideJogIsBusy())
+    {
+        ManipulatorAction_Abort();
+    }
+
     if (ZoneTask_IsBusy())
     {
         ZoneTask_Abort();
@@ -115,6 +131,18 @@ bool RawStationTask_Start(uint8_t batch, uint32_t now_ms)
     robot_raw_station_docked = 0U;
 
 #if RAW_DOCK_ENABLE
+    /*
+     * 视觉识别前必须先把齿条伸到识别位。这里把它和车体 +X 停靠平移放到
+     * 同一个窗口一起启动：滑台只动电机6，底盘只动四个轮电机，两者互不
+     * 抢轴；相机相对圆盘的径向位置由“车体靠近量 + 齿条伸出量”共同决定，
+     * 而 RAW_VISION_SLIDE_START_MM 已扣掉 RAW_DOCK_BODY_X_M，因此并行
+     * 过程中始终不超过旧版直接伸到 115 mm 的取像位。
+     *
+     * 启动失败不在这里判错：到站后 ZoneTask 的 SLIDE_OUT 仍会按原流程
+     * 重新前伸，只是退回串行、多花一点时间。
+     */
+    (void)ManipulatorAction_SlideJogToRawAlignStart();
+
     chassis_motion_move_x(s_chassis,
                           RAW_DOCK_BODY_X_M,
                           RAW_DOCK_SPEED_MPS,
@@ -150,6 +178,23 @@ void RawStationTask_Update(uint32_t now_ms)
 
         case RAW_STATION_DOCK_SETTLE:
             if ((int32_t)(now_ms - s_deadline_ms) >= 0)
+            {
+                enter_state(RAW_STATION_WAIT_PRESLIDE);
+            }
+            break;
+
+        /*
+         * 停靠窗口里并行启动的滑台前伸可能比底盘停靠慢（云台预转的
+         * 舵机稳定时间占大头），这里只等它收尾；已经到位时本状态一帧通过。
+         * 失败则必须报错：滑台半路停住后位置基准作废，继续跑 ZoneTask
+         * 只会在 SLIDE_OUT 处再失败一次，不如在这里冻结现场。
+         */
+        case RAW_STATION_WAIT_PRESLIDE:
+            if (ManipulatorAction_SlideJogHasError())
+            {
+                task_fail(RAW_STATION_ERROR_PRESLIDE);
+            }
+            else if (!ManipulatorAction_SlideJogIsBusy())
             {
                 enter_state(RAW_STATION_START_ZONE);
             }
@@ -231,6 +276,10 @@ void RawStationTask_Abort(void)
     if (s_chassis != NULL)
     {
         chassis_motion_stop(s_chassis);
+    }
+    if (ManipulatorAction_SlideJogIsBusy())
+    {
+        ManipulatorAction_Abort();
     }
     if (ZoneTask_IsBusy())
     {

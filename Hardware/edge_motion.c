@@ -9,8 +9,14 @@
 /*
  * 平移加速度、死区和稳停时间继承 VOFA 导航实车调试值；
  * 航向纠偏已升级为独立 PD 控制层，不再使用固定 20 RPM。
+ *
+ * 平移加速度现设为 0：EMM42 的 acc=0 表示不做加减速斜坡，收到速度指令
+ * 立即按目标转速运行（见 chassis.c 里 estimate_position_timeout_ms 的说明，
+ * acc=0 时定位超时也不计斜坡时间）。因此起步/停止没有缓冲，速度值本身
+ * 必须保持保守（ROUTE_EDGE_SPEED_MPS 现为 120 rpm）。
+ * 原地转向仍用 robot_config.h 的 ROUTE_TURN_ACC。
  */
-#define EDGE_MOTION_MOVE_ACC                   100U
+#define EDGE_MOTION_MOVE_ACC                   130U
 #define EDGE_MOTION_YAW_DEADBAND_DEG          0.50f
 #define EDGE_MOTION_YAW_CORRECT_MAX_RPM         80U
 #define EDGE_MOTION_YAW_CORRECT_MIN_RPM          8U

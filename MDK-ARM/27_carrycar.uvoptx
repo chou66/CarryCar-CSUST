@@ -113,7 +113,7 @@
         <tDllPa />
         <tDlgDll />
         <tDlgPa />
-        <tIfile>C:\Users\Lin\Desktop\CarryCar_MIX2_10.17\CarryCar_MIX2\debug_watch.ini</tIfile>
+        <tIfile>C:\Users\wangshu\Desktop\CarryCar_MIX2_10.23\CarryCar_MIX2_10.23\CarryCar_MIX2\debug_watch.ini</tIfile>
         <pMon>BIN\CMSIS_AGDI.dll</pMon>
       </DebugOpt>
       <TargetDriverDllRegistry>

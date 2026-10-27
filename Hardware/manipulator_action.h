@@ -118,11 +118,14 @@ typedef enum
     MANIP_GROUND_TO_TRAY_CLOSE,
     MANIP_GROUND_TO_TRAY_WAIT_CLOSE,
 
-		/* 电机5先上升回最高原点。 */
+		/* 电机5上升回最高原点，同时电机6后缩回原点（并行）。 */
 		MANIP_GROUND_TO_TRAY_RETURN_GIMBAL,
 		MANIP_GROUND_TO_TRAY_WAIT_RETURN_GIMBAL,
-		
-		/* 电机5到位后，电机6再后缩回原点。 */
+
+		/*
+		 * 保留顺序回缩状态值：并行化后不再进入，仅作实车干涉时的回退路径。
+		 * 进入本状态仍是“电机5到位后电机6再后缩”。
+		 */
 		MANIP_GROUND_TO_TRAY_RETRACT_SLIDE,
 		MANIP_GROUND_TO_TRAY_WAIT_RETRACT_SLIDE,
 
@@ -170,11 +173,14 @@ typedef enum
     MANIP_TRAY_TO_GROUND_OPEN,
     MANIP_TRAY_TO_GROUND_WAIT_OPEN,
 
-		/* 电机5先上升回最高原点。 */
+		/* 电机5上升回最高原点，同时电机6后缩回原点（并行）。 */
 		MANIP_TRAY_TO_GROUND_FINAL_RETURN_GIMBAL,
 		MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETURN_GIMBAL,
-		
-		/* 电机5到位后，电机6再后缩回原点。 */
+
+		/*
+		 * 保留顺序回缩状态值：并行化后不再进入，仅作实车干涉时的回退路径。
+		 * 进入本状态仍是“电机5到位后电机6再后缩”。
+		 */
 		MANIP_TRAY_TO_GROUND_FINAL_RETRACT_SLIDE,
 		MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETRACT_SLIDE,
 
@@ -197,13 +203,21 @@ typedef enum
  *   MANIP_JOG_IDLE   未在动作
  *   MANIP_JOG_ROTATE 先转云台：夹爪转到识别姿态并张开，等舵机到位
  *   MANIP_JOG_MOVE   滑台指令已发出（等下一个 Update 切进 WAIT）
- *   MANIP_JOG_WAIT   等滑台到位
+ *   MANIP_JOG_WAIT   等滑台到位（并行预置时同时等两路舵机 DONE）
  *   MANIP_JOG_LOWER  滑台已到识别位，等电机5下降到预取像高度
  *   MANIP_JOG_RAISE  回原点前，等电机5先抬回最高原点
+ *   MANIP_JOG_HEIGHT 低位标定时，电机5在“取像高度”和“实际放置高度”之间
+ *                    单独升降；该状态绝不移动滑台和云台
  *   MANIP_JOG_DONE   到位
  *   MANIP_JOG_ERROR  发送失败 / 超时 / 堵转保护
  *
- * 只有「伸到识别位」那一段会先走 ROTATE（云台先转、滑台后伸）；
+ * 「伸到识别位」那一段有两种节奏：
+ *   - 并行（粗加工区/暂存区）：云台/夹爪指令与滑台前伸同一帧下发，滑台
+ *     电机6和舵机同时动；WAIT 除了等滑台到位，还要等两路舵机 DONE
+ *     （或 K230_ALIGN_ROTATE_TIMEOUT_MS 兜底），两件事都完成才算 DONE，
+ *     因此上层 IsDone() 之后才发 K230 detect，识别不会提前。
+ *   - 串行（原料区/通用点动）：先走 ROTATE（云台先转、滑台后伸）。原料区
+ *     的串行开销已被停靠平移窗口掩盖，且“先转再伸”是那里验证过的安全次序。
  * 「退回原点」不动云台，直接从 MOVE 开始。
  * 粗加工区/暂存区带 ROUGH_/STORAGE_VISION_PRE_DROP_MM 时，WAIT 到位后
  * 再走 LOWER；带预下降的回原点则先走 RAISE 抬回最高点，再回缩滑台。
@@ -219,7 +233,8 @@ typedef enum
     /* 追加在末尾，保持前面所有枚举值不变。 */
     MANIP_JOG_ROTATE,
     MANIP_JOG_LOWER,
-    MANIP_JOG_RAISE
+    MANIP_JOG_RAISE,
+    MANIP_JOG_HEIGHT
 } ManipulatorSlideJogState_t;
 
 /*
@@ -317,6 +332,19 @@ bool ManipulatorAction_StartToTrayFromAlignedPose(const ManipPose_t *pickup_pose
 
 bool ManipulatorAction_StartTrayToGroundAtPose(const ManipPose_t *place_pose);
 
+/*
+ * 同上两个入口，但跳过动作开头的“云台转到外部端角度 + 张开夹爪”舵机段。
+ *
+ * 仅当调用方已经直接把同一组目标下发给 CarouselServo / GripperServo，
+ * 并确认 CarouselServo_IsDone() && GripperServo_IsDone() 后使用。
+ * ZoneTask 在转动料盘选择舵机的同一时刻下发云台与夹爪目标，让料盘和
+ * 云台并行转动；等待两者都到位后才从电机运动段开始，动作本身不变。
+ *
+ * 参数校验失败时与普通入口一样返回 false 且不改变任何状态。
+ */
+bool ManipulatorAction_StartToTrayAtPosePrepared(const ManipPose_t *pickup_pose);
+bool ManipulatorAction_StartTrayToGroundAtPosePrepared(const ManipPose_t *place_pose);
+
 void ManipulatorAction_Update(uint32_t now_ms);
 void ManipulatorAction_Abort(void);
 
@@ -324,9 +352,12 @@ void ManipulatorAction_Abort(void);
  * 视觉预置、位置点动与回退：给视觉识别腾出取像位姿与取像距离。
  *
  * 相机装在夹爪上，识别统一在取料位2(POS2)姿态下做，所以识别之前要先把
- * 两件事按顺序做完（顺序不能换）：
- *   1) 云台先转——夹爪转到识别姿态 POS2 并张开。夹爪在缩回状态下回转，
+ * 下面几件事做完：
+ *   1) 云台转——夹爪转到识别姿态 POS2 并张开。
+ *      原料区/通用点动保持「云台先转、滑台后伸」，夹爪在缩回状态下回转，
  *      比在伸出 95mm 后再转更不容易和外围干涉。
+ *      粗加工区/暂存区改成并行：云台/夹爪与滑台前伸同一帧下发，
+ *      两件事都完成才算就位（详见 ManipulatorSlideJogState_t 的说明）。
  *   2) 滑台后伸——通用识别伸到 POS2 的伸出量；原料区停靠后使用
  *      RAW_VISION_SLIDE_START_MM（已扣除底盘靠近量），
  *      让取像距离与识别姿态自洽。
@@ -349,11 +380,11 @@ void ManipulatorAction_Abort(void);
  * 启动条件不满足时返回 false 且不改变任何状态：
  *   SlideJogToAlignStart —— 暂存区通用识别预置
  *   SlideJogToRoughAlignStart —— 粗加工区2号参考环预置，使用实车标定的
- *                                ROUGH_SLIDE_POS2_MM，滑台到位后预下降
- *                                ROUGH_VISION_PRE_DROP_MM
+ *                                ROUGH_VISION_LOW_SLIDE_POS2_MM；云台转向与滑台前伸
+ *                                同时开始，两者都完成后预下降 ROUGH_VISION_PRE_DROP_MM
  *   SlideJogToStorageAlignStart —— 暂存区2号参考环预置，使用独立的
- *                                  STORAGE_SLIDE_POS2_MM，滑台到位后预下降
- *                                  STORAGE_VISION_PRE_DROP_MM
+ *                                  STORAGE_VISION_LOW_SLIDE_POS2_MM；云台转向与滑台前伸
+ *                                  同时开始，两者都完成后预下降 STORAGE_VISION_PRE_DROP_MM
  *   SlideJogToRawAlignStart —— 原料停靠后的补偿预伸
  *   SlideJogToPositionStart —— 当前位置可信，走到新的绝对目标
  *   SlideJogHomeStart       —— 从当前可信的非零位置回原点；若此前做过
@@ -367,10 +398,64 @@ void ManipulatorAction_Abort(void);
  * 主动作与本状态机互斥：预置进行中 start 主动作会返回 false，反之亦然。
  */
 bool ManipulatorAction_SlideJogToAlignStart(void);
+
+/*
+ * ==================== 高位识别兼容接口 ====================
+ * 仅供保留的旧VOFA标定流程使用：云台转到2号参考角、滑台伸到对应区域的
+ * 2号长度，但电机5保持在最高原点，不执行视觉预下降。
+ * 正式比赛流程不要调用这两个接口，正式流程继续使用下面不带High的低位接口。
+ */
+bool ManipulatorAction_SlideJogToRoughAlignHighStart(void);
+bool ManipulatorAction_SlideJogToStorageAlignHighStart(void);
+
+/*
+ * ==================== 低位识别正式接口 ====================
+ * 云台/夹爪就位、滑台伸到2号参考长度后，再让电机5下降到预取像高度。
+ * 下降量分别取ROUGH_VISION_PRE_DROP_MM和STORAGE_VISION_PRE_DROP_MM。
+ */
 bool ManipulatorAction_SlideJogToRoughAlignStart(void);
 bool ManipulatorAction_SlideJogToStorageAlignStart(void);
 bool ManipulatorAction_SlideJogToRawAlignStart(void);
+
+/*
+ * 低位手工标定专用：保持调用方已经选好的1/2/3号云台角，只把滑台移动到
+ * target_mm，确认滑台到位后再下降电机5 pre_drop_mm。
+ * 与正式2号预置不同，本接口不会强制把云台改回205度，也不会再次开夹爪。
+ * 低位已经生效后继续微调滑台应改用SlideJogToPositionStart()；结束时必须用
+ * SlideJogHomeStart()，由它先抬回最高点，再把滑台收回软件0 mm。
+ */
+bool ManipulatorAction_SlideJogToVisionPositionStart(float target_mm,
+                                                      float pre_drop_mm);
+
+/*
+ * 低位标定的垂直位置验证接口。
+ *
+ * target_drop_mm 是“从电机5最高机械原点累计向下”的绝对距离，必须为正数：
+ *   100.0 -> 回到当前粗加工/暂存区的低位取像高度；
+ *   125.0 -> 当前配置下暂存区第二层放置高度；
+ *   185.0 -> 当前配置下粗加工/暂存区第一层实际放置高度。
+ *
+ * 本接口只允许在滑台已经伸到可信识别位置、且电机5已经做过低位预下降时
+ * 使用。内部把绝对目标换算成相对位移，因此可反复在100/125/185 mm之间
+ * 切换；到位后会更新视觉下降量，保证0x84仍能先完整抬回最高点再收滑台。
+ * 允许的最大下降量由-MANIP_PICKUP_GROUND_MM限制，避免调试帧越过正式地面
+ * 放置高度。云台、夹爪和滑台在该动作中保持不动。
+ */
+bool ManipulatorAction_SlideJogToVisionDropStart(float target_drop_mm);
 bool ManipulatorAction_SlideJogToPositionStart(float target_mm);
+
+/*
+ * 低位标定专用的两个分轴动作：
+ *   RaiseGimbalOnlyStart：只把电机5从当前累计下降量抬回最高原点，齿条
+ *                         保持当前伸长位置；
+ *   RetractSlideOnlyStart：只把电机6齿条收回软件0 mm，要求电机5已经
+ *                          位于最高原点。
+ *
+ * 原SlideJogHomeStart仍保留，表示“先抬丝杆、再收齿条”的组合安全回收。
+ * 分轴接口用于实车标定时逐步验证动作，不能绕过位置可信和忙状态互锁。
+ */
+bool ManipulatorAction_SlideJogRaiseGimbalOnlyStart(void);
+bool ManipulatorAction_SlideJogRetractSlideOnlyStart(void);
 bool ManipulatorAction_SlideJogHomeStart(void);
 
 /*
@@ -409,6 +494,46 @@ extern volatile uint8_t robot_manip_slide_position_valid;
 /* 视觉预下降镜像：drop_mm 负数=比最高原点低，applied=1 表示尚未抬回。 */
 extern volatile float robot_manip_vision_drop_mm;
 extern volatile uint8_t robot_manip_vision_drop_applied;
+
+/*
+ * ==================== 行驶途中的机械预置（多步并行） ====================
+ *
+ * 正式任务在“上一段作业刚收尾、底盘还没起步”的那一刻调用本接口，把下一次
+ * 作业要用的料盘槽位、云台识别角和夹爪张开量提前摆好，让舵机与底盘运动
+ * 并行：
+ *
+ *   只动三路舵机（料盘选择、云台、夹爪），不伸齿条、不下降电机5。
+ *
+ * 这样做的安全性来自现有动作收尾约定：每一段区域动作结束时齿条都已回到
+ * 原点、电机5都在最高机械原点（见 MANIP_GROUND_TO_TRAY_WAIT_RETURN_GIMBAL /
+ * MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETURN_GIMBAL），夹爪是在
+ * 收回且抬高的状态下回转，不会扫到料盘或场地结构。
+ *
+ * 云台角固定取 CAROUSEL_PICKUP_POS2_DEG，与 SlideJogToXXXAlignStart() 到站
+ * 后下发的目标完全一致。后者的 MANIP_JOG_ROTATE 阶段重新下发同一目标时，
+ * 舵机若已在位只会重新走一次 150 ms 稳定确认（CarouselServo_SetUs /
+ * GripperServo_SetUs 在 current==target 时直接进 SETTLING），随后立刻伸齿条，
+ * 因而省掉了“停车后才开始转云台”的那段时间。
+ *
+ * 启动条件不满足时返回 false 且不改变任何状态；预置失败绝不让任务失败——
+ * 到站后的原有流程本身会把同样的姿态摆好，只是慢一些。
+ */
+bool ManipulatorAction_PrepositionForNextZone(uint8_t tray_slot);
+
+/*
+ * 预置结果镜像（非 static 全局，Keil Watch 直接输名字即可）：
+ *   robot_manip_preposition_result  最近一次预置的结果码 MANIP_PREPOSITION_xxx
+ *   robot_manip_preposition_slot    最近一次预置成功的料盘槽位 0..2
+ * 上电默认 NONE / 0xFF。
+ */
+#define MANIP_PREPOSITION_NONE      0U  /* 本次上电还没预置过 */
+#define MANIP_PREPOSITION_OK        1U
+#define MANIP_PREPOSITION_BUSY      2U  /* 主动作或滑台点动未结束 */
+#define MANIP_PREPOSITION_NOT_HOME  3U  /* 齿条不在原点，禁止回转 */
+#define MANIP_PREPOSITION_PARAM     4U  /* 槽位或云台角非法 */
+
+extern volatile uint8_t robot_manip_preposition_result;
+extern volatile uint8_t robot_manip_preposition_slot;
 
 bool ManipulatorAction_IsBusy(void);
 bool ManipulatorAction_IsDone(void);

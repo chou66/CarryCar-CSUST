@@ -3,7 +3,7 @@
 | 模块 | 外设 | 引脚 |
 |---|---|---|
 | HWT101 | USART1 | PC4 TX / PC5 RX |
-| 扫码模块（未启用） | USART2 | PA2 TX / PA3 RX |
+| 扫码模块 | USART2（115200-8-N-1） | PA2 TX / PA3 RX |
 | 触摸屏 / HMI | USART3 | PB10 TX / PE15 RX |
 | K230 | UART4 | PC10 TX / PC11 RX |
 | 无刷/扩展 | UART5 | PC12 TX / PD2 RX |

@@ -85,12 +85,12 @@ void HMI_Page_Debug(void);
  *        设置比赛页面的大字任务码
  *
  * @param code
- * 任务码字符串，例如：
- * "123+231+312"
+ * 扫码模块收到的任务码字符串，例如：
+ * "156+123+516+231"
  *
- * 建议：
- * 任务码识别成功后只写入一次；
- * 任务码发生变化时再更新。
+ * RobotApp在N6扫码区收到一个新的候选码后会立即调用本接口，因此格式
+ * 错误的原始内容也能显示出来，方便判断串口错位或二维码印刷问题。
+ * 只有TaskCode_Parse()校验通过后，该任务码才会真正锁定并驱动搬运顺序。
  */
 void HMI_Race_SetTaskCode(const char *code);
 
@@ -160,10 +160,10 @@ void HMI_Race_SetResult(const char *result);
  *        设置调试页面任务码
  *
  * @param code
- * 当前任务码字符串。
+ * 当前任务码字符串，格式与比赛页面完全相同，固定为15个ASCII字符。
  *
  * 与比赛页不同：
- * 此处使用普通小字体，仅用于调试观察。
+ * 此处使用普通小字体，仅用于调试观察；不参与任何状态机判断。
  */
 void HMI_Debug_SetTaskCode(const char *code);
 

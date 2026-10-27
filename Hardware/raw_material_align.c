@@ -96,7 +96,7 @@ static RawStopPurpose_t s_stop_purpose = RAW_STOP_PURPOSE_NONE;
 static uint8_t s_pending_exit_reason = RAW_ALIGN_EXIT_NONE;
 static uint32_t s_stop_last_tx_ms = 0U;
 /* 当前“已下发的绝对目标”。对准完成后由 ZoneTask 保存并用于正式抓取。 */
-static float s_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+static float s_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
 static float s_slide_mm = RAW_VISION_SLIDE_START_MM;
 
 /* 本轮是否真的改变了对应执行器；未改变的轴不应阻塞 MOVING 状态。 */
@@ -115,7 +115,7 @@ volatile uint8_t robot_raw_align_stable_frames = 0U;
 volatile uint16_t robot_raw_align_iteration = 0U;
 volatile int32_t robot_raw_align_px_x = 0;
 volatile int32_t robot_raw_align_px_y = 0;
-volatile float robot_raw_align_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+volatile float robot_raw_align_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
 volatile float robot_raw_align_slide_mm = RAW_VISION_SLIDE_START_MM;
 volatile float robot_raw_align_angle_step_deg = 0.0f;
 volatile float robot_raw_align_slide_step_mm = 0.0f;
@@ -509,7 +509,7 @@ void RawMaterialAlign_Init(void)
     s_stop_purpose = RAW_STOP_PURPOSE_NONE;
     s_pending_exit_reason = RAW_ALIGN_EXIT_NONE;
     s_stop_last_tx_ms = 0U;
-    s_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+    s_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
     s_slide_mm = RAW_VISION_SLIDE_START_MM;
     s_wait_carousel = false;
     s_wait_slide = false;
@@ -574,7 +574,7 @@ bool RawMaterialAlign_Start(uint8_t color_id, uint32_t now_ms)
     s_stop_purpose = RAW_STOP_PURPOSE_NONE;
     s_pending_exit_reason = RAW_ALIGN_EXIT_NONE;
     s_stop_last_tx_ms = 0U;
-    s_carousel_deg = K230_ALIGN_CAROUSEL_ANGLE_DEG;
+    s_carousel_deg = CAROUSEL_PICKUP_POS2_DEG;
     s_slide_mm = ManipulatorAction_SlideJogGetPositionMm();
     s_wait_carousel = false;
     s_wait_slide = false;
@@ -662,6 +662,14 @@ void RawMaterialAlign_Update(uint32_t now_ms)
             begin_stop_handshake(RAW_STOP_PURPOSE_RECOVER_BUSY,
                                  RAW_ALIGN_EXIT_NONE,
                                  now_ms);
+        }
+        else if ((strcmp(g_k230_status.error_text, "notfound") == 0) ||
+                 (strcmp(g_k230_status.error_text, "no_target") == 0))
+        {
+            /*
+             * 当前画面暂时没有目标不属于系统故障。保持当前识别状态，
+             * 等待物料进入视野后由 K230 继续返回颜色、偏差或 grab。
+             */
         }
         else
         {

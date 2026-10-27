@@ -42,6 +42,12 @@ extern volatile uint8_t robot_mission_task_step;
 extern volatile uint8_t robot_mission_task_steps;
 extern volatile uint8_t robot_mission_vision_iteration;
 
+/* 二维码任务解析结果：批次下标0/1，物料下标0..2。 */
+extern volatile uint8_t robot_task_code_valid;
+extern volatile uint8_t robot_task_color[2][3];
+extern volatile uint8_t robot_task_rough_slot[2][3];
+extern volatile uint8_t robot_task_storage_slot[2][3];
+
 Chassis *RobotApp_GetChassis(void);
 HMI_Navigation_t *RobotApp_GetNavigation(void);
 

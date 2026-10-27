@@ -2,6 +2,7 @@
 #define __ZONE_TASK_H
 
 #include "main.h"
+#include "task_code.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -26,6 +27,8 @@
  * -> 云台与滑台二维位置闭环），识别到对应颜色才夹取。
  * 注意识别前那两件事的顺序是固定的「云台先转、滑台后伸」：夹爪在缩回
  * 状态下回转更不容易和外围干涉；两件都就位后才发 detect。
+ * 第一步的滑台前伸已经由 RawStationTask 在车体 +X 停靠平移的同一窗口里
+ * 并行完成，到站后直接发 detect，不再重复前伸。
  * 原料区三步的表内 pose 以 ZONE_RAW_POS2_POSE 为初值；对准完成后会把
  * 实际云台角度与滑台位置一起写入本步抓取 pose。抓取不再先退回原点、
  * 再重新伸出，而是直接从当前对准位下降电机5，见
@@ -35,8 +38,8 @@
  * 需人工把滑台推回原点并调用 Manipulator_Slide_SetHome() 才能重新启动。
  * （云台预转阶段失败也同样作废基准——急停语义下不假设滑台没被碰过。）
  * 粗加工区/暂存区的对位由 mission 在整区域动作之前做一次，步骤里为 0。
- * 其中粗加工区固定只识别2号圆环来修正底盘；完成后1号、3号依靠已标定的
- * 固定云台角和齿条长度放置/取回，不会在六个机械步骤中再次启动视觉。
+ * 其中粗加工区固定只识别2号圆环来修正底盘；完成后1/2/3号均依靠已标定
+ * 的夹爪云台角和齿条长度放置/取回，不会在六个机械步骤中再次启动视觉。
  *
  * 步骤表与所有位姿标定都集中在 zone_task.c / robot_config.h，
  * 本模块不含任何机械尺寸数字。
@@ -53,8 +56,8 @@ typedef enum
 typedef enum
 {
     ZONE_TASK_IDLE = 0,
-    ZONE_TASK_MOVE_TRAY,     /* 料盘选择舵机转到本步槽位 */
-    ZONE_TASK_WAIT_TRAY,     /* 等料盘稳定 */
+    ZONE_TASK_MOVE_TRAY,     /* 料盘与云台/夹爪同时转向本步目标 */
+    ZONE_TASK_WAIT_TRAY,     /* 等料盘和舵机都稳定 */
     ZONE_TASK_ALIGN,         /* 视觉对位（仅 align_color != 0 的步骤） */
     ZONE_TASK_WAIT_ALIGN,    /* 等对位结束才允许夹 */
     ZONE_TASK_START_ACTION,  /* 启动一步机械臂动作 */
@@ -69,6 +72,13 @@ typedef enum
 } ZoneTaskState_t;
 
 void ZoneTask_Init(void);
+
+/*
+ * 在启动原料区、粗加工区、暂存区动作前装载已严格校验的二维码任务。
+ * ZoneTask内部会复制整份配置，后续连续扫码不会改变正在执行的搬运顺序。
+ */
+bool ZoneTask_SetTaskCode(const MissionTaskCode_t *task);
+void ZoneTask_ClearTaskCode(void);
 
 /**
  * @brief 启动某个区域某一批次的机械动作序列。
@@ -88,6 +98,20 @@ bool ZoneTask_HasError(void);
 /* 诊断：当前步骤序号（0-based）与本次序列的总步数。 */
 uint8_t ZoneTask_GetStep(void);
 uint8_t ZoneTask_GetStepCount(void);
+uint8_t ZoneTask_GetCurrentColor(void);
+
+/**
+ * @brief 查询某区域某批次第一步要用的料盘槽位，供行驶途中提前转料盘。
+ *
+ * 只能在 ZoneTask_SetTaskCode() 之后查询：步骤表的槽位在装载任务码时被
+ * 二维码覆盖，之后不再改变，因此这里查到的就是到站后真实使用的槽位。
+ * 本函数只读表，不改变任何运行状态，可以在 ZoneTask 未启动时调用。
+ *
+ * @param slot 输出槽位 0..2（三张表的首步槽位当前都是 0，但这里不写死，
+ *             改步骤表后自动跟随）。
+ * @return false 表示区域/批次非法或 table 为空。
+ */
+bool ZoneTask_GetFirstTraySlot(ZoneId_t zone, uint8_t batch, uint8_t *slot);
 
 /*
  * 状态镜像（非 static 全局，Keil Watch 直接输名字即可，无需限定名）：

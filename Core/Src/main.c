@@ -87,7 +87,7 @@ void SystemClock_Config(void);
   */
 int main(void)
 
-{
+  {
 
   /* USER CODE BEGIN 1 */
 
@@ -123,7 +123,7 @@ int main(void)
 	fdcan2_UserInit();
 
 	VofaDebug_Init();
-	AppUart_Init();
+	/* RobotApp_Init()统一初始化并挂接全部UART接收，避免重复Receive_IT。 */
  
 	//test K230期间不启动
 	Servo_Init();

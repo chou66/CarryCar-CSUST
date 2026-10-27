@@ -3,24 +3,26 @@
 #include "hmi_protocol.h"
 #include "vofa_debug.h"
 #include "k230.h"
+#include "qr_scanner.h"
 
 /*
  * 统一 UART 单字节中断分发。
  *
  * 当前已接入：
  *   USART1 -> HWT101
+ *   USART2 -> GM67/MJ6000 二维码模块（PA3 RX / PA2 TX）
  *   USART3 -> HMI 协议解析（PE15 RX / PB10 TX）
  *   UART4  -> K230
  *   UART5  -> VOFA 调试接收（10.7.2 需先 0x70 人工接管后才允许运动命令）
  *
  * 注意：
- *   HMI 已从 USART2 迁到 USART3。USART2 现在应用层无人使用，不再挂
- *   IT 接收，可以留给 GM67/MJ6000 之类的后续外设（LPUART1 同样空闲）。
+ *   HMI 已从 USART2 迁到 USART3，USART2 现在专供扫码模块。
  *
  * 后续新模块接入时继续在这里统一分发，
  * 不要在其它模块再次定义 HAL_UART_RxCpltCallback()，避免回调互相覆盖。
  */
 static uint8_t s_rx1;
+static uint8_t s_rx2;
 static uint8_t s_rx4;
 static uint8_t s_rx_hmi;
 static uint8_t s_rx5;
@@ -93,6 +95,14 @@ volatile uint32_t hmi_usart3_error_count = 0U;
 volatile uint32_t hmi_usart3_last_error = 0U;
 volatile uint8_t  hmi_usart3_last_byte = 0U;
 
+/* USART2 / QR 原始接收诊断。 */
+volatile uint32_t qr_usart2_rx_count = 0U;
+volatile uint32_t qr_usart2_rearm_ok_count = 0U;
+volatile uint32_t qr_usart2_rearm_fail_count = 0U;
+volatile uint32_t qr_usart2_error_count = 0U;
+volatile uint32_t qr_usart2_last_error = 0U;
+volatile uint8_t  qr_usart2_last_byte = 0U;
+
 /* UART4 / K230 原始接收诊断：只统计链路，不参与协议和任务判断。 */
 volatile uint32_t k230_uart4_rx_count = 0U;
 volatile uint32_t k230_uart4_rearm_ok_count = 0U;
@@ -106,10 +116,17 @@ static void arm_rx(UART_HandleTypeDef *huart, uint8_t *byte)
     HAL_StatusTypeDef st = HAL_UART_Receive_IT(huart, byte, 1U);
 
     /*
-     * 只对 HMI / USART3 记录挂接结果。
+     * 对扫码、HMI、K230记录挂接结果。
      * 正常情况下初始化和每次收完 1 字节以后都应该重新得到 HAL_OK。
      */
-    if (huart == &huart3)
+    if (huart == &huart2)
+    {
+        if (st == HAL_OK)
+            qr_usart2_rearm_ok_count++;
+        else
+            qr_usart2_rearm_fail_count++;
+    }
+    else if (huart == &huart3)
     {
         if (st == HAL_OK)
             hmi_usart3_rearm_ok_count++;
@@ -128,6 +145,7 @@ static void arm_rx(UART_HandleTypeDef *huart, uint8_t *byte)
 void AppUart_Init(void)
 {
     hwt101_init(&s_imu);
+    QRScanner_Init();
 
     /*
      * 各外设的 MX_xxx_Init() 必须先在 main() 中完成，再启动 1 byte IT 接收。
@@ -135,6 +153,7 @@ void AppUart_Init(void)
      * 主循环只消费协议层已经解析好的事件。
      */
     arm_rx(&huart1, &s_rx1);
+    arm_rx(&huart2, &s_rx2);
     arm_rx(&huart3, &s_rx_hmi);
     arm_rx(&huart4, &s_rx4);
     arm_rx(&huart5, &s_rx5);
@@ -236,6 +255,18 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         update_imu_debug_mirror();
         arm_rx(&huart1, &s_rx1);
     }
+    else if (huart == &huart2)
+    {
+        /*
+         * 扫码模块始终开启，因此USART2始终保持1字节中断接收。
+         * 这里只记录原始链路并把字节交给QRScanner；任务码是否合法、是否
+         * 应当开始任务由主循环中的RobotApp判断，中断里不推进机械状态机。
+         */
+        qr_usart2_rx_count++;
+        qr_usart2_last_byte = s_rx2;
+        QRScanner_FeedByte(s_rx2, now);
+        arm_rx(&huart2, &s_rx2);
+    }
     else if (huart == &huart3)
     {
         /*
@@ -276,7 +307,12 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
      * HAL 进入 ErrorCallback 时 ErrorCode 仍保留本次错误原因。
      * USART3 单独记录，便于区分“根本没收到”和“收到但持续串口错误”。
      */
-    if (huart == &huart3)
+    if (huart == &huart2)
+    {
+        qr_usart2_error_count++;
+        qr_usart2_last_error = huart->ErrorCode;
+    }
+    else if (huart == &huart3)
     {
         hmi_usart3_error_count++;
         hmi_usart3_last_error = huart->ErrorCode;
@@ -295,6 +331,8 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
     if (huart == &huart1)
         arm_rx(&huart1, &s_rx1);
+    else if (huart == &huart2)
+        arm_rx(&huart2, &s_rx2);
     else if (huart == &huart3)
         arm_rx(&huart3, &s_rx_hmi);
     else if (huart == &huart4)

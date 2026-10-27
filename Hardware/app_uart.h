@@ -8,14 +8,14 @@
  *
  * 当前接线：
  *   USART1 -> HWT101
+ *   USART2 -> GM67/MJ6000 扫码模块（PA3 RX / PA2 TX）
  *   USART3 -> HMI 串口屏（PE15 RX / PB10 TX）
  *   UART4  -> K230
  *   UART5  -> VOFA（保留调试入口）
  *
  * 重要：
- *   HMI 已从 USART2 迁到 USART3。USART2 现在没有接收方，不再挂
- *   1-byte IT 接收；它对应用层是空闲口，可以留给 GM67/MJ6000 之类的
- *   新外设（LPUART1 也是空的）。
+ *   HMI 已从 USART2 迁到 USART3。USART2 以 1-byte IT 方式持续接收
+ *   无包头包尾的二维码 ASCII 数据。
  *
  * HAL_UART_RxCpltCallback() 只允许在 app_uart.c 中维护一份。
  */
@@ -68,6 +68,14 @@ extern volatile uint32_t hmi_usart3_rearm_fail_count;
 extern volatile uint32_t hmi_usart3_error_count;
 extern volatile uint32_t hmi_usart3_last_error;
 extern volatile uint8_t  hmi_usart3_last_byte;
+
+/* GM67/MJ6000 / USART2 原始链路诊断。 */
+extern volatile uint32_t qr_usart2_rx_count;
+extern volatile uint32_t qr_usart2_rearm_ok_count;
+extern volatile uint32_t qr_usart2_rearm_fail_count;
+extern volatile uint32_t qr_usart2_error_count;
+extern volatile uint32_t qr_usart2_last_error;
+extern volatile uint8_t  qr_usart2_last_byte;
 
 /* K230 / UART4 原始链路诊断；用于区分协议状态机问题与串口收字节问题。 */
 extern volatile uint32_t k230_uart4_rx_count;
