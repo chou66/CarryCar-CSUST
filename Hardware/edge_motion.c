@@ -80,8 +80,8 @@ static int8_t edge_signf(float x)
  * 节点是 MISSION_STORAGE_NODE。整段都成立，因此 N2->N1 和 N1->N4
  * 两段直线拿到的是同一组参数，封路绕行 N2->N5->N4 也一样。
  *
- * 返回段（N4 -> 启停区 N3/N9）另有 ROUTE_RETURN_CENTER_INPLACE_TURN：
- * 规划结果经过中央路口 N5 时关闭圆滑拐角，改走原地直角转弯。
+ * 另外 ROUTE_CENTER_INPLACE_TURN：本次导航的规划路径经过中央路口 N5
+ * 时关闭圆滑拐角，改走原地直角转弯（N4->N8 走廊除外）。
  *========================================================================*/
 typedef struct
 {
@@ -96,7 +96,7 @@ typedef struct
 } EdgeTurnTuning_t;
 
 /* 本次导航路径里是否经过某个拓扑节点（返回段用来判定是否经中央路口）。 */
-#if ROUTE_RETURN_CENTER_INPLACE_TURN
+#if ROUTE_CENTER_INPLACE_TURN
 static uint8_t edge_path_contains_node(const PathResult_t *path, uint8_t node)
 {
     uint8_t i;
@@ -112,7 +112,7 @@ static uint8_t edge_path_contains_node(const PathResult_t *path, uint8_t node)
 
     return 0U;
 }
-#endif /* ROUTE_RETURN_CENTER_INPLACE_TURN */
+#endif /* ROUTE_CENTER_INPLACE_TURN */
 
 static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
 {
@@ -159,21 +159,19 @@ static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
                 ROUTE_SEG_N2_N4_CORNER_ARC_MIN_MARGIN_M;
         }
     }
-#elif !(ROUTE_RETURN_CENTER_INPLACE_TURN)
+#elif !(ROUTE_CENTER_INPLACE_TURN)
     (void)em;
 #endif
 
-#if ROUTE_RETURN_CENTER_INPLACE_TURN
+#if ROUTE_CENTER_INPLACE_TURN
     /*
-     * 返回段（暂存区 N4 -> 启停区 N3/N9）：
-     * 偏好路线 N4->N7->N8->N9 被封路切断时，规划器回退到经中央路口 N5 的
-     * 最短路（N4->N5->N6->N9 / N4->N5->N6->N3）。中央路口余量紧，且封路
-     * 说明现场动线与标定不同，所以本段关掉圆滑拐角，恢复“到节点停车 +
-     * 原地直角转弯”。偏好路线本身不含 N5，仍按圆弧通过。
+     * 封路后绕到中央路口 N5 的区段：本段所有拐角改走“到节点停车 +
+     * 原地直角转弯”。中央路口余量紧，且封路说明现场动线与标定不同，
+     * 不在路口拉圆弧。
      *
-     * 例外：N4->N8 走廊始终保留圆滑拐弯 —— 偏好路线 N4->N7->N8 本来就是
-     * 靠 N7 的圆弧过弯；封路退化到 N4->N5->N8 时同样保留，这条走廊的
-     * 圆弧半径单独标定过，不参与返回段的原地转弯策略。
+     * 例外：N4->N8 走廊始终保留圆滑拐弯 —— 偏好路线 N4->N7->N8 本来
+     * 就是靠 N7 的圆弧过弯；封路退化到 N4->N5->N8 时同样保留，这条走廊
+     * 的圆弧半径单独标定过，不参与中央路口的原地转弯策略。
      */
     if (em && em->hmi_nav)
     {
@@ -190,9 +188,6 @@ static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
              target == (uint8_t)MISSION_RAW_NODE) ? 1U : 0U;
 
         if (!keep_smooth &&
-            path && path->valid && path->length > 0U &&
-            path->node[0] == (uint8_t)MISSION_STORAGE_NODE &&
-            MISSION_IS_RETURN_NODE(target) &&
             edge_path_contains_node(path, (uint8_t)ROUTE_CENTER_NODE))
         {
             tuning->arc_enable = 0U;
