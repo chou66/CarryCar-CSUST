@@ -170,16 +170,27 @@ static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
      * 最短路（N4->N5->N6->N9 / N4->N5->N6->N3）。中央路口余量紧，且封路
      * 说明现场动线与标定不同，所以本段关掉圆滑拐角，恢复“到节点停车 +
      * 原地直角转弯”。偏好路线本身不含 N5，仍按圆弧通过。
+     *
+     * 例外：N4->N8 走廊始终保留圆滑拐弯 —— 偏好路线 N4->N7->N8 本来就是
+     * 靠 N7 的圆弧过弯；封路退化到 N4->N5->N8 时同样保留，这条走廊的
+     * 圆弧半径单独标定过，不参与返回段的原地转弯策略。
      */
     if (em && em->hmi_nav)
     {
         const PathResult_t *path;
         uint8_t target;
+        uint8_t keep_smooth;
 
         path = Navigation_GetPath(&em->hmi_nav->nav);
         target = Navigation_GetTargetNode(&em->hmi_nav->nav);
 
-        if (path && path->valid && path->length > 0U &&
+        keep_smooth =
+            (path && path->valid && path->length > 0U &&
+             path->node[0] == (uint8_t)MISSION_STORAGE_NODE &&
+             target == (uint8_t)MISSION_RAW_NODE) ? 1U : 0U;
+
+        if (!keep_smooth &&
+            path && path->valid && path->length > 0U &&
             path->node[0] == (uint8_t)MISSION_STORAGE_NODE &&
             MISSION_IS_RETURN_NODE(target) &&
             edge_path_contains_node(path, (uint8_t)ROUTE_CENTER_NODE))
