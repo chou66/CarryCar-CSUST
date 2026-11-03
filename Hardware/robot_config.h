@@ -333,14 +333,18 @@
  *   0 = 全流程模式：底盘导航 + 视觉对位 + 机械臂抓放全部执行；
  *   1 = 只跑底盘模式：正常完成整条导航路径（扫码、原料/粗加工/暂存
  *       作业点都照常到站），IMU 任务航向对准、启停区进出也照常执行，
- *       但所有视觉对位和机械臂抓放都不执行，改为在每个作业节点原地
- *       等待 MISSION_CHASSIS_HOLD_MS（默认 2 s）占位，然后继续下一段。
+ *       但不做机械臂抓放。到站后的处理分两种：
+ *         - 粗加工区(N2)/暂存区(N4)：仍然做完整视觉校准（机械预置 ->
+ *           K230 对环 -> 航向复核 -> 齿条回缩），校准结束直接进入下一段
+ *           底盘运动，不执行放置/夹取；
+ *         - 其它作业点（原料区等）：原地等待 MISSION_CHASSIS_HOLD_MS
+ *           （默认 2 s）占位，然后继续下一段。
  *
  * 可在 Keil 的 C/C++ -> Define 里直接写 MISSION_CHASSIS_ONLY=1 覆盖，
  * 不必改本文件。
  */
 #ifndef MISSION_CHASSIS_ONLY
-#define MISSION_CHASSIS_ONLY                 0U  /* 0=全流程，1=只跑底盘（机械臂任务延时2s占位） */
+#define MISSION_CHASSIS_ONLY                 1U  /* 0=全流程，1=只跑底盘（机械臂任务延时2s占位） */
 #endif
 /* 只跑底盘模式：每个作业点替代机械臂任务的占位延时。 */
 #define MISSION_CHASSIS_HOLD_MS           2000U
@@ -374,8 +378,8 @@
  * MISSION_ALIGN_ACC 语义不同，所以单独给值。
  * 其它任务点（扫码 N6、原料 N8）继续走上面的航向 PD。 */
 #define MISSION_ALIGN_POS_ENABLE                1U  /* 0=所有任务点都回退到 PD */
-#define MISSION_ALIGN_POS_SPEED_MPS          0.40f  /* 位置模式转速对应的轮线速度（m/s） */
-#define MISSION_ALIGN_POS_ACC                 130U  /* EMM 位置模式 acc 档位 */
+#define MISSION_ALIGN_POS_SPEED_MPS          0.50f  /* 位置模式转速对应的轮线速度（m/s） */
+#define MISSION_ALIGN_POS_ACC                 180U  /* EMM 位置模式 acc 档位 */
 
 /* ---------- 原料区识别预伸 ----------
  * N8 不再做车体停靠平移：原先 40 mm 的车体靠近量并入滑台伸出量，

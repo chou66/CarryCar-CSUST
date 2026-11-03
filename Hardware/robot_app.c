@@ -465,6 +465,25 @@ static void mission_enter_chassis_hold(uint32_t now_ms)
     HMI_Race_SetAction("CHASSIS HOLD");
     HMI_Race_SetResult("SKIP TASK");
 }
+
+#if K230_ALIGN_ENABLE
+/*
+ * 只跑底盘模式下，哪些作业点仍然要做视觉校准。
+ *   粗加工区/暂存区：保留完整视觉对环，因为校准结果会修正底盘停靠位；
+ *                    校准完成后同样不做抓放，直接推进下一段底盘运动。
+ *   原料区：      视觉抓取由 RawStationTask 驱动、与抓放强耦合，仍用占位。
+ */
+static uint8_t mission_chassis_only_uses_vision(void)
+{
+    ZoneId_t zone;
+    uint8_t batch;
+
+    if (!mission_zone_for_stage(robot_mission_stage, &zone, &batch))
+        return 0U;
+
+    return ((zone == ZONE_ROUGH) || (zone == ZONE_STORAGE)) ? 1U : 0U;
+}
+#endif /* K230_ALIGN_ENABLE */
 #endif /* MISSION_CHASSIS_ONLY */
 
 #if K230_ALIGN_ENABLE
@@ -483,6 +502,15 @@ static bool mission_start_ring_align(uint32_t now_ms)
     {
         return false;
     }
+
+#if MISSION_CHASSIS_ONLY
+    /*
+     * 只跑底盘模式不在暂存区叠放，也没有扫码得到的颜色身份锚点
+     * （暂存区第二轮本来要走 STACK-2）。这里按第一轮 PLACE-2 直接对
+     * 2 号圆环：校准目标是底盘停靠位，与物料身份无关。
+     */
+    batch = 0U;
+#endif
 
     if ((zone == ZONE_STORAGE) && (batch == 1U))
     {
@@ -521,6 +549,16 @@ static void mission_begin_vision_align(uint32_t now_ms)
         mission_enter_task_hold(now_ms);
         return;
     }
+
+#if MISSION_CHASSIS_ONLY
+    /*
+     * 只跑底盘模式不叠放：暂存区第二轮（batch 1）没有第一层物料可压，
+     * 仍按第一轮的低位取像位姿，与 mission_start_ring_align() 的
+     * PLACE-2 选择保持一致。原料区不受影响（它本来就不进这条视觉入口）。
+     */
+    if (zone != ZONE_RAW)
+        batch = 0U;
+#endif
 
 #if K230_ALIGN_ENABLE
     /*
@@ -603,19 +641,6 @@ static void mission_begin_vision_align(uint32_t now_ms)
  */
 static void mission_continue_after_alignment(uint32_t now_ms)
 {
-#if MISSION_CHASSIS_ONLY
-    /*
-     * 只跑底盘模式：导航、任务航向对准、启停区进出都照常执行（这些都属于
-     * 底盘任务），到站对好航向后跳过视觉对位和机械臂抓放，用
-     * MISSION_CHASSIS_HOLD_MS 原地等待占位，然后继续下一段路径。
-     */
-    if (robot_mission_stage < 7U)
-    {
-        mission_enter_chassis_hold(now_ms);
-        return;
-    }
-#endif
-
     if (s_mission_advance_after_alignment)
     {
         s_mission_advance_after_alignment = 0U;
@@ -660,6 +685,30 @@ static void mission_continue_after_alignment(uint32_t now_ms)
         HMI_Race_SetResult("RETRACT");
         return;
     }
+
+#if MISSION_CHASSIS_ONLY
+    /*
+     * 只跑底盘模式：导航、任务航向对准、启停区进出都照常执行（这些都属于
+     * 底盘任务）。粗加工区/暂存区保留完整视觉校准（这里开始机械预置，之后
+     * 走 K230 对环 -> 航向复核 -> 齿条回缩），校准结束由
+     * MISSION_VISION_RETRACT 直接推进下一段；其余作业点仍用占位延时。
+     *
+     * 放在 pose-lock 分支之后：视觉校准中途重新对航向后，仍要按原有逻辑
+     * 直接重拍 K230 或收齿条，不能再从机械预置重来（此时齿条已经伸出）。
+     */
+    if (robot_mission_stage < 7U)
+    {
+#if K230_ALIGN_ENABLE
+        if (mission_chassis_only_uses_vision())
+        {
+            mission_begin_vision_align(now_ms);
+            return;
+        }
+#endif
+        mission_enter_chassis_hold(now_ms);
+        return;
+    }
+#endif
 
     mission_begin_vision_align(now_ms);
 }
@@ -1302,8 +1351,17 @@ static void mission_update(uint32_t now_ms)
 
         if (ManipulatorAction_SlideJogIsDone())
         {
+#if MISSION_CHASSIS_ONLY
+            /*
+             * 只跑底盘模式：本作业点的视觉校准到此结束，不进入放置/夹取
+             * 任务，齿条回零、电机5 到顶后直接推进下一段底盘运动。
+             * 状态与 HMI 由 mission_advance_stage() 里的规划函数刷新。
+             */
+            mission_advance_stage();
+#else
             HMI_Race_SetResult("OK");
             mission_enter_task_hold(now_ms);
+#endif
         }
         return;
     }
