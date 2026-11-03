@@ -79,6 +79,9 @@ static int8_t edge_signf(float x)
  * 识别不看调用点，只看本次导航：路径起点是 MISSION_ROUGH_NODE、目标
  * 节点是 MISSION_STORAGE_NODE。整段都成立，因此 N2->N1 和 N1->N4
  * 两段直线拿到的是同一组参数，封路绕行 N2->N5->N4 也一样。
+ *
+ * 返回段（N4 -> 启停区 N3/N9）另有 ROUTE_RETURN_CENTER_INPLACE_TURN：
+ * 规划结果经过中央路口 N5 时关闭圆滑拐角，改走原地直角转弯。
  *========================================================================*/
 typedef struct
 {
@@ -91,6 +94,25 @@ typedef struct
     float arc_max_deg;
     float arc_min_margin_m;
 } EdgeTurnTuning_t;
+
+/* 本次导航路径里是否经过某个拓扑节点（返回段用来判定是否经中央路口）。 */
+#if ROUTE_RETURN_CENTER_INPLACE_TURN
+static uint8_t edge_path_contains_node(const PathResult_t *path, uint8_t node)
+{
+    uint8_t i;
+
+    if (!path || !path->valid || node == 0U)
+        return 0U;
+
+    for (i = 0U; (i < path->length) && (i < PATH_MAX_LEN); i++)
+    {
+        if (path->node[i] == node)
+            return 1U;
+    }
+
+    return 0U;
+}
+#endif /* ROUTE_RETURN_CENTER_INPLACE_TURN */
 
 static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
 {
@@ -137,8 +159,34 @@ static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
                 ROUTE_SEG_N2_N4_CORNER_ARC_MIN_MARGIN_M;
         }
     }
-#else
+#elif !(ROUTE_RETURN_CENTER_INPLACE_TURN)
     (void)em;
+#endif
+
+#if ROUTE_RETURN_CENTER_INPLACE_TURN
+    /*
+     * 返回段（暂存区 N4 -> 启停区 N3/N9）：
+     * 偏好路线 N4->N7->N8->N9 被封路切断时，规划器回退到经中央路口 N5 的
+     * 最短路（N4->N5->N6->N9 / N4->N5->N6->N3）。中央路口余量紧，且封路
+     * 说明现场动线与标定不同，所以本段关掉圆滑拐角，恢复“到节点停车 +
+     * 原地直角转弯”。偏好路线本身不含 N5，仍按圆弧通过。
+     */
+    if (em && em->hmi_nav)
+    {
+        const PathResult_t *path;
+        uint8_t target;
+
+        path = Navigation_GetPath(&em->hmi_nav->nav);
+        target = Navigation_GetTargetNode(&em->hmi_nav->nav);
+
+        if (path && path->valid && path->length > 0U &&
+            path->node[0] == (uint8_t)MISSION_STORAGE_NODE &&
+            MISSION_IS_RETURN_NODE(target) &&
+            edge_path_contains_node(path, (uint8_t)ROUTE_CENTER_NODE))
+        {
+            tuning->arc_enable = 0U;
+        }
+    }
 #endif
 }
 
