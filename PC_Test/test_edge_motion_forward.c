@@ -6,6 +6,7 @@
 #include "edge_motion.h"
 #include "hwt101_uart.h"
 #include "navigation.h"
+#include "robot_config.h"
 
 static Hwt101 s_imu;
 static uint8_t s_position_done;
@@ -14,9 +15,19 @@ static uint8_t s_motion_busy;
 static unsigned s_rotate_count;
 static unsigned s_translate_count;
 static unsigned s_velocity_count;
+static unsigned s_arc_count;
 static float s_last_rotate_deg;
 static float s_last_dx_m;
 static float s_last_dy_m;
+static float s_last_world_dx_m;
+static float s_last_world_dy_m;
+static float s_last_target_yaw_deg;
+static float s_last_arc_start_yaw_deg;
+static float s_last_arc_turn_deg;
+static float s_last_arc_radius_m;
+static uint8_t s_last_arc_reverse;
+static uint8_t s_last_ramp_in;
+static uint8_t s_last_ramp_out;
 static float s_last_wz_radps;
 static int s_pass;
 static int s_fail;
@@ -47,6 +58,16 @@ static void reset_stubs(void)
     s_last_rotate_deg = 0.0f;
     s_last_dx_m = 0.0f;
     s_last_dy_m = 0.0f;
+    s_last_world_dx_m = 0.0f;
+    s_last_world_dy_m = 0.0f;
+    s_last_target_yaw_deg = 0.0f;
+    s_arc_count = 0U;
+    s_last_arc_start_yaw_deg = 0.0f;
+    s_last_arc_turn_deg = 0.0f;
+    s_last_arc_radius_m = 0.0f;
+    s_last_arc_reverse = 0U;
+    s_last_ramp_in = 1U;
+    s_last_ramp_out = 1U;
     s_last_wz_radps = 0.0f;
 }
 
@@ -100,6 +121,68 @@ void chassis_motion_translate(Chassis *chassis, float dx_m, float dy_m,
     s_motion_busy = 1U;
 }
 
+void chassis_motion_drift_translate(Chassis *chassis,
+                                    float world_dx_m, float world_dy_m,
+                                    float distance_m,
+                                    float target_world_yaw_deg,
+                                    float speed_mps, uint32_t now_ms)
+{
+    chassis_motion_drift_segment(chassis, world_dx_m, world_dy_m, distance_m,
+                                 target_world_yaw_deg, speed_mps, 1U, 1U,
+                                 now_ms);
+}
+
+void chassis_motion_drift_segment(Chassis *chassis,
+                                  float world_dx_m, float world_dy_m,
+                                  float distance_m,
+                                  float target_world_yaw_deg,
+                                  float speed_mps,
+                                  uint8_t ramp_in, uint8_t ramp_out,
+                                  uint32_t now_ms)
+{
+    (void)chassis; (void)speed_mps; (void)now_ms;
+    /* 边是纯车身Y运动，桩按距离记录 dy，dx 恒为 0；世界向量单独记录。 */
+    s_translate_count++;
+    s_last_dx_m = 0.0f;
+    s_last_dy_m = distance_m;
+    s_last_world_dx_m = world_dx_m;
+    s_last_world_dy_m = world_dy_m;
+    s_last_target_yaw_deg = target_world_yaw_deg;
+    s_last_ramp_in = ramp_in;
+    s_last_ramp_out = ramp_out;
+    s_position_done = 0U;
+    s_motion_busy = 1U;
+}
+
+void chassis_motion_arc_world_ex(Chassis *chassis,
+                                 float start_tangent_world_yaw_deg,
+                                 float turn_deg,
+                                 float radius_m,
+                                 float speed_mps,
+                                 uint8_t reverse,
+                                 uint32_t now_ms)
+{
+    (void)chassis; (void)speed_mps; (void)now_ms;
+    s_arc_count++;
+    s_last_arc_start_yaw_deg = start_tangent_world_yaw_deg;
+    s_last_arc_turn_deg = turn_deg;
+    s_last_arc_radius_m = radius_m;
+    s_last_arc_reverse = reverse;
+    s_position_done = 0U;
+    s_motion_busy = 1U;
+}
+
+void chassis_motion_arc_world(Chassis *chassis,
+                              float start_world_yaw_deg,
+                              float turn_deg,
+                              float radius_m,
+                              float speed_mps,
+                              uint32_t now_ms)
+{
+    chassis_motion_arc_world_ex(chassis, start_world_yaw_deg, turn_deg,
+                                radius_m, speed_mps, 0U, now_ms);
+}
+
 bool chassis_motion_done(const Chassis *chassis)
 { (void)chassis; return s_position_done != 0U; }
 bool chassis_motion_failed(const Chassis *chassis)
@@ -137,12 +220,16 @@ static void test_turn_then_forward(void)
     Navigation_PlanTo(&hmi.nav, 6U);
     EdgeMotion_Init(&edge, &chassis, &hmi);
 
+    /*
+     * 车头朝北(0°)，N5->N6 朝东(90°)：起点航向不对、且终点就是目标节点，
+     * 不能做圆滑拐角，仍按原来的“原地转到边方向再走”。
+     */
     set_yaw(0.0f, 0U);
     EdgeMotion_Update(&edge, 0U);
     check(edge.state == EDGE_MOTION_TURNING_TO_EDGE &&
           s_rotate_count == 1U && s_translate_count == 0U &&
           nearf(s_last_rotate_deg, -90.0f, 0.01f),
-          "N5->N6 turns clockwise before moving");
+          "N5->N6 turns in place when the target node itself needs the turn");
 
     finish_position();
     EdgeMotion_Update(&edge, 1U);
@@ -154,7 +241,8 @@ static void test_turn_then_forward(void)
     check(edge.state == EDGE_MOTION_TRANSLATING &&
           s_translate_count == 1U &&
           nearf(s_last_dx_m, 0.0f, 0.0001f) &&
-          nearf(s_last_dy_m, 0.90f, 0.01f),
+          nearf(s_last_dy_m, 0.90f, 0.01f) &&
+          s_last_ramp_in == 1U && s_last_ramp_out == 1U,
           "After turn, topology edge is pure forward motion");
 
     finish_position();
@@ -265,12 +353,14 @@ static void test_large_error_is_corrected_and_rechecked(void)
 }
 
 /*
- * 中间节点后紧接着要转 90 度时，边末不再先纠到当前边航向：
- * 直接提交节点，下一次 Update 由 edge_turn 一次转到下一条边的目标角。
+ * 圆滑拐角：1->6 的路线是 1->4->5->6，第一段 1->4 朝北(0°)，第二段
+ * 4->5->6 朝东(90°)。
  *
- * 路径 1->2->5->6：第一段 1->2 朝东(90 度)，第二段 2->5 朝北(0 度)。
+ * 领 1->4 时预读到 N4 要转 90°，于是直线末段不再减速，按半径
+ * ROUTE_CORNER_ARC_RADIUS_M 走一段圆弧转过拐角，弧后保持满速直接接上
+ * 4->6 的直线——N4 不停车、不做原地转。
  */
-static void test_following_turn_skips_redundant_edge_correction(void)
+static void test_corner_arc_blends_intermediate_node(void)
 {
     HMI_Navigation_t hmi;
     Chassis chassis;
@@ -284,32 +374,53 @@ static void test_following_turn_skips_redundant_edge_correction(void)
     Navigation_PlanTo(&hmi.nav, 6U);
     EdgeMotion_Init(&edge, &chassis, &hmi);
 
-    set_yaw(90.0f, 0U);
+    set_yaw(0.0f, 0U);
     EdgeMotion_Update(&edge, 0U);
+    check(edge.state == EDGE_MOTION_TRANSLATING &&
+          s_rotate_count == 0U && s_translate_count == 1U &&
+          s_last_ramp_in == 1U && s_last_ramp_out == 0U &&
+          nearf(s_last_world_dy_m, 0.85f, 0.01f) &&
+          nearf(s_last_dy_m,
+                0.85f - ROUTE_CORNER_ARC_RADIUS_M, 0.01f),
+          "Straight keeps full speed into the corner arc");
+
     finish_position();
     EdgeMotion_Update(&edge, 1U);
+    check(edge.state == EDGE_MOTION_CORNER_ARC &&
+          s_arc_count == 1U && s_translate_count == 1U &&
+          nearf(s_last_arc_start_yaw_deg, 0.0f, 0.01f) &&
+          nearf(s_last_arc_turn_deg, 90.0f, 0.01f) &&
+          nearf(s_last_arc_radius_m, ROUTE_CORNER_ARC_RADIUS_M, 0.0001f),
+          "Corner is passed as a 90-degree arc of the configured radius");
 
-    /* 0.6 度超过边末死区，但下一条边需要转 90 度。 */
-    set_yaw(90.6f, 200U);
+    finish_position();
+    EdgeMotion_Update(&edge, 2U);
+    check(edge.state == EDGE_MOTION_TRANSLATING &&
+          s_rotate_count == 0U && s_translate_count == 2U &&
+          s_last_ramp_in == 0U && s_last_ramp_out == 1U &&
+          nearf(s_last_world_dx_m, 1.75f, 0.01f) &&
+          nearf(s_last_world_dy_m, 0.0f, 0.01f) &&
+          nearf(s_last_target_yaw_deg, 90.0f, 0.01f) &&
+          nearf(s_last_dy_m,
+                1.75f - ROUTE_CORNER_ARC_RADIUS_M, 0.01f),
+          "Arc exits straight into the next edge without stopping");
+
+    finish_position();
+    EdgeMotion_Update(&edge, 3U);
+    set_yaw(90.0f, 200U);
     EdgeMotion_Update(&edge, 200U);
     check(edge.state == EDGE_MOTION_IDLE &&
-          Navigation_GetCurrentNode(&hmi.nav) == 2U &&
-          !Navigation_IsDone(&hmi.nav) &&
+          Navigation_IsDone(&hmi.nav) &&
+          Navigation_GetCurrentNode(&hmi.nav) == 6U &&
           s_velocity_count == 0U,
-          "Intermediate node commits without a redundant edge-end correction");
-
-    EdgeMotion_Update(&edge, 201U);
-    check(edge.state == EDGE_MOTION_TURNING_TO_EDGE &&
-          s_rotate_count == 1U &&
-          nearf(s_last_rotate_deg, 90.6f, 0.05f),
-          "Next edge turns directly from the drifted angle to its target heading");
+          "Corner run commits every crossed node after the final straight");
 }
 
 /*
- * 下一条边是直行通过时不能跳纠偏，否则 0.5~0.8 度的小误差会沿路径累积。
- * 路径 1->2->3 两段都朝东。
+ * 同一条车道上的连续边（1->2->3 都朝东）在领取时合并成一次直线平移：
+ * 中途的 N2 不停车、不做边末航向校准，只在最终目标 N3 停车提交。
  */
-static void test_straight_through_node_still_corrects(void)
+static void test_straight_run_is_merged_into_one_translate(void)
 {
     HMI_Navigation_t hmi;
     Chassis chassis;
@@ -329,15 +440,23 @@ static void test_straight_through_node_still_corrects(void)
 
     set_yaw(90.0f, 0U);
     EdgeMotion_Update(&edge, 0U);
+    check(edge.state == EDGE_MOTION_TRANSLATING &&
+          edge.run_steps == 2U &&
+          edge.to_node == 3U &&
+          s_translate_count == 1U &&
+          nearf(s_last_dy_m, 1.75f, 0.01f),
+          "Collinear edges merge into one 1.75 m straight translate");
+
     finish_position();
     EdgeMotion_Update(&edge, 1U);
 
-    set_yaw(90.6f, 200U);
+    set_yaw(90.2f, 200U);
     EdgeMotion_Update(&edge, 200U);
-    check(edge.state == EDGE_MOTION_YAW_CORRECTING &&
-          Navigation_GetCurrentNode(&hmi.nav) == 1U &&
-          s_velocity_count == 1U,
-          "Straight-through node keeps the edge-end correction");
+    check(edge.state == EDGE_MOTION_IDLE &&
+          Navigation_IsDone(&hmi.nav) &&
+          Navigation_GetCurrentNode(&hmi.nav) == 3U &&
+          s_velocity_count == 0U,
+          "Merged run advances every crossed node and stops only at the target");
 }
 
 /*
@@ -377,14 +496,147 @@ static void test_final_task_node_defers_to_task_alignment(void)
           "Final task node defers heading work to task-yaw alignment");
 }
 
+/*
+ * 倒车过弯：N2->N4 的路线是 2->1->4。车在 N2 完成粗加工后车头朝东(90°)，
+ * 第一段 2->1 朝西，edge_turn 选择倒车（不转 180°）。倒车直线末段同样
+ * 保持满速，用倒车圆弧转过 N1，再继续倒车到 N4——N1 不停车。
+ */
+static void test_corner_arc_blends_backward_run(void)
+{
+    HMI_Navigation_t hmi;
+    Chassis chassis;
+    EdgeMotion_t edge;
+
+    memset(&hmi, 0, sizeof(hmi));
+    memset(&chassis, 0, sizeof(chassis));
+    reset_stubs();
+    hmi.initialized = 1U;
+    Navigation_Init(&hmi.nav, 2U, 0U);
+    Navigation_PlanTo(&hmi.nav, 4U);
+    EdgeMotion_Init(&edge, &chassis, &hmi);
+
+    /* N2 车头朝东(90°)，2->1 朝西 => 倒车，且预读 N1 的 90° 弯。 */
+    set_yaw(90.0f, 0U);
+    EdgeMotion_Update(&edge, 0U);
+    check(edge.state == EDGE_MOTION_TRANSLATING &&
+          edge.drive_backward == 1U && edge.corner_valid == 1U &&
+          edge.corner_reverse == 1U &&
+          s_rotate_count == 0U && s_translate_count == 1U &&
+          s_last_ramp_in == 1U && s_last_ramp_out == 0U &&
+          nearf(s_last_world_dx_m, -0.85f, 0.01f) &&
+          nearf(s_last_world_dy_m, 0.0f, 0.01f) &&
+          nearf(s_last_target_yaw_deg, 90.0f, 0.01f) &&
+          nearf(s_last_dy_m, -(0.85f - ROUTE_CORNER_ARC_RADIUS_M), 0.01f),
+          "Backward straight keeps full speed into the corner arc");
+
+    finish_position();
+    EdgeMotion_Update(&edge, 1U);
+    check(edge.state == EDGE_MOTION_CORNER_ARC &&
+          s_arc_count == 1U && s_translate_count == 1U &&
+          s_last_arc_reverse == 1U &&
+          nearf(s_last_arc_start_yaw_deg, -90.0f, 0.01f) &&
+          nearf(s_last_arc_turn_deg, 90.0f, 0.01f),
+          "Backward corner is passed as a reverse arc");
+
+    finish_position();
+    EdgeMotion_Update(&edge, 2U);
+    check(edge.state == EDGE_MOTION_TRANSLATING &&
+          edge.to_node == 4U && edge.drive_backward == 1U &&
+          s_rotate_count == 0U && s_translate_count == 2U &&
+          s_last_ramp_in == 0U && s_last_ramp_out == 1U &&
+          nearf(s_last_world_dx_m, 0.0f, 0.01f) &&
+          nearf(s_last_world_dy_m, 0.85f, 0.01f) &&
+          nearf(s_last_target_yaw_deg, 180.0f, 0.01f) &&
+          nearf(s_last_dy_m, -(0.85f - ROUTE_CORNER_ARC_RADIUS_M), 0.01f),
+          "Reverse arc exits into a backward straight without stopping");
+
+    finish_position();
+    EdgeMotion_Update(&edge, 3U);
+    set_yaw(180.0f, 200U);
+    EdgeMotion_Update(&edge, 200U);
+    check(edge.state == EDGE_MOTION_IDLE &&
+          Navigation_IsDone(&hmi.nav) &&
+          Navigation_GetCurrentNode(&hmi.nav) == 4U &&
+          s_velocity_count == 0U,
+          "Backward corner run commits the crossed node without a pivot");
+}
+
+/*
+ * 暂存区 N4 -> 原料区 N8 走偏好的 4->7->8（与 4->5->8 等长）。
+ * N4 完成暂存任务后车头朝下(180°)，4->7 朝北、7->8 朝东，两段都倒车；
+ * N7 用倒车圆弧 90° 通过，全程不停车、不原地转。
+ */
+static void test_storage_to_raw_route_uses_n7_arc(void)
+{
+    HMI_Navigation_t hmi;
+    Chassis chassis;
+    EdgeMotion_t edge;
+
+    memset(&hmi, 0, sizeof(hmi));
+    memset(&chassis, 0, sizeof(chassis));
+    reset_stubs();
+    hmi.initialized = 1U;
+    Navigation_Init(&hmi.nav, 4U, 0U);
+    Navigation_PlanTo(&hmi.nav, 8U);
+    EdgeMotion_Init(&edge, &chassis, &hmi);
+
+    /* N4 车头朝下(180°)，4->7 朝北 => 倒车，并预读 N7 的 90° 弯。 */
+    set_yaw(180.0f, 0U);
+    EdgeMotion_Update(&edge, 0U);
+    check(edge.state == EDGE_MOTION_TRANSLATING &&
+          edge.to_node == 7U && edge.drive_backward == 1U &&
+          edge.corner_valid == 1U && edge.corner_reverse == 1U &&
+          s_rotate_count == 0U && s_translate_count == 1U &&
+          s_last_ramp_in == 1U && s_last_ramp_out == 0U &&
+          nearf(s_last_world_dx_m, 0.0f, 0.01f) &&
+          nearf(s_last_world_dy_m, 0.90f, 0.01f) &&
+          nearf(s_last_target_yaw_deg, 180.0f, 0.01f) &&
+          nearf(s_last_dy_m, -(0.90f - ROUTE_CORNER_ARC_RADIUS_M), 0.01f),
+          "Storage->raw route starts with a backward 4->7 straight");
+
+    finish_position();
+    EdgeMotion_Update(&edge, 1U);
+    check(edge.state == EDGE_MOTION_CORNER_ARC &&
+          s_arc_count == 1U && s_translate_count == 1U &&
+          s_last_arc_reverse == 1U &&
+          nearf(s_last_arc_start_yaw_deg, 0.0f, 0.01f) &&
+          nearf(s_last_arc_turn_deg, 90.0f, 0.01f),
+          "N7 is passed as a 90-degree reverse arc");
+
+    finish_position();
+    EdgeMotion_Update(&edge, 2U);
+    check(edge.state == EDGE_MOTION_TRANSLATING &&
+          edge.to_node == 8U && edge.drive_backward == 1U &&
+          s_rotate_count == 0U && s_translate_count == 2U &&
+          s_last_ramp_in == 0U && s_last_ramp_out == 1U &&
+          nearf(s_last_world_dx_m, 0.85f, 0.01f) &&
+          nearf(s_last_world_dy_m, 0.0f, 0.01f) &&
+          /* 7->8 朝东，倒车时车头朝西：偏航角按 [-180,180] 归一为 -90。 */
+          nearf(s_last_target_yaw_deg, -90.0f, 0.01f) &&
+          nearf(s_last_dy_m, -(0.85f - ROUTE_CORNER_ARC_RADIUS_M), 0.01f),
+          "Arc exits straight into 7->8 backward without stopping");
+
+    finish_position();
+    EdgeMotion_Update(&edge, 3U);
+    set_yaw(270.0f, 200U);
+    EdgeMotion_Update(&edge, 200U);
+    check(edge.state == EDGE_MOTION_IDLE &&
+          Navigation_IsDone(&hmi.nav) &&
+          Navigation_GetCurrentNode(&hmi.nav) == 8U &&
+          s_velocity_count == 0U,
+          "4->7->8 arrives at N8 aligned with -90 without a pivot");
+}
+
 int main(void)
 {
     test_turn_then_forward();
     test_already_aligned_goes_forward();
     test_node_behind_uses_reverse_without_full_turn();
     test_large_error_is_corrected_and_rechecked();
-    test_following_turn_skips_redundant_edge_correction();
-    test_straight_through_node_still_corrects();
+    test_corner_arc_blends_intermediate_node();
+    test_corner_arc_blends_backward_run();
+    test_storage_to_raw_route_uses_n7_arc();
+    test_straight_run_is_merged_into_one_translate();
     test_final_task_node_defers_to_task_alignment();
     printf("PASS: %d\nFAIL: %d\n", s_pass, s_fail);
     return s_fail ? 1 : 0;

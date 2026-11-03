@@ -65,6 +65,5 @@ void MapGraph_Build(uint32_t obstacle_mask);
 uint8_t MapGraph_IsConnected(uint8_t node_a, uint8_t node_b);
 
 // 获取边代价
-uint16_t MapGraph_GetCost(uint8_t node_a, uint8_t node_b);
 
 #endif

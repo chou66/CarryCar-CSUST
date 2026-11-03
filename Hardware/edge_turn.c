@@ -35,7 +35,11 @@ uint8_t EdgeTurn_Plan(uint8_t from_node,
 
     if (!plan || tolerance_deg < 0.0f ||
         from_node < 1U || from_node > NODE_NUM ||
-        to_node < 1U || to_node > NODE_NUM ||
+        to_node < 1U || to_node > NODE_NUM)
+        return 0U;
+
+    /* 合并出来的直线段横跨多个节点，g_graph 里没有直接边，跳过连通性检查。 */
+    if (!(options && options->allow_merged_edge) &&
         !MapGraph_IsConnected(from_node, to_node))
         return 0U;
 

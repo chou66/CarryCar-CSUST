@@ -5,21 +5,23 @@
 #include "hwt101_uart.h"
 #include "navigation.h"
 #include "robot_config.h"
+#include <math.h>
 
 /*
  * 平移加速度、死区和稳停时间继承 VOFA 导航实车调试值；
  * 航向纠偏已升级为独立 PD 控制层，不再使用固定 20 RPM。
  *
- * 平移加速度现设为 0：EMM42 的 acc=0 表示不做加减速斜坡，收到速度指令
- * 立即按目标转速运行（见 chassis.c 里 estimate_position_timeout_ms 的说明，
- * acc=0 时定位超时也不计斜坡时间）。因此起步/停止没有缓冲，速度值本身
- * 必须保持保守（ROUTE_EDGE_SPEED_MPS 现为 120 rpm）。
- * 原地转向仍用 robot_config.h 的 ROUTE_TURN_ACC。
+ * 直线平动和圆弧走速度模式 + 软件正弦加减速（见 chassis.c 的 profile_*），
+ * 位移按实测脉冲换算成“加速-匀速-减速”速度曲线，因此 EDGE_MOTION_MOVE_ACC
+ * 只对直接速度命令（航向 PD 等）有效。
+ *
+ * 原地旋转（EDGE_MOTION_TURNING_TO_EDGE）走 EMM 位置模式，没有软件剖面，
+ * ROUTE_TURN_ACC 作为驱动器 acc 档位重新生效。
  */
 #define EDGE_MOTION_MOVE_ACC                   130U
 #define EDGE_MOTION_YAW_DEADBAND_DEG          0.50f
 #define EDGE_MOTION_YAW_CORRECT_MAX_RPM         80U
-#define EDGE_MOTION_YAW_CORRECT_MIN_RPM          8U
+#define EDGE_MOTION_YAW_CORRECT_MIN_RPM          2U
 #define EDGE_MOTION_YAW_CORRECT_ACC             10U
 #define EDGE_MOTION_YAW_SETTLE_MS              150U
 #define EDGE_MOTION_IMU_TIMEOUT_MS             300U
@@ -27,6 +29,14 @@
 /*
  * 世界角误差 -> 角速度的 PD 参数。
  * kp 单位约为 (deg/s)/deg；kd 用世界角速度抑制接近目标时的惯性超调。
+ *
+ * 增益上限由“死区 / 刷新周期”决定，不能只按收敛速度往上调：
+ *   80 rpm 满速 ≈ 97 deg/s，40 ms 刷新 → 每帧约 3.9 deg；
+ *   死区只有 0.5 deg，所以近目标处必须靠 kp 把输出压下来，
+ *   否则输出直接饱和成 bang-bang，越过死区→反向→再越过，形成左右震荡。
+ * kp = 1.8 时 0.61 deg 误差才到满速、1 deg 误差约 1.8 deg/s（被 8 rpm
+ * 最小输出兜到约 9.7 deg/s = 0.39 deg/帧 < 死区），闭环才稳定收敛。
+ * 2026-10-31：曾误把本值写成 160（≈ 90 倍），导致回启停区边末纠偏持续震荡。
  */
 #define EDGE_MOTION_YAW_KP                     1.80f
 #define EDGE_MOTION_YAW_KD                     0.35f
@@ -45,6 +55,7 @@
 #define EDGE_MOTION_YAW_REFRESH_MS               40U
 
 #define EDGE_MOTION_TWO_PI_F 6.28318530717958647692f
+#define EDGE_MOTION_RAD_TO_DEG_F 57.29577951308232f
 
 static float edge_absf(float x)
 {
@@ -56,6 +67,79 @@ static int8_t edge_signf(float x)
     if (x > 0.0f) return 1;
     if (x < 0.0f) return -1;
     return 0;
+}
+
+/*========================================================================
+ * 区段专用转弯参数
+ *
+ * 默认全部取全局 ROUTE_*；只有 N2（粗加工）-> N4（暂存）这一段用
+ * ROUTE_SEG_N2_N4_* 覆盖，使倒车入弯可以单独调半径/转角/倒车阈值，
+ * 不影响其他区段。
+ *
+ * 识别不看调用点，只看本次导航：路径起点是 MISSION_ROUGH_NODE、目标
+ * 节点是 MISSION_STORAGE_NODE。整段都成立，因此 N2->N1 和 N1->N4
+ * 两段直线拿到的是同一组参数，封路绕行 N2->N5->N4 也一样。
+ *========================================================================*/
+typedef struct
+{
+    uint8_t arc_enable;
+    uint8_t allow_reverse;
+    float turn_tolerance_deg;
+    float reverse_min_turn_saving_deg;
+    float turn_speed_mps;
+    float arc_radius_m;
+    float arc_max_deg;
+    float arc_min_margin_m;
+} EdgeTurnTuning_t;
+
+static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
+{
+    if (!tuning)
+        return;
+
+    tuning->arc_enable = (ROUTE_CORNER_ARC_ENABLE != 0U) ? 1U : 0U;
+    tuning->allow_reverse = (ROUTE_ALLOW_REVERSE != 0U) ? 1U : 0U;
+    tuning->turn_tolerance_deg = ROUTE_TURN_TOLERANCE_DEG;
+    tuning->reverse_min_turn_saving_deg = ROUTE_REVERSE_MIN_TURN_SAVING_DEG;
+    tuning->turn_speed_mps = ROUTE_TURN_SPEED_MPS;
+    tuning->arc_radius_m = ROUTE_CORNER_ARC_RADIUS_M;
+    tuning->arc_max_deg = ROUTE_CORNER_ARC_MAX_DEG;
+    tuning->arc_min_margin_m = ROUTE_CORNER_ARC_MIN_MARGIN_M;
+
+#if ROUTE_SEG_TURN_N2_N4_ENABLE
+    if (em && em->hmi_nav)
+    {
+        const PathResult_t *path;
+        uint8_t target;
+
+        path = Navigation_GetPath(&em->hmi_nav->nav);
+        target = Navigation_GetTargetNode(&em->hmi_nav->nav);
+
+        if (path && path->valid && path->length > 0U &&
+            path->node[0] == (uint8_t)MISSION_ROUGH_NODE &&
+            target == (uint8_t)MISSION_STORAGE_NODE)
+        {
+            tuning->arc_enable =
+                (ROUTE_SEG_N2_N4_CORNER_ARC_ENABLE != 0U) ? 1U : 0U;
+            tuning->allow_reverse =
+                (ROUTE_SEG_N2_N4_ALLOW_REVERSE != 0U) ? 1U : 0U;
+            tuning->turn_tolerance_deg =
+                ROUTE_SEG_N2_N4_TURN_TOLERANCE_DEG;
+            tuning->reverse_min_turn_saving_deg =
+                ROUTE_SEG_N2_N4_REVERSE_MIN_TURN_SAVING_DEG;
+            tuning->turn_speed_mps =
+                ROUTE_SEG_N2_N4_TURN_SPEED_MPS;
+            tuning->arc_radius_m =
+                ROUTE_SEG_N2_N4_CORNER_ARC_RADIUS_M;
+            tuning->arc_max_deg =
+                ROUTE_SEG_N2_N4_CORNER_ARC_MAX_DEG;
+            tuning->arc_min_margin_m =
+                ROUTE_SEG_N2_N4_CORNER_ARC_MIN_MARGIN_M;
+        }
+    }
+#else
+    (void)em;
+#endif
 }
 
 static void edge_save_acceleration(EdgeMotion_t *em)
@@ -114,6 +198,7 @@ static void edge_clear_runtime(EdgeMotion_t *em)
 {
     em->from_node = 0U;
     em->to_node = 0U;
+    em->run_steps = 1U;
     em->settle_until_ms = 0U;
     em->yaw_correct_start_ms = 0U;
     em->yaw_correct_deadline_ms = 0U;
@@ -122,6 +207,17 @@ static void edge_clear_runtime(EdgeMotion_t *em)
     em->yaw_velocity_active = 0U;
     em->yaw_command_wz_radps = 0.0f;
     em->turn_attempt = 0U;
+    em->corner_valid = 0U;
+    em->corner_next_to_node = 0U;
+    em->corner_next_steps = 0U;
+    em->corner_reverse = 0U;
+    em->corner_turn_deg = 0.0f;
+    em->corner_next_world_dx_m = 0.0f;
+    em->corner_next_world_dy_m = 0.0f;
+    em->corner_next_length_m = 0.0f;
+    em->corner_next_yaw_deg = 0.0f;
+    em->corner_arc_radius_m = 0.0f;
+    em->arc_entry_radius_m = 0.0f;
 }
 
 /*
@@ -156,20 +252,166 @@ static void edge_fail(EdgeMotion_t *em)
     em->state = EDGE_MOTION_ERROR;
 }
 
+/*========================================================================
+ * 直线段合并：把共线同向的连续拓扑边走成一次平移
+ *
+ * 规划层给出的是逐节点的拓扑路径，但相邻两段方向完全一样时（同一条车道
+ * 上的 1->2->3），中间那个节点既没有任务要执行，也没有理由停车。原来每段
+ * 边都要停车 + 边末航向校准，白白多花两轮起停和两次稳停的时间。
+ *
+ * 这里在领取一条边时向前预读路径，把共线同向的连续边合并成一次平移：
+ *   - 中间节点不提交、不停车、不再做航向校准；
+ *   - 只在需要拐弯的节点，或本次导航的目标节点停车；
+ *   - 任务动作仍然只在 mission 当前 stage 的目标节点执行。
+ *========================================================================*/
+
+/* 在本次规划的路径中查找节点下标；找不到返回 0xFF。 */
+static uint8_t edge_path_index(const PathResult_t *path, uint8_t node)
+{
+    uint8_t i;
+
+    if (!path || !path->valid)
+        return 0xFFU;
+
+    for (i = 0; i < path->length; i++)
+    {
+        if (path->node[i] == node)
+            return i;
+    }
+
+    return 0xFFU;
+}
+
+#if ROUTE_MERGE_STRAIGHT_EDGES
+/* a->b 与 b->c 是否严格共线同向（叉积为 0 且点积为正）。 */
+static uint8_t edge_collinear(uint8_t a, uint8_t b, uint8_t c)
+{
+    float dx1 = g_nodes[b].x - g_nodes[a].x;
+    float dy1 = g_nodes[b].y - g_nodes[a].y;
+    float dx2 = g_nodes[c].x - g_nodes[b].x;
+    float dy2 = g_nodes[c].y - g_nodes[b].y;
+    float cross = dx1 * dy2 - dy1 * dx2;
+    float dot   = dx1 * dx2 + dy1 * dy2;
+
+    if (dot <= 0.0f)
+        return 0U;  /* 反向或坐标退化 */
+
+    if (cross > ROUTE_COLLINEAR_EPS_M2 || cross < -ROUTE_COLLINEAR_EPS_M2)
+        return 0U;  /* 不在同一条直线上 */
+
+    return 1U;
+}
+#endif
+
+/*
+ * 从 from_node 出发，计算这次直线平移实际能走到哪个节点。
+ *
+ * @param to_node 输出合并后的终点；无法合并时保持 Navigation 给出的下一节点。
+ * @return 这次平移覆盖的拓扑边条数，至少为 1。
+ */
+static uint8_t edge_merge_straight_run(const EdgeMotion_t *em,
+                                       uint8_t from_node,
+                                       uint8_t *to_node)
+{
+#if ROUTE_MERGE_STRAIGHT_EDGES
+    const PathResult_t *path;
+    uint8_t target;
+    uint8_t index;
+    uint8_t end;
+
+    if (!em || !em->hmi_nav || !to_node)
+        return 1U;
+
+    path = Navigation_GetPath(&em->hmi_nav->nav);
+    target = Navigation_GetTargetNode(&em->hmi_nav->nav);
+    index = edge_path_index(path, from_node);
+
+    if (index == 0xFFU ||
+        ((uint16_t)index + 1U) >= (uint16_t)path->length)
+        return 1U;
+
+    end = (uint8_t)(index + 1U);
+
+    while (((uint16_t)end + 1U) < (uint16_t)path->length)
+    {
+        uint8_t mid = path->node[end];
+
+        /* 本次导航的目标节点必须停车，绝不跨过去。 */
+        if (mid == target)
+            break;
+
+        if (!edge_collinear(path->node[end - 1U], mid,
+                            path->node[end + 1U]))
+            break;
+
+        end++;
+    }
+
+    *to_node = path->node[end];
+    return (uint8_t)(end - index);
+#else
+    (void)em;
+    (void)from_node;
+    (void)to_node;
+    return 1U;
+#endif
+}
+
+/*
+ * 合并段跑完、真正停在 run_to_node 之后，紧接着要执行的那条边。
+ * 供“边末是否还要转向”的预测使用，保证预测对象和下一次实际领取的边一致。
+ */
+static uint8_t edge_next_run_edge(const EdgeMotion_t *em,
+                                  uint8_t run_to_node,
+                                  uint8_t *from_node,
+                                  uint8_t *to_node)
+{
+    const PathResult_t *path;
+    uint8_t index;
+
+    if (!em || !em->hmi_nav || !from_node || !to_node)
+        return 0U;
+
+    if (Navigation_GetState(&em->hmi_nav->nav) != NAV_STATE_RUNNING)
+        return 0U;
+
+    path = Navigation_GetPath(&em->hmi_nav->nav);
+    index = edge_path_index(path, run_to_node);
+
+    if (index == 0xFFU ||
+        ((uint16_t)index + 1U) >= (uint16_t)path->length)
+        return 0U;
+
+    *from_node = run_to_node;
+    *to_node   = path->node[index + 1U];
+    return 1U;
+}
+
 /*
  * 一条真实物理边只有在：
  *   位置运动完成 + HWT101 航向确认完成
  * 之后才能提交给 Navigation。
+ *
+ * 若这次平移合并了多条共线同向的拓扑边，就按 run_steps 连续推进节点下标；
+ * 中间节点既不停车，也不做边末航向校准。
  */
 static uint8_t edge_commit(EdgeMotion_t *em)
 {
+    uint8_t steps;
+    uint8_t i;
+
     if (!em || !em->hmi_nav)
         return 0U;
 
-    if (!HMI_Navigation_EdgeReached(em->hmi_nav))
+    steps = (em->run_steps > 0U) ? em->run_steps : 1U;
+
+    for (i = 0; i < steps; i++)
     {
-        edge_fail(em);
-        return 0U;
+        if (!HMI_Navigation_EdgeReached(em->hmi_nav))
+        {
+            edge_fail(em);
+            return 0U;
+        }
     }
 
     HMI_Navigation_UpdateDebugDisplay(em->hmi_nav);
@@ -200,6 +442,7 @@ static uint8_t edge_following_turn_covers_heading(EdgeMotion_t *em,
     uint8_t target_node;
     EdgeTurnOptions_t options;
     EdgeTurnPlan_t plan;
+    EdgeTurnTuning_t tuning;
 
     if (!em || !em->hmi_nav)
         return 0U;
@@ -210,15 +453,22 @@ static uint8_t edge_following_turn_covers_heading(EdgeMotion_t *em,
     if (em->arrival_align_valid && em->to_node == target_node)
         return 1U;
 
-    /* 中间节点：用与 edge_apply_turn_plan() 完全相同的决策参数预测下一段。 */
-    if (!Navigation_GetFollowingEdge(&em->hmi_nav->nav,
-                                     &from_node, &to_node))
+    /*
+     * 中间节点：用与 edge_apply_turn_plan() 完全相同的决策参数预测下一段。
+     * 合并段的终点可能已经在路径里前进了好几格，因此这里按合并终点取边，
+     * 而不是按 executor 的当前位置。
+     */
+    if (!edge_next_run_edge(em, em->to_node, &from_node, &to_node))
         return 0U;
 
-    options.allow_reverse = ROUTE_ALLOW_REVERSE;
-    options.reverse_min_turn_saving_deg = ROUTE_REVERSE_MIN_TURN_SAVING_DEG;
+    edge_turn_tuning(em, &tuning);
+
+    options.allow_reverse = tuning.allow_reverse;
+    options.reverse_min_turn_saving_deg =
+        tuning.reverse_min_turn_saving_deg;
     options.arrival_yaw_valid = 0U;
     options.arrival_world_yaw_deg = 0.0f;
+    options.allow_merged_edge = 0U; /* 预测对象是紧邻的下一段拓扑边。 */
 
     if (to_node == target_node &&
         target_node >= 1U && target_node <= NODE_NUM &&
@@ -231,12 +481,184 @@ static uint8_t edge_following_turn_covers_heading(EdgeMotion_t *em,
     if (!EdgeTurn_Plan(from_node,
                        to_node,
                        current_world_yaw_deg,
-                       ROUTE_TURN_TOLERANCE_DEG,
+                       tuning.turn_tolerance_deg,
                        &options,
                        &plan))
         return 0U;
 
     return plan.turn_required ? 1U : 0U;
+}
+
+/*========================================================================
+ * 圆滑拐角：直线 → 圆弧 → 直线
+ *
+ * 领取一段直线时向前预读：如果这段直线终点处要拐弯，就不在节点停车原地
+ * 转，而是让直线末段保持满速，提前 R 米开始走一段半径 R 的圆弧转过拐角，
+ * 再以满速接着走下一条边的直线（ROUTE_CORNER_ARC_ENABLE）。
+ *
+ * 圆弧的切线始终等于拓扑边方向，因此车体中心贴着“圆角”走，既不切角也
+ * 不偏出边线；车头由底盘航向 PD 跟随切线。
+ *
+ * 倒车边同样可以圆滑通过：车头朝向 = 行进切线 + 180°，圆弧按倒车走，
+ * 弧后直线继续倒车；切线方向连续、车头角速度与切线角速度一致，因此
+ * N2->N1->N4 这类“先倒车再拐弯”的路径也不用停车。
+ *
+ * 不能圆滑通过时返回 0，调用方保持原来的“到节点停车 + 原地转向”：
+ *   - 转角超过该区段配置的圆弧最大转角；
+ *   - 圆弧前后的直线长度不足以容纳半径；
+ *   - 拐角节点就是本次导航的目标节点（必须在节点精确停车）。
+ *
+ * 半径/最大转角/前后余量由 edge_turn_tuning() 按区段给出：普通区段取
+ * ROUTE_CORNER_ARC_*，N2->N4 区段取 ROUTE_SEG_N2_N4_CORNER_ARC_*。
+ *========================================================================*/
+
+/*
+ * 预读本段直线终点处的拐角。
+ *
+ * @param corner_node   本段直线的终点（拐角节点）
+ * @param run_dir_deg   本段直线的车头世界航向（前进=切线，倒车=切线+180°）
+ * @param run_length_m  本段直线的长度
+ * @param run_backward  本段是否倒车
+ * @return 1=可以用圆弧通过，结果写入 em->corner_*。
+ */
+static uint8_t edge_plan_corner(EdgeMotion_t *em,
+                                uint8_t corner_node,
+                                float run_dir_deg,
+                                float run_length_m,
+                                uint8_t run_backward)
+{
+    uint8_t end_node = corner_node;
+    uint8_t steps;
+    uint8_t target;
+    float dx;
+    float dy;
+    float length;
+    float dir_deg;
+    float travel_dir_deg;
+    float turn_deg;
+    float min_run_m;
+    EdgeTurnTuning_t tuning;
+
+    if (!em || !em->hmi_nav)
+        return 0U;
+
+    em->corner_valid = 0U;
+    em->corner_reverse = 0U;
+    em->corner_arc_radius_m = 0.0f;
+
+    /* N2->N4 区段的转弯参数与其他区段分开，见 edge_turn_tuning()。 */
+    edge_turn_tuning(em, &tuning);
+    if (!tuning.arc_enable)
+        return 0U;
+
+    target = Navigation_GetTargetNode(&em->hmi_nav->nav);
+    if (corner_node == target)
+        return 0U;
+
+    /* 圆弧之后实际要走的直线（同样把共线边合并掉）。 */
+    steps = edge_merge_straight_run(em, corner_node, &end_node);
+    if (steps == 0U || end_node == corner_node)
+        return 0U;
+
+    dx = g_nodes[end_node].x - g_nodes[corner_node].x;
+    dy = g_nodes[end_node].y - g_nodes[corner_node].y;
+    length = sqrtf(dx * dx + dy * dy);
+    if (length <= 0.0f)
+        return 0U;
+
+    dir_deg = atan2f(dx, dy) * EDGE_MOTION_RAD_TO_DEG_F;
+    /* 倒车时车头与行进方向差 180°，转角必须按切线（行进方向）计算。 */
+    travel_dir_deg = run_backward ?
+                     EdgeTurn_WrapDeg(run_dir_deg + 180.0f) : run_dir_deg;
+    turn_deg = EdgeTurn_WrapDeg(dir_deg - travel_dir_deg);
+
+    if (edge_absf(turn_deg) <= tuning.turn_tolerance_deg)
+        return 0U;  /* 直行通过，不是拐角 */
+    if (edge_absf(turn_deg) > tuning.arc_max_deg)
+        return 0U;  /* 掉头等大角度仍停车原地转 */
+
+    min_run_m = tuning.arc_radius_m + tuning.arc_min_margin_m;
+    if (run_length_m < min_run_m || length < min_run_m)
+        return 0U;
+
+    em->corner_valid = 1U;
+    em->corner_reverse = run_backward ? 1U : 0U;
+    em->corner_turn_deg = turn_deg;
+    em->corner_next_to_node = end_node;
+    em->corner_next_steps = steps;
+    em->corner_next_world_dx_m = dx;
+    em->corner_next_world_dy_m = dy;
+    em->corner_next_length_m = length;
+    em->corner_arc_radius_m = tuning.arc_radius_m;
+    /* 弧后直线的车头目标航向：倒车时同样是切线+180°。 */
+    em->corner_next_yaw_deg = run_backward ?
+                              EdgeTurn_WrapDeg(dir_deg + 180.0f) : dir_deg;
+    return 1U;
+}
+
+/*
+ * 启动一段世界系直线。
+ *
+ * ramp_in=0 表示从圆弧出来，ramp_out 由 em->corner_valid 决定：
+ * 有拐角时保持满速交给圆弧，没有拐角时正常减速停车。
+ * 圆弧前后各要占用 R 米直线来过渡，因此实际平直段长度要扣掉对应半径。
+ */
+static void edge_start_straight(EdgeMotion_t *em,
+                                float world_dx_m, float world_dy_m,
+                                float body_dy_m,
+                                float target_world_yaw_deg,
+                                float run_length_m,
+                                uint8_t ramp_in,
+                                uint32_t now_ms)
+{
+    float trim_m = run_length_m;
+    float scale = 1.0f;
+    float entry_radius_m = em->arc_entry_radius_m;
+
+    em->arc_entry_radius_m = 0.0f;
+    if (!ramp_in)
+        trim_m -= entry_radius_m;              /* 圆弧出口：用刚走过的圆弧半径 */
+    if (em->corner_valid)
+        trim_m -= em->corner_arc_radius_m;     /* 圆弧入口：用本段拐角的半径 */
+
+    if (trim_m < 0.05f)
+        trim_m = 0.05f;
+
+    if (run_length_m > 0.0001f)
+        scale = trim_m / run_length_m;
+
+    chassis_motion_drift_segment(em->chassis,
+                                 world_dx_m, world_dy_m,
+                                 body_dy_m * scale,
+                                 target_world_yaw_deg,
+                                 ROUTE_EDGE_SPEED_MPS,
+                                 ramp_in,
+                                 em->corner_valid ? 0U : 1U,
+                                 now_ms);
+}
+
+/*
+ * 直线末段满速进入圆弧：切线方向 = 当前边行进方向，车头目标随之旋转。
+ * 倒车边传入的切线是“车头航向 + 180°”，并把 reverse 交给底盘层，
+ * 由底盘把车头锁在切线+180°。
+ */
+static void edge_start_corner_arc(EdgeMotion_t *em, uint32_t now_ms)
+{
+    float start_tangent_deg = em->edge_heading_ref_deg;
+
+    if (em->corner_reverse)
+        start_tangent_deg = EdgeTurn_WrapDeg(start_tangent_deg + 180.0f);
+
+    em->chassis->acceleration = EDGE_MOTION_MOVE_ACC;
+    em->arc_entry_radius_m = em->corner_arc_radius_m;
+    chassis_motion_arc_world_ex(em->chassis,
+                                start_tangent_deg,
+                                em->corner_turn_deg,
+                                em->corner_arc_radius_m,
+                                ROUTE_EDGE_SPEED_MPS,
+                                em->corner_reverse,
+                                now_ms);
+    em->state = EDGE_MOTION_CORNER_ARC;
 }
 
 static uint32_t edge_yaw_timeout_ms(float yaw_error_deg)
@@ -301,10 +723,14 @@ static uint8_t edge_start_yaw_correction(EdgeMotion_t *em,
 /*
  * 根据 edge_turn 的纯计算结果启动下一动作。
  *
- * 需要转向：下发最短位置转角，等待状态机复查 IMU。
+ * 需要转向：下发最短转角的速度剖面，等待状态机复查 IMU。
  * 已对准：不再做世界->车身横移换算，固定 dx=0；dy由决策层选择
  *         +边长（前进）或-边长（后退），从执行层保证整条拓扑边只沿
  *         车身Y轴行驶，既杜绝大距离横移，也避免不必要的180°转向。
+ *         直线段由 chassis_motion_drift_translate() 边走边锁航向。
+ *
+ * 启动直线段之前会向前预读一个拐角：终点要拐弯时直线末段保持满速，
+ * 接着由 EDGE_MOTION_CORNER_ARC 走圆弧过去（见 edge_plan_corner）。
  */
 static uint8_t edge_apply_turn_plan(EdgeMotion_t *em,
                                     float current_world_yaw_deg,
@@ -312,15 +738,22 @@ static uint8_t edge_apply_turn_plan(EdgeMotion_t *em,
 {
     EdgeTurnPlan_t plan;
     EdgeTurnOptions_t options;
+    EdgeTurnTuning_t tuning;
     uint8_t navigation_target;
 
     if (!em || !em->chassis || !em->hmi_nav)
         return 0U;
 
-    options.allow_reverse = ROUTE_ALLOW_REVERSE;
-    options.reverse_min_turn_saving_deg = ROUTE_REVERSE_MIN_TURN_SAVING_DEG;
+    /* N2->N4 区段使用专用转弯参数，其他区段取全局值。 */
+    edge_turn_tuning(em, &tuning);
+
+    options.allow_reverse = tuning.allow_reverse;
+    options.reverse_min_turn_saving_deg =
+        tuning.reverse_min_turn_saving_deg;
     options.arrival_yaw_valid = 0U;
     options.arrival_world_yaw_deg = 0.0f;
+    /* 合并段的起终点在 g_graph 中没有直接边，需要显式放行连通性检查。 */
+    options.allow_merged_edge = (em->run_steps > 1U) ? 1U : 0U;
 
     /*
      * 只有to_node恰好是本次导航最终目标时，task_yaw才属于这一次到站动作。
@@ -338,7 +771,7 @@ static uint8_t edge_apply_turn_plan(EdgeMotion_t *em,
     if (!EdgeTurn_Plan(em->from_node,
                        em->to_node,
                        current_world_yaw_deg,
-                       ROUTE_TURN_TOLERANCE_DEG,
+                       tuning.turn_tolerance_deg,
                        &options,
                        &plan))
         return 0U;
@@ -360,19 +793,36 @@ static uint8_t edge_apply_turn_plan(EdgeMotion_t *em,
         em->chassis->acceleration = ROUTE_TURN_ACC;
         chassis_motion_rotate_deg(em->chassis,
                                   plan.chassis_turn_deg,
-                                  ROUTE_TURN_SPEED_MPS,
+                                  tuning.turn_speed_mps,
                                   now_ms);
         em->turn_attempt++;
         em->state = EDGE_MOTION_TURNING_TO_EDGE;
         return 1U;
     }
 
+    /*
+     * 直线段改用漂移路径：世界方向由节点向量给出，车体中心沿世界直线
+     * 前进/后退；底盘层在行驶过程中用 HWT101 世界航向做 PD，把车头锁在
+     * 本边目标航向上。
+     *
+     * 同时预读本段终点处的拐角：能圆滑通过时，直线末段保持满速进入圆弧，
+     * 由 EDGE_MOTION_CORNER_ARC 接着把车头转到下一条边的方向。
+     */
+    (void)edge_plan_corner(em,
+                           em->to_node,
+                           plan.target_world_yaw_deg,
+                           plan.distance_m,
+                           plan.drive_backward);
+
     em->chassis->acceleration = EDGE_MOTION_MOVE_ACC;
-    chassis_motion_translate(em->chassis,
-                             0.0f,
-                             plan.body_dy_m,
-                             ROUTE_EDGE_SPEED_MPS,
-                             now_ms);
+    edge_start_straight(em,
+                        plan.world_dx_m,
+                        plan.world_dy_m,
+                        plan.body_dy_m,
+                        plan.target_world_yaw_deg,
+                        plan.distance_m,
+                        1U,
+                        now_ms);
     em->state = EDGE_MOTION_TRANSLATING;
     return 1U;
 }
@@ -396,6 +846,17 @@ void EdgeMotion_Init(EdgeMotion_t *em, Chassis *chassis, HMI_Navigation_t *hmi_n
     em->drive_backward = 0U;
     em->turn_attempt = 0U;
     em->arrival_align_valid = 0U;
+    em->corner_valid = 0U;
+    em->corner_next_to_node = 0U;
+    em->corner_next_steps = 0U;
+    em->corner_reverse = 0U;
+    em->corner_turn_deg = 0.0f;
+    em->corner_next_world_dx_m = 0.0f;
+    em->corner_next_world_dy_m = 0.0f;
+    em->corner_next_length_m = 0.0f;
+    em->corner_next_yaw_deg = 0.0f;
+    em->corner_arc_radius_m = 0.0f;
+    em->arc_entry_radius_m = 0.0f;
     heading_init(&em->yaw_controller,
                  EDGE_MOTION_YAW_KP,
                  EDGE_MOTION_YAW_KD,
@@ -445,7 +906,7 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
 
     /*
      * 真暂停必须停止物理运动。
-     * 位置模式被异步打断后，驱动器剩余距离无法可靠还原，所以保持 10.4 原设计：
+     * 速度剖面被异步打断后剩余距离无法可靠还原，所以保持 10.4 原设计：
      * 不盲目 resume 当前边，而是进入 PAUSE_ABORT，等待上层重新定位/规划。
      */
     if (nav_state == NAV_STATE_PAUSED)
@@ -507,9 +968,71 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
 
         if (chassis_motion_done(em->chassis))
         {
+            /* 终点处需要拐弯：不停车，直线末段保持满速直接进圆弧。 */
+            if (em->corner_valid)
+            {
+                edge_start_corner_arc(em, now_ms);
+                return;
+            }
+
             em->state = EDGE_MOTION_SETTLE_AFTER_TRANSLATE;
             em->settle_until_ms = now_ms + EDGE_MOTION_YAW_SETTLE_MS;
         }
+        return;
+    }
+
+    /* 3b) 圆弧通过拐角：结束后无缝接上下一条边的直线。 */
+    if (em->state == EDGE_MOTION_CORNER_ARC)
+    {
+        float next_dx;
+        float next_dy;
+        float next_length;
+        float next_yaw;
+        uint8_t next_to_node;
+        uint8_t next_steps;
+        uint8_t next_reverse;
+
+        if (chassis_motion_failed(em->chassis))
+        {
+            edge_fail(em);
+            return;
+        }
+
+        if (!chassis_motion_done(em->chassis))
+            return;
+
+        next_dx = em->corner_next_world_dx_m;
+        next_dy = em->corner_next_world_dy_m;
+        next_length = em->corner_next_length_m;
+        next_yaw = em->corner_next_yaw_deg;
+        next_to_node = em->corner_next_to_node;
+        next_steps = em->corner_next_steps;
+        next_reverse = em->corner_reverse;
+
+        /*
+         * 圆弧已经越过拐角节点，但 Navigation 只在整段直线（含圆弧）
+         * 真正结束并完成航向确认后才提交；这里先累计拓扑边条数。
+         */
+        em->from_node = em->to_node;
+        em->to_node = next_to_node;
+        em->run_steps = (uint8_t)(em->run_steps + next_steps);
+
+        em->world_dx_m = next_dx;
+        em->world_dy_m = next_dy;
+        em->body_dx_m = 0.0f;
+        em->body_dy_m = next_reverse ? -next_length : next_length;
+        em->edge_heading_ref_deg = next_yaw;
+        em->drive_backward = next_reverse;
+
+        /* 继续预读下一个拐角，支持连续拐弯不停车（倒车段继续按倒车预读）。 */
+        (void)edge_plan_corner(em, em->to_node, next_yaw,
+                               next_length, next_reverse);
+
+        em->chassis->acceleration = EDGE_MOTION_MOVE_ACC;
+        edge_start_straight(em, next_dx, next_dy,
+                            next_reverse ? -next_length : next_length,
+                            next_yaw, next_length, 0U, now_ms);
+        em->state = EDGE_MOTION_TRANSLATING;
         return;
     }
 
@@ -653,6 +1176,14 @@ void EdgeMotion_Update(EdgeMotion_t *em, uint32_t now_ms)
         edge_save_acceleration(em);
         em->turn_attempt = 0U;
 
+        /*
+         * 先向前预读路径：共线同向的连续边合并成一次直线平移，
+         * 只在需要拐弯的节点或本次导航目标节点停车。
+         */
+        em->run_steps = edge_merge_straight_run(em,
+                                                em->from_node,
+                                                &em->to_node);
+
         if (!edge_apply_turn_plan(em, current_yaw_deg, now_ms))
             edge_fail(em);
     }
@@ -679,6 +1210,7 @@ uint8_t EdgeMotion_IsActive(const EdgeMotion_t *em)
 
     return (em->state == EDGE_MOTION_TURNING_TO_EDGE ||
             em->state == EDGE_MOTION_SETTLE_AFTER_TURN ||
+            em->state == EDGE_MOTION_CORNER_ARC ||
             em->state == EDGE_MOTION_TRANSLATING ||
             em->state == EDGE_MOTION_SETTLE_AFTER_TRANSLATE ||
             em->state == EDGE_MOTION_YAW_CORRECTING ||

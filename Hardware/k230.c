@@ -313,18 +313,6 @@ uint32_t K230_TakeEvents(void)
     return events;
 }
 
-uint8_t K230_GetStatus(K230_Status_t *out)
-{
-    if ((out == NULL) ||
-        (!g_k230_status.valid))
-    {
-        return 0U;
-    }
-
-    *out = g_k230_status;
-    return 1U;
-}
-
 uint8_t K230_IsOnline(uint32_t now_ms)
 {
     if (!g_k230_status.valid)
@@ -405,31 +393,6 @@ HAL_StatusTypeDef K230_SendString(const char *text)
     return HAL_UART_Transmit(&huart4, (uint8_t *)text, len, 100U);
 }
 
-static uint8_t k230_task_can_start(void)
-{
-    return (g_k230_task_state == K230_TASK_IDLE) ||
-           (g_k230_task_state == K230_TASK_DONE) ||
-           (g_k230_task_state == K230_TASK_ERROR);
-}
-
-static void k230_task_clear_result(
-    K230_TaskMode_t mode,
-    uint8_t requested_id,
-    uint32_t now_ms)
-{
-    memset(&g_k230_task_result,
-           0,
-           sizeof(g_k230_task_result));
-
-    g_k230_task_result.mode = mode;
-    g_k230_task_result.requested_id = requested_id;
-    g_k230_task_result.start_ms = now_ms;
-    g_k230_task_result.start_message_count =
-        g_k230_status.message_count;
-    g_k230_task_result.last_message_count =
-        g_k230_status.message_count;
-}
-
 static void k230_task_fail(uint8_t error_code)
 {
     uint8_t index = 0U;
@@ -450,67 +413,6 @@ static void k230_task_fail(uint8_t error_code)
     }
 
     g_k230_task_state = K230_TASK_ERROR;
-}
-
-uint8_t K230_TaskStartDetect(uint8_t color_id)
-{
-    uint32_t now_ms;
-
-    if (!k230_task_can_start() ||
-        (color_id < 1U) ||
-        (color_id > 6U))
-    {
-        return 0U;
-    }
-
-    /* 先解析并清掉旧任务残留，防止旧grab/offset被本次任务使用。 */
-    K230_Process();
-    (void)K230_TakeEvents();
-
-    now_ms = HAL_GetTick();
-    k230_task_clear_result(
-        K230_TASK_MODE_DETECT,
-        color_id,
-        now_ms);
-
-    if (K230_StartDetect(color_id) != HAL_OK)
-    {
-        k230_task_fail(K230_TASK_ERROR_SEND);
-        return 0U;
-    }
-
-    g_k230_task_state = K230_TASK_WAIT_RESULT;
-    return 1U;
-}
-
-uint8_t K230_TaskStartPlace(uint8_t position_id)
-{
-    uint32_t now_ms;
-
-    if (!k230_task_can_start() ||
-        (position_id < 1U) ||
-        (position_id > 3U))
-    {
-        return 0U;
-    }
-
-    K230_Process();
-    (void)K230_TakeEvents();
-
-    now_ms = HAL_GetTick();
-    k230_task_clear_result(
-        K230_TASK_MODE_PLACE,
-        position_id,
-        now_ms);
-
-    if (K230_StartPlace(position_id) != HAL_OK)
-    {
-        k230_task_fail(K230_TASK_ERROR_SEND);
-        return 0U;
-    }
-
-    g_k230_task_state = K230_TASK_WAIT_RESULT;
-    return 1U;
 }
 
 void K230_TaskUpdate(uint32_t now_ms)
@@ -588,56 +490,3 @@ void K230_TaskAbort(void)
     (void)K230_TakeEvents();
     g_k230_task_state = K230_TASK_IDLE;
 }
-
-uint8_t K230_TaskIsBusy(void)
-{
-    return (g_k230_task_state ==
-            K230_TASK_WAIT_RESULT) ? 1U : 0U;
-}
-
-uint8_t K230_TaskIsDone(void)
-{
-    return (g_k230_task_state ==
-            K230_TASK_DONE) ? 1U : 0U;
-}
-
-uint8_t K230_TaskHasError(void)
-{
-    return (g_k230_task_state ==
-            K230_TASK_ERROR) ? 1U : 0U;
-}
-
-uint8_t K230_TaskTakeOffset(
-    char *direction,
-    int32_t *offset_px)
-{
-    if ((direction == NULL) ||
-        (offset_px == NULL) ||
-        (!g_k230_task_result.offset_pending))
-    {
-        return 0U;
-    }
-
-    *direction = g_k230_task_result.direction;
-    *offset_px = g_k230_task_result.offset_px;
-    g_k230_task_result.offset_pending = 0U;
-    return 1U;
-}
-
-uint8_t K230_TaskGetResult(K230_TaskResult_t *out)
-{
-    if (out == NULL)
-    {
-        return 0U;
-    }
-
-    *out = g_k230_task_result;
-    return 1U;
-}
-
-
-
-
-
-
-

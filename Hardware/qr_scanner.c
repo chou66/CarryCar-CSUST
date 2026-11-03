@@ -172,14 +172,3 @@ uint8_t QRScanner_GetNewCode(char *out, uint16_t max_len)
     s_consumed_seq = seq;
     return 1U;
 }
-
-uint8_t QRScanner_GetLatestCode(char *out, uint16_t max_len)
-{
-    return copy_code_stable(out, max_len, NULL);
-}
-
-uint8_t QRScanner_IsOnline(uint32_t now_ms)
-{
-    return (s_last_frame_ms != 0U &&
-            (uint32_t)(now_ms - s_last_frame_ms) <= 2000U) ? 1U : 0U;
-}

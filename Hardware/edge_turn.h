@@ -47,6 +47,13 @@ typedef struct
     float reverse_min_turn_saving_deg;
     uint8_t arrival_yaw_valid;
     float arrival_world_yaw_deg;
+
+    /*
+     * 置 1 表示 from_node -> to_node 是运动层合并出来的一条“直线段”，
+     * 中间跨过了若干同向节点，因此 g_graph 里查不到直接边。
+     * 置 1 时跳过拓扑连通性检查；合并的合法性由 edge_motion 的共线判断保证。
+     */
+    uint8_t allow_merged_edge;
 } EdgeTurnOptions_t;
 
 /* 把角度归一化到 [-180, 180]。 */

@@ -826,8 +826,3 @@ uint16_t RawMaterialAlign_GetIteration(void)
 {
     return s_iteration;
 }
-
-uint8_t RawMaterialAlign_GetError(void)
-{
-    return robot_raw_align_error;
-}

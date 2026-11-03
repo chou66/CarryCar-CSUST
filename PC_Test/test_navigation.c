@@ -36,6 +36,46 @@ int main(void)
     check(Navigation_Init(&n,5,0)&&Navigation_PlanTo(&n,5),"Same-node plan");
     check(Navigation_IsDone(&n)&&Navigation_GetCurrentNode(&n)==5,"Same-node DONE");
 
+    /* 固定动线偏好：扫码 N6->原料 N8 优先经 N9，粗加工 N2->暂存 N4 优先经 N1 */
+    Navigation_Init(&n,6,0);
+    check(Navigation_PlanTo(&n,8),"Plan N6->N8 via N9");
+    p=Navigation_GetPath(&n);
+    check(p&&p->valid&&p->length==3&&p->node[0]==6&&p->node[1]==9&&p->node[2]==8,
+          "Preferred route N6->N9->N8");
+    check(run(&n)&&Navigation_GetCurrentNode(&n)==8,"Preferred route arrives N8");
+
+    Navigation_Init(&n,2,0);
+    check(Navigation_PlanTo(&n,4),"Plan N2->N4 via N1");
+    p=Navigation_GetPath(&n);
+    check(p&&p->valid&&p->length==3&&p->node[0]==2&&p->node[1]==1&&p->node[2]==4,
+          "Preferred route N2->N1->N4");
+    check(run(&n)&&Navigation_GetCurrentNode(&n)==4,"Preferred route arrives N4");
+
+    /* 偏好路线封路时回退普通最短路：节点封路 (bit8=N9, bit0=N1) 与边封路 (bit20=6-9, bit15=1-4) */
+    Navigation_Init(&n,6,(1UL<<8));
+    check(Navigation_PlanTo(&n,8),"Plan N6->N8 with N9 blocked");
+    p=Navigation_GetPath(&n);
+    check(p&&p->valid&&p->length==3&&p->node[1]==5&&p->node[2]==8,
+          "Fallback N6->N5->N8 when N9 blocked");
+
+    Navigation_Init(&n,2,(1UL<<0));
+    check(Navigation_PlanTo(&n,4),"Plan N2->N4 with N1 blocked");
+    p=Navigation_GetPath(&n);
+    check(p&&p->valid&&p->length==3&&p->node[1]==5&&p->node[2]==4,
+          "Fallback N2->N5->N4 when N1 blocked");
+
+    Navigation_Init(&n,6,(1UL<<20));
+    check(Navigation_PlanTo(&n,8),"Plan N6->N8 with edge 6-9 blocked");
+    p=Navigation_GetPath(&n);
+    check(p&&p->valid&&p->length==3&&p->node[1]==5&&p->node[2]==8,
+          "Fallback N6->N5->N8 when edge 6-9 blocked");
+
+    Navigation_Init(&n,2,(1UL<<15));
+    check(Navigation_PlanTo(&n,4),"Plan N2->N4 with edge 1-4 blocked");
+    p=Navigation_GetPath(&n);
+    check(p&&p->valid&&p->length==3&&p->node[1]==5&&p->node[2]==4,
+          "Fallback N2->N5->N4 when edge 1-4 blocked");
+
     Navigation_Init(&n,9,0); Navigation_PlanTo(&n,3);
     check(Navigation_Pause(&n)&&Navigation_GetState(&n)==NAV_STATE_PAUSED,"Pause");
     check(!Navigation_GetCurrentEdge(&n,&a,&b)&&!Navigation_EdgeReached(&n),

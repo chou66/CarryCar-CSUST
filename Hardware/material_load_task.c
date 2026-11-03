@@ -71,35 +71,6 @@ void MaterialLoadTask_Init(void)
     state_start_ms = 0U;
 }
 
-bool MaterialLoadTask_Start(
-    ManipulatorPickupSource_t source)
-{
-    if (!task_can_start())
-    {
-        return false;
-    }
-
-    switch (source)
-    {
-        case MANIP_PICKUP_SOURCE_GROUND:
-        case MANIP_PICKUP_SOURCE_TABLE:
-            break;
-
-        default:
-            return false;
-    }
-
-    task_mode = MATERIAL_TASK_MODE_LOAD;
-    pickup_source = source;
-    task_index = 0U;
-
-    enter_state(
-        MATERIAL_TASK_MOVE_TRAY,
-        HAL_GetTick());
-
-    return true;
-}
-
 bool MaterialUnloadTask_Start(void)
 {
     if (!task_can_start())
@@ -224,29 +195,4 @@ bool MaterialLoadTask_IsBusy(void)
     return (task_state != MATERIAL_TASK_IDLE) &&
            (task_state != MATERIAL_TASK_DONE) &&
            (task_state != MATERIAL_TASK_ERROR);
-}
-
-bool MaterialLoadTask_IsDone(void)
-{
-    return task_state == MATERIAL_TASK_DONE;
-}
-
-bool MaterialLoadTask_HasError(void)
-{
-    return task_state == MATERIAL_TASK_ERROR;
-}
-
-MaterialTaskMode_t MaterialLoadTask_GetMode(void)
-{
-    return task_mode;
-}
-
-MaterialTaskState_t MaterialLoadTask_GetState(void)
-{
-    return task_state;
-}
-
-uint8_t MaterialLoadTask_GetPickupIndex(void)
-{
-    return task_index;
 }

@@ -8,7 +8,10 @@
 #define VOFA_CHASSIS_MAX_RPM     100U
 
 /* Formal chassis-motion validation.
- * 0.20 m/s is approximately 50 wheel RPM for the current 77 mm wheel.
+ *
+ * 0x42~0x45（横移/原地转）仍使用本速度；0x40/0x41（前进/后退）已改为
+ * 与正式导航直边相同的漂移执行器，速度固定用 ROUTE_EDGE_SPEED_MPS，
+ * 以便用它们标定 CHASSIS_FORWARD_PULSES_PER_M。
  */
 #define VOFA_FORMAL_MOVE_SPEED_MPS  0.80f
 #define VOFA_FORMAL_MOVE_ACC        130U
@@ -68,9 +71,12 @@
  * 36 rotate CW:     P1=rpm/10, P2=acc
  * 37 chassis stop
  *
- * Formal chassis_motion/chassis_set_position validation:
- * 40 forward by VOFA_FORMAL_DISTANCE_M (currently 1.00 m)
- * 41 backward by VOFA_FORMAL_DISTANCE_M (currently 1.00 m)
+ * Formal chassis_motion validation:
+ * 40 forward by VOFA_FORMAL_DISTANCE_M (currently 0.90 m). Uses the same
+ *    drift path as a navigation edge: HWT101 world-heading hold plus
+ *    ROUTE_EDGE_SPEED_MPS, so it can calibrate CHASSIS_FORWARD_PULSES_PER_M.
+ * 41 backward by VOFA_FORMAL_DISTANCE_M (currently 0.90 m). Same drift path
+ *    with the world travel direction reversed and the heading held.
  * 42 strafe left by VOFA_FORMAL_DISTANCE_M (currently 1.00 m)
  * 43 strafe right by VOFA_FORMAL_DISTANCE_M (currently 1.00 m)
  * 44 rotate CCW 90 deg
@@ -220,7 +226,8 @@
  * 14=VOFA motion command rejected: send 0x70 first,
  * 15=VOFA takeover is stopping RobotApp; wait briefly and retry,
  * 17=calibration owns actuators; conflicting command rejected,
- * 18=calibration rejected command; see ch1 error code.
+ * 18=calibration rejected command; see ch1 error code,
+ * 20=0x40/0x41 rejected: HWT101 not fresh or world zero unavailable.
  * 粗加工 ch1：1参数、2忙、3 IMU、4寻路、5边运动、6未回零、7机械臂、
  * 8启停区出库。暂存区相同，另加9=K230对准失败。
  */
@@ -322,10 +329,4 @@ extern volatile uint32_t cal_dbg_execute_count;
  * pre-move status query (bus round trip OK), 0 if it did not.
  */
 uint8_t Motor1_RevTest(void);
-
-/*
- * Direct CAN smoke test: slide-rail motor (id 6) turns two revolutions.
- * Same probe-first contract; see vofa_debug.c for the pulses-per-rev note.
- */
-uint8_t Slide_RevTest(void);
 #endif

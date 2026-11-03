@@ -268,9 +268,8 @@ static ManipPose_t current_step_pose(void)
 /*
  * 滑台是否已经停在原料识别位。
  *
- * RawStationTask 在车体 +X 停靠平移的同一个窗口里把齿条预伸到
- * RAW_VISION_SLIDE_START_MM；满足这个条件时本区域第一步可以跳过
- * SLIDE_OUT，直接进入视觉识别。
+ * RawStationTask 在到站时把齿条预伸到 RAW_VISION_SLIDE_START_MM；
+ * 满足这个条件时本区域第一步可以跳过 SLIDE_OUT，直接进入视觉识别。
  */
 static bool raw_slide_prealigned_ready(ZoneId_t zone)
 {
@@ -363,7 +362,7 @@ static bool task_can_start(ZoneId_t zone)
      * 相对原点算的。急停或上一轮失败后基准会作废，此时直接拒绝启动，
      * 而不是启动后才发现点动发不出去。
      *
-     * 例外：RawStationTask 已在停靠平移窗口里把齿条预伸到原料识别位，
+     * 例外：RawStationTask 已在到站时把齿条预伸到原料识别位，
      * 此时滑台基准是 ALIGN 且位置为 RAW_VISION_SLIDE_START_MM，属于
      * 正常输入；第一步的视觉识别会直接从这个位置开始。
      */
@@ -535,8 +534,8 @@ void ZoneTask_Update(uint32_t now_ms)
                  * 到该姿态并张开夹爪，再把滑台前伸到该位的前伸量，让取像
                  * 姿态和取像距离都对上——顺序见 SLIDE_OUT 那一段。
                  *
-                 * 本区域第一步的齿条已经由 RawStationTask 在车体停靠平移
-                 * 的同一窗口里预伸到位，此时跳过 SLIDE_OUT 直接识别。
+                 * 本区域第一步的齿条已经由 RawStationTask 在到站时预伸
+                 * 到位，此时跳过 SLIDE_OUT 直接识别。
                  */
                 if (current_align_color(&active_program->steps[task_index]) != 0U)
                 {

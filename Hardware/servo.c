@@ -59,11 +59,11 @@ uint16_t Servo_AngleToUs(float angle_deg, float travel_deg)
 }
 
 #define CAROUSEL_STEP_PERIOD_MS     20U  //多久改变一次脉宽
-#define CAROUSEL_STEP_US            30U  //每次改变多少脉宽
+#define CAROUSEL_STEP_US            40U  //每次改变多少脉宽
 #define CAROUSEL_SETTLE_MS          50U //输出到达目标后的稳定时间
 
 #define GRIPPER_STEP_PERIOD_MS      20U
-#define GRIPPER_STEP_US             30U
+#define GRIPPER_STEP_US             40U
 #define GRIPPER_SETTLE_MS           50U
 
 typedef enum
@@ -98,10 +98,17 @@ void Servo_Init(void)
 {
     uint16_t carousel_poweron_us =
         Servo_AngleToUs(CAROUSEL_POWERON_DEG, CAROUSEL_TRAVEL_DEG);
+    uint16_t tray_poweron_us =
+        Servo_AngleToUs(TRAY_SELECTOR_POWERON_DEG, TRAY_SELECTOR_TRAVEL_DEG);
 
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, SERVO_CENTER_US);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, SERVO_CENTER_US);
-	  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, SERVO_CENTER_US);
+    /* 料盘上电直接输出 TRAY_SELECTOR_POWERON_DEG（TraySelectorServo 无软件
+     * 状态跟踪，SetUs 直接写寄存器，无需同步其他变量）。 */
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, tray_poweron_us);
+    /* 云台上电直接输出 CAROUSEL_POWERON_DEG，软件状态与物理位置保持一致，
+     * 否则第一次 SetAngle 会从 1500 us 突跳到 carousel_current_us。 */
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, carousel_poweron_us);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, SERVO_CENTER_US);
+    /* CH4 已不承载料盘，固定输出中点。 */
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, SERVO_CENTER_US);
 	
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
@@ -124,11 +131,13 @@ void Servo_Init(void)
 
 }
 
-/*Pwm1Servo_SetUs()       → TIM3_CH1 → 板载PWM1
-CarouselServo_SetUs()     → TIM3_CH2 → 板载PWM2
-TraySelectorServo_SetUs() → TIM3_CH4 → 板载PWM3
-GripperServo_SetUs()      → TIM3_CH3 → 板载PWM4*/
+/*TraySelectorServo_SetUs() → TIM3_CH1 → 板载PWM1  （料盘选择）
+CarouselServo_SetUs()     → TIM3_CH2 → 板载PWM2  （云台旋转）
+GripperServo_SetUs()      → TIM3_CH3 → 板载PWM4  （夹爪开合）
+TIM3_CH4 / 板载PWM3       → 预留，固定输出中点 1500 us*/
 
+/* PWM1 与料盘共用 TIM3_CH1，本函数等价于 TraySelectorServo_SetUs()，
+ * 保留给 VOFA 0x22 命令里 p1=0 的老用法。 */
 void Pwm1Servo_SetUs(uint16_t us)
 {
     __HAL_TIM_SET_COMPARE(&htim3,TIM_CHANNEL_1,clamp_us(us));
@@ -263,15 +272,6 @@ void GripperServo_Update(uint32_t now_ms)
     }
 }
 
-bool GripperServo_IsBusy(void)
-{
-    return
-        (gripper_state ==
-         GRIPPER_STATE_MOVING) ||
-        (gripper_state ==
-         GRIPPER_STATE_SETTLING);
-}
-
 bool GripperServo_IsDone(void)
 {
     return
@@ -281,10 +281,10 @@ bool GripperServo_IsDone(void)
          GRIPPER_STATE_DONE);
 }
 
-/*物料选择*/
+/*物料选择：板载PWM1 / TIM3_CH1*/
 void TraySelectorServo_SetUs(uint16_t us)
 {
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, clamp_us(us));
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, clamp_us(us));
 }
 
 void TraySelectorServo_SetAngle(float angle_deg)
@@ -410,12 +410,6 @@ void CarouselServo_Update(uint32_t now_ms)
     }
 }
 
-bool CarouselServo_IsBusy(void)
-{
-    return (carousel_state == CAROUSEL_STATE_MOVING) ||
-           (carousel_state == CAROUSEL_STATE_SETTLING);
-}
-
 bool CarouselServo_IsDone(void)
 {
     return (carousel_state == CAROUSEL_STATE_IDLE) ||
@@ -424,19 +418,9 @@ bool CarouselServo_IsDone(void)
 
 
 //三个固定位置(夹取位、放置位、回中位）
-void CarouselServo_ToPickupPos1(void)
-{
-    CarouselServo_SetAngle(CAROUSEL_PICKUP_POS1_DEG);
-}
-
 void CarouselServo_ToPickup(void)
 {
     CarouselServo_SetAngle(CAROUSEL_PICKUP_POS2_DEG);
-}
-
-void CarouselServo_ToPickupPos3(void)
-{
-    CarouselServo_SetAngle(CAROUSEL_PICKUP_POS3_DEG);
 }
 
 void CarouselServo_ToPlace(void)

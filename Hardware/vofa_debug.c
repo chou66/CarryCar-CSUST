@@ -1,4 +1,5 @@
 #include "vofa_debug.h"
+#include <math.h>
 #include "usart.h"
 #include "app_uart.h"
 #include "hwt101_uart.h"
@@ -595,36 +596,6 @@ uint8_t Motor1_RevTest(void)
     return 1U;
 }
 
-/*
- * Direct CAN smoke test for the slide-rail motor (CAN address MOTOR_SLIDE_ID):
- * rotate two motor revolutions, 30 rpm, acc 10.
- *
- * NOTE: pulses per revolution assume the same 16-microstep setup as the
- * wheel motors (3200/rev). If the slide driver uses a different
- * subdivision, adjust SLIDE_TEST_PULSES_PER_REV.
- *
- * Same contract as Motor1_RevTest(): a status query on id 6 runs first;
- * no reply -> returns 0 and the motor stays still. Direction 0 is an
- * arbitrary reference; flip it if the carriage runs the wrong way.
- */
-#define SLIDE_TEST_PULSES_PER_REV   3200U
-
-uint8_t Slide_RevTest(void)
-{
-    uint8_t status = 0U;
-
-    if (Emm_V5_Read_Status(5U, &status, 60U) == 0U)
-        return 0U;                      /* no CAN reply: id6 silent */
-
-    Emm_V5_En_Control(5U, true, false);
-    HAL_Delay(5U);
-
-    Emm_V5_Pos_Control(5U, 0U, 30U, 10U,
-                       0.5f * SLIDE_TEST_PULSES_PER_REV, false, false);
-
-    return 1U;
-}
-
 void VofaDebug_Init(void)
 {
     MecanumConfig cfg;
@@ -730,6 +701,61 @@ void VofaDebug_FeedByte(uint8_t b)
 }
 
 /*
+ * 0x40/0x41：使用与正式导航直边完全相同的执行路径。
+ *
+ * 正式边由 EdgeMotion -> chassis_motion_drift_segment() 执行：世界系速度
+ * 方向恒定，每 10 ms 用 HWT101 世界航向把世界速度旋到车体系，并用航向
+ * PD 锁住目标航向。原来的 chassis_motion_forward/backward() 只是车体系
+ * 开环剖面，没有 IMU 参与，两者在实车上的距离/航向并不等价，不能用
+ * 后者标定前者。
+ *
+ * 参考航向取命令按下瞬间的世界航向：
+ *   sign=+1 前进：世界行进方向 = 当前车头方向；
+ *   sign=-1 后退：世界行进方向 = 当前车头反方向，车头仍锁在参考航向，
+ *                  与 EdgeMotion 倒车边“世界向量 from->to、车身 dy 取负”
+ *                  的约定一致。
+ * 速度固定用 ROUTE_EDGE_SPEED_MPS，与比赛直边一致；实际轮速跟随随速度
+ * 变化，用别的速度标出来的 CHASSIS_FORWARD_PULSES_PER_M 在比赛工况下
+ * 不成立。
+ *
+ * 返回 0=已启动；20=HWT101 未就绪（无新数据或无法建立世界零点）。
+ */
+static uint8_t debug_formal_drift_move(int8_t sign)
+{
+    Hwt101 *imu = AppUart_GetImu();
+    uint32_t now_ms = HAL_GetTick();
+    float yaw_deg;
+    float th;
+
+    if (!hwt101_is_fresh(imu, now_ms, VOFA_NAV_IMU_TIMEOUT_MS))
+        return 20U;
+
+    /*
+     * 上电后还没跑过任务时世界零点尚未建立：把当前车头立为参考即可。
+     * 正式任务开始时 robot_app 会重新建零点，不会污染比赛坐标系。
+     */
+    if (!hwt101_world_zero_ready(imu))
+    {
+        hwt101_set_world_zero(imu);
+        if (!hwt101_world_zero_ready(imu))
+            return 20U;
+    }
+
+    yaw_deg = hwt101_world_yaw_deg(imu);
+    th = yaw_deg * 0.01745329252f;
+
+    chassis_motion_drift_segment(&s_debug_chassis,
+                                 (sign >= 0) ? sinf(th) : -sinf(th),
+                                 (sign >= 0) ? cosf(th) : -cosf(th),
+                                 (sign >= 0) ? VOFA_FORMAL_DISTANCE_M
+                                             : -VOFA_FORMAL_DISTANCE_M,
+                                 yaw_deg,
+                                 ROUTE_EDGE_SPEED_MPS,
+                                 1U, 1U, now_ms);
+    return 0U;
+}
+
+/*
  * 10.7.2 RobotApp + VOFA coexistence diagnostics.
  * Only commands that can change actuators require manual takeover.
  * 0x02 only changes the IMU software zero and is left available.
@@ -746,6 +772,7 @@ static uint8_t vofa_cmd_needs_manual_override(uint8_t cmd)
 static void process_cmd(void)
 {
     uint8_t c, p1, p2, p3, p4;
+    uint8_t rc;
     uint32_t primask;
     uint16_t rpm, us, pulses;
 
@@ -1009,29 +1036,18 @@ static void process_cmd(void)
         break;
 
 
-    case 0x40U: /* formal forward by VOFA_FORMAL_DISTANCE_M */
+    case 0x40U: /* formal forward: drift path identical to a navigation edge */
+    case 0x41U: /* formal backward: drift path identical to a navigation edge */
         if (chassis_motion_busy(&s_debug_chassis) || debug_nav_is_running()) {
             last_result = 2U;
             break;
         }
         s_debug_chassis.acceleration = VOFA_FORMAL_MOVE_ACC;
-        chassis_motion_forward(&s_debug_chassis,
-                               VOFA_FORMAL_DISTANCE_M,
-                               VOFA_FORMAL_MOVE_SPEED_MPS,
-                               HAL_GetTick());
-        formal_motion_active = 1U;
-        break;
-
-    case 0x41U: /* formal backward by VOFA_FORMAL_DISTANCE_M */
-        if (chassis_motion_busy(&s_debug_chassis) || debug_nav_is_running()) {
-            last_result = 2U;
+        rc = debug_formal_drift_move((c == 0x40U) ? 1 : -1);
+        if (rc != 0U) {
+            last_result = rc;
             break;
         }
-        s_debug_chassis.acceleration = VOFA_FORMAL_MOVE_ACC;
-        chassis_motion_backward(&s_debug_chassis,
-                                VOFA_FORMAL_DISTANCE_M,
-                                VOFA_FORMAL_MOVE_SPEED_MPS,
-                                HAL_GetTick());
         formal_motion_active = 1U;
         break;
 

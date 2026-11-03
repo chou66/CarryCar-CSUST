@@ -80,6 +80,13 @@ void chassis_motion_translate(Chassis *chassis, float dx_m, float dy_m,
     s_motion_done = 0;
 }
 
+/* K230 视觉对位现在走位置模式入口，测试里同样记录成一次平移。 */
+void chassis_motion_translate_precise(Chassis *chassis, float dx_m, float dy_m,
+                                      float speed_mps, uint32_t now_ms)
+{
+    chassis_motion_translate(chassis, dx_m, dy_m, speed_mps, now_ms);
+}
+
 bool chassis_motion_done(const Chassis *chassis)
 {
     (void)chassis;

@@ -16,10 +16,9 @@
  *   GROUND -> MANIP_PICKUP_GROUND_MM
  *   TABLE  -> MANIP_PICKUP_TABLE_MM
  *
- * position决定夹爪旋转舵机方向：
- *   POSITION_1 -> CarouselServo_ToPickupPos1()
- *   POSITION_2 -> CarouselServo_ToPickup()
- *   POSITION_3 -> CarouselServo_ToPickupPos3()
+ * position决定夹爪旋转角与滑台前伸量：
+ *   POSITION_1/2/3 -> 分别查 position_to_carousel_deg() 与 position_to_slide_mm()
+ *                     得到该取料位对应的云台角和齿条长度
  *
  * 调用示例：
  *   ManipulatorAction_StartGroundToTrayAt(
@@ -84,6 +83,9 @@ volatile uint8_t manip_debug_fail_reason = MANIP_FAIL_NONE;
 volatile uint8_t manip_debug_fail_motor = 0U;
 volatile uint8_t manip_debug_confirm_src = 0U;
 volatile uint8_t manip_debug_fail_status = 0U;
+/* 夹取/放置中超过 MANIP_MOTOR_IGNORE_TIMEOUT_MS 仍未回读到到位标志、
+ * 被按“已到位”放行的电机位掩码（bit4=5号、bit5=6号）。 */
+volatile uint8_t manip_debug_ignored_mask = 0U;
 
 /*
  * 状态镜像：非 static 全局，Keil Watch 直接输变量名即可观察，
@@ -111,6 +113,25 @@ static void clear_fail_debug(void);
 static uint32_t state_start_ms = 0U;
 static uint32_t motor_start_ms = 0U;
 static uint32_t last_status_query_ms = 0U;
+
+/*
+ * 收尾上升阶段滑台回缩的延时：
+ *   slide_retract_delayed —— 本次动作的下降深度是否达到地面高度。
+ *                            Start 时按位姿判定；原料台/物料盘为 false。
+ *   slide_retract_hold_ms —— 距下发滑台回缩还剩多少 ms。0 表示本次不延后
+ *                            （已在同一帧下发）或延时已到、回缩已下发。
+ * 只做时间戳倒计时，不阻塞主循环；电机5 仍然只发一条完整回程指令。
+ */
+static bool slide_retract_delayed = false;
+static uint32_t slide_retract_hold_ms = 0U;
+
+/*
+ * 去程“先伸出、再下降”的延时（与上面的延时回缩互为镜像）：
+ *   gimbal_down_hold_ms —— 距下发电机5 下降还剩多少 ms。0 表示本次不分步
+ *                          （已在同一帧下发）或延时已到、下降已下发。
+ * 发送伸出指令时按伸出量算好；WAIT_GROUND 里倒计时到点才发下降。
+ */
+static uint32_t gimbal_down_hold_ms = 0U;
 
 /*
  * 滑台点动子状态机（视觉识别前的预伸 / 识别后的退回）。
@@ -161,6 +182,13 @@ static bool jog_extend_after_drop_pending = false;
 
 /* RAISE 结束后是否继续把滑台退回原点（HomeStart 使用）。 */
 static bool jog_home_after_raise = false;
+
+/*
+ * HOME_PARALLEL 本次实际下发了指令的电机掩码。
+ * 只在真的发过命令的电机上等 0x3A 到位：视觉预下降量为 0 或滑台本来
+ * 就在原点时，没发命令的电机不会产生新的到位标志，一起等只会超时。
+ */
+static uint8_t jog_home_parallel_mask = 0U;
 
 /*
  * 识别预置的并行模式（粗加工区/暂存区使用）：
@@ -289,10 +317,17 @@ static void query_motor_feedback(
 /*
  * 到位判定沿用底盘逻辑：每台电机在守卫窗之后返回的新鲜 0x3A
  * 应答中 Prf_TF(bit1)=1。未到位则继续等待，直到超时转 ERROR。
+ *
+ * allow_ignore=1（夹取/放置主动作）：超过 MANIP_MOTOR_IGNORE_TIMEOUT_MS
+ * 仍缺到位标志时按到位放行，并在 manip_debug_ignored_mask 里留下掩码，
+ * 避免 CAN 回读丢失把整段动作拖到 40 s 超时。堵转保护仍是致命故障，
+ * 不会被忽略。
+ * allow_ignore=0（视觉点动等）：保持原来的严格等待。
  */
-static MotorWaitResult_t wait_motor_position(
+static MotorWaitResult_t wait_motor_position_ex(
     uint8_t motor_mask,
-    uint32_t now_ms)
+    uint32_t now_ms,
+    uint8_t allow_ignore)
 {
     uint8_t confirmed_mask;
     query_motor_feedback(motor_mask, now_ms);
@@ -322,6 +357,19 @@ static MotorWaitResult_t wait_motor_position(
         return MOTOR_REACHED;
     }
 
+    /*
+     * 夹取/放置主动作：2 s 内始终没回读到未确认电机的到位标志，视为
+     * “机械上已经到位、只是回读缺失”，直接放行到下一状态。
+     * 注意这里只忽略“没消息”，不忽略堵转故障（上面的分支已经先返回）。
+     */
+    if (allow_ignore &&
+        (now_ms - motor_start_ms) >= MANIP_MOTOR_IGNORE_TIMEOUT_MS)
+    {
+        manip_debug_ignored_mask |=
+            (uint8_t)(motor_mask & (uint8_t)~confirmed_mask);
+        return MOTOR_REACHED;
+    }
+
     if ((now_ms - motor_start_ms) >=
         MANIP_PLACE_MOTOR_TIMEOUT_MS)
     {
@@ -332,6 +380,22 @@ static MotorWaitResult_t wait_motor_position(
     }
 
     return MOTOR_WAITING;
+}
+
+/* 视觉点动/预置：严格等待，缺回读时仍按原逻辑超时失败。 */
+static MotorWaitResult_t wait_motor_position(
+    uint8_t motor_mask,
+    uint32_t now_ms)
+{
+    return wait_motor_position_ex(motor_mask, now_ms, 0U);
+}
+
+/* 夹取/放置主动作：2 s 缺到位回读时按到位继续。 */
+static MotorWaitResult_t wait_motor_position_task(
+    uint8_t motor_mask,
+    uint32_t now_ms)
+{
+    return wait_motor_position_ex(motor_mask, now_ms, 1U);
 }
 
 static bool motor_wait_failed(MotorWaitResult_t result)
@@ -355,6 +419,7 @@ static void clear_fail_debug(void)
     pending_fail_motor = 0U;
     manip_debug_confirm_src = 0U;
     manip_debug_fail_status = 0U;
+    manip_debug_ignored_mask = 0U;
 }
 
 /* 旧枚举 -> 标定角度（与 robot_config.h 的 CAROUSEL_*_DEG 一一对应）。 */
@@ -453,6 +518,7 @@ void ManipulatorAction_Init(void)
     jog_vision_drop_pending = false;
     jog_extend_after_drop_pending = false;
     jog_home_after_raise = false;
+    jog_home_parallel_mask = 0U;
     jog_wait_carousel_done = false;
     jog_rotate_start_ms = 0U;
     robot_manip_jog_state = (uint8_t)MANIP_JOG_IDLE;
@@ -529,6 +595,14 @@ static bool prepare_to_tray_start(const ManipPose_t *pickup_pose)
     {
         return false;
     }
+
+    /*
+     * 只有地面高度的取料才需要“升过半程再回缩滑台”；原料台/物料盘
+     * 下降深度小，保持原来同帧边升边收，节拍不变。
+     */
+    slide_retract_delayed =
+        (pickup_pose->gimbal_drop_mm <=
+         (-MANIP_SLIDE_RETRACT_HOLD_MIN_MM));
 
     active_pickup_carousel_deg = pickup_pose->carousel_deg;
     active_pickup_slide_mm = pickup_pose->slide_extend_mm;
@@ -698,27 +772,6 @@ bool ManipulatorAction_StartToTrayAt(
     return ManipulatorAction_StartToTrayAtPose(&pose);
 }
 
-bool ManipulatorAction_StartToTray(
-    ManipulatorPickupSource_t source)
-{
-    return ManipulatorAction_StartToTrayAt(
-        source,
-        MANIP_PICKUP_POSITION_2);
-}
-
-
-bool ManipulatorAction_StartGroundToTray(void)
-{
-    return ManipulatorAction_StartGroundToTrayAt(
-        MANIP_PICKUP_POSITION_2);
-}
-
-bool ManipulatorAction_StartTableToTray(void)
-{
-    return ManipulatorAction_StartTableToTrayAt(
-        MANIP_PICKUP_POSITION_2);
-}
-
 bool ManipulatorAction_StartGroundToTrayAt(ManipulatorPickupPosition_t position)
 {
     return ManipulatorAction_StartToTrayAt(
@@ -774,6 +827,14 @@ static bool prepare_from_tray_start(const ManipPose_t *place_pose)
 
     effective_mm = place_pose->gimbal_drop_mm +
                    ((float)place_pose->layer * MANIP_LAYER_STEP_MM);
+
+    /*
+     * 与取料侧同一判据：地面/粗加工/暂存区放料延后回缩滑台，
+     * 浅层位姿保持原来同帧边升边收。
+     */
+    slide_retract_delayed =
+        (place_pose->gimbal_drop_mm <=
+         (-MANIP_SLIDE_RETRACT_HOLD_MIN_MM));
 
     active_place_carousel_deg = place_pose->carousel_deg;
     active_place_slide_mm = place_pose->slide_extend_mm;
@@ -862,12 +923,6 @@ bool ManipulatorAction_StartTrayToGroundAt(
     return ManipulatorAction_StartTrayToGroundAtPose(&pose);
 }
 
-bool ManipulatorAction_StartTrayToGround(void)
-{
-    return ManipulatorAction_StartTrayToGroundAt(
-        MANIP_PICKUP_POSITION_2);
-}
-
 /*
  * 主动作或点动把滑台成功退回机械原点后，统一同步：
  *   - Manipulator 层的 HOME 基准（供 ZoneTask 判断下一段能否启动）；
@@ -883,6 +938,58 @@ static void commit_slide_home_position(void)
     jog_position_valid = true;
     robot_manip_slide_position_mm = 0.0f;
     robot_manip_slide_position_valid = 1U;
+}
+
+/*
+ * 本次收尾滑台回缩需要延后的毫秒数，0 表示同帧立即回缩。
+ * 按电机5 匀速段估算上升一半所需时间；加减速导致的偏差用
+ * MANIP_SLIDE_RETRACT_HOLD_RATIO 留余量（比例越大越晚回缩、越保守）。
+ */
+static uint32_t slide_retract_delay_ms(float gimbal_return_mm)
+{
+    float hold_ms;
+
+    if (!slide_retract_delayed)
+    {
+        return 0U;
+    }
+
+    hold_ms = gimbal_return_mm *
+              MANIP_SLIDE_RETRACT_HOLD_RATIO *
+              MANIP_GIMBAL_MS_PER_MM;
+
+    if (hold_ms < 1.0f)
+    {
+        return 0U;
+    }
+
+    return (uint32_t)(hold_ms + 0.5f);
+}
+
+/*
+ * 本次去程“先伸出、再下降”需要延后下降的毫秒数，0 表示同帧一起动。
+ * 按电机6 匀速段估算伸出 MANIP_SLIDE_EXTEND_HOLD_RATIO 行程所需时间；
+ * 加减速造成的偏差用该比例宏留余量（比例越大越晚下降、越保守）。
+ */
+static uint32_t gimbal_down_delay_ms(float slide_extend_mm)
+{
+    float hold_ms;
+
+    if (slide_extend_mm <= 0.0f)
+    {
+        return 0U;
+    }
+
+    hold_ms = slide_extend_mm *
+              MANIP_SLIDE_EXTEND_HOLD_RATIO *
+              MANIP_SLIDE_MS_PER_MM;
+
+    if (hold_ms < 1.0f)
+    {
+        return 0U;
+    }
+
+    return (uint32_t)(hold_ms + 0.5f);
 }
 
 static void update_to_tray(uint32_t now_ms)
@@ -936,8 +1043,9 @@ static void update_to_tray(uint32_t now_ms)
             break;
 
         /*
-         * 电机5下降到地面夹取高度。
-         * 电机6同时向前伸出。
+         * 电机6 先向前伸出；伸到 MANIP_SLIDE_EXTEND_HOLD_RATIO 行程后
+         * 电机5 才开始下降到地面夹取高度（见下方 WAIT_GROUND）。
+         * 伸出量很小时延时为 0，仍按“同帧伸出 + 下降”执行。
          */
         case MANIP_GROUND_TO_TRAY_MOVE_TO_GROUND:
             prepare_motor_feedback(
@@ -946,19 +1054,32 @@ static void update_to_tray(uint32_t now_ms)
             motor_start_ms = now_ms;
             last_status_query_ms = now_ms;
 
-            if (!Manipulator_Gimbal_MoveMm(
-                    active_pickup_gimbal_mm,
-                    MANIP_GIMBAL_RPM,
-                    MANIP_GIMBAL_ACC) ||
-                !Manipulator_Slide_MoveMm(
+            if (!Manipulator_Slide_MoveMm(
                     active_pickup_slide_mm,
                     MANIP_SLIDE_RPM,
                     MANIP_SLIDE_ACC))
             {
                 record_pending_fail(MANIP_FAIL_SEND,
-                                    MOTOR_MANIPULATOR_MASK);
+                                    MOTOR_SLIDE_MASK);
                 action_fail(now_ms);
                 break;
+            }
+
+            gimbal_down_hold_ms =
+                gimbal_down_delay_ms(active_pickup_slide_mm);
+
+            if (gimbal_down_hold_ms == 0U)
+            {
+                if (!Manipulator_Gimbal_MoveMm(
+                        active_pickup_gimbal_mm,
+                        MANIP_GIMBAL_RPM,
+                        MANIP_GIMBAL_ACC))
+                {
+                    record_pending_fail(MANIP_FAIL_SEND,
+                                        MOTOR_GIMBAL_MASK);
+                    action_fail(now_ms);
+                    break;
+                }
             }
 
             enter_state(
@@ -967,7 +1088,56 @@ static void update_to_tray(uint32_t now_ms)
             break;
 
         case MANIP_GROUND_TO_TRAY_WAIT_GROUND:
-            motor_result = wait_motor_position(
+            /*
+             * 分步去程：先只让电机6 伸出，倒计时到半程再下发电机5 下降。
+             * 此间不做位置判定，只轮询电机6 状态防堵转。
+             */
+            if (gimbal_down_hold_ms != 0U)
+            {
+                query_motor_feedback(MOTOR_SLIDE_MASK, now_ms);
+
+                if (emm_any_stall_protect_after(
+                        MOTOR_SLIDE_MASK,
+                        motor_start_ms))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_FAULT,
+                        MOTOR_SLIDE_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+
+                if ((now_ms - motor_start_ms) <
+                    gimbal_down_hold_ms)
+                {
+                    break;
+                }
+
+                /*
+                 * 已伸出过半，此刻才下降。重起守卫窗，避免把电机5
+                 * 上一次到位的旧应答误判成本次下降到位。
+                 */
+                prepare_motor_feedback(MOTOR_GIMBAL_MASK);
+                motor_start_ms = now_ms;
+                last_status_query_ms = now_ms;
+                gimbal_down_hold_ms = 0U;
+
+                if (!Manipulator_Gimbal_MoveMm(
+                        active_pickup_gimbal_mm,
+                        MANIP_GIMBAL_RPM,
+                        MANIP_GIMBAL_ACC))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_SEND,
+                        MOTOR_GIMBAL_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+            }
+
+            motor_result = wait_motor_position_task(
                 MOTOR_MANIPULATOR_MASK,
                 now_ms);
 
@@ -1006,132 +1176,179 @@ static void update_to_tray(uint32_t now_ms)
 						}
 						break;
 
-				/*
-				* 夹紧物料后，电机5上升回最高原点与电机6后缩回原点同时进行。
-				*
-				* 两台是独立 CAN 地址、独立位置环，emm_pos 用 snF=false 立即启动，
-				* 因此本状态在同一帧先后发出两条指令，实际启动只差一个 CAN 帧
-				* 的时间；WAIT_RETURN_GIMBAL 用合并掩码等两台都到位后再转云台放料。
-				*
-				* 注意：合运动轨迹是“边升边收”的斜线，仍落在原来先升后收的
-				* 矩形包络内，但中间高度离料台/圆环边缘更近，改动后必须空载和
-				* 带料各验证一次不刮料台。若实车干涉，把 WAIT_RETURN_GIMBAL 的
-				* 下一步改回 RETRACT_SLIDE 即可恢复原来的串行顺序。
-				*/
-				case MANIP_GROUND_TO_TRAY_RETURN_GIMBAL:
-						prepare_motor_feedback(MOTOR_MANIPULATOR_MASK);
-				
-						motor_start_ms = now_ms;
-						last_status_query_ms = now_ms;
-				
-						if (!Manipulator_Gimbal_MoveMm(
-										active_pickup_gimbal_return_mm,
-										MANIP_GIMBAL_RPM,
-										MANIP_GIMBAL_ACC))
-						{
-								record_pending_fail(
-										MANIP_FAIL_SEND,
-										MOTOR_GIMBAL_MASK);
-				
-								action_fail(now_ms);
-								break;
-						}
-				
-						/*
-						 * 同一帧紧接着发滑台回缩：两条 emm_pos 各自立即启动，
-						 * 上升与内收并行推进，不再等电机5到位。
-						 */
-						if (!Manipulator_Slide_MoveMm(
-										active_pickup_slide_return_mm,
-										MANIP_SLIDE_RPM,
-										MANIP_SLIDE_ACC))
-						{
-								record_pending_fail(
-										MANIP_FAIL_SEND,
-										MOTOR_SLIDE_MASK);
+        /*
+         * 夹紧物料后的收尾：电机5 一次升回最高原点，电机6 回缩到原点。
+         *
+         * 两条 emm_pos 各自立即启动，电机5 全程只发一条完整回程指令：
+         *   地面取料 —— 电机6 延后 MANIP_SLIDE_RETRACT_HOLD_RATIO 段上升时间
+         *               再回缩，避免齿条带夹爪在低位横向扫过物料；
+         *   原料台/物料盘 —— 同一帧下发，保持原来的“边升边收”。
+         * 延时用时间戳倒计时，不阻塞主循环。
+         */
+        case MANIP_GROUND_TO_TRAY_RETURN_GIMBAL:
+            prepare_motor_feedback(MOTOR_MANIPULATOR_MASK);
 
-								action_fail(now_ms);
-								break;
-						}
+            motor_start_ms = now_ms;
+            last_status_query_ms = now_ms;
 
-						enter_state(
-								MANIP_GROUND_TO_TRAY_WAIT_RETURN_GIMBAL,
-								now_ms);
-						break;
+            if (!Manipulator_Gimbal_MoveMm(
+                    active_pickup_gimbal_return_mm,
+                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_ACC))
+            {
+                record_pending_fail(
+                    MANIP_FAIL_SEND,
+                    MOTOR_GIMBAL_MASK);
 
-				case MANIP_GROUND_TO_TRAY_WAIT_RETURN_GIMBAL:
-						motor_result = wait_motor_position(
-								MOTOR_MANIPULATOR_MASK,
-								now_ms);
+                action_fail(now_ms);
+                break;
+            }
 
-						if (motor_result == MOTOR_REACHED)
-						{
-								/*
-								 * 上升与回缩都已到位。滑台回程量等于去程伸出量，
-								 * 到位即回到机械原点，这里同步位置基准。
-								 */
-								commit_slide_home_position();
-								enter_state(
-										MANIP_GROUND_TO_TRAY_ROTATE_TO_PLACE,
-										now_ms);
-						}
-						else if (motor_wait_failed(motor_result))
-						{
-								action_fail(now_ms);
-						}
-						break;
-						
-				/*
-				 * 保留的顺序回缩路径（电机5到位后电机6再后缩）。
-				 * 上升/回缩并行化后主流程不再进入本状态，仅作实车干涉时
-				 * 回退备用：把 WAIT_RETURN_GIMBAL 的下一步改回本状态即可。
-				 */
-				case MANIP_GROUND_TO_TRAY_RETRACT_SLIDE:
-						prepare_motor_feedback(MOTOR_SLIDE_MASK);
-				
-						motor_start_ms = now_ms;
-						last_status_query_ms = now_ms;
-				
-						if (!Manipulator_Slide_MoveMm(
-										active_pickup_slide_return_mm,
-										MANIP_SLIDE_RPM,
-										MANIP_SLIDE_ACC))
-						{
-								record_pending_fail(
-										MANIP_FAIL_SEND,
-										MOTOR_SLIDE_MASK);
-				
-								action_fail(now_ms);
-								break;
-						}
-				
-						enter_state(
-								MANIP_GROUND_TO_TRAY_WAIT_RETRACT_SLIDE,
-								now_ms);
-						break;
-						
-				case MANIP_GROUND_TO_TRAY_WAIT_RETRACT_SLIDE:
-						motor_result = wait_motor_position(
-								MOTOR_SLIDE_MASK,
-								now_ms);
+            slide_retract_hold_ms =
+                slide_retract_delay_ms(active_pickup_gimbal_return_mm);
 
-						if (motor_result == MOTOR_REACHED)
-						{
-								/*
-								 * 无论本次动作从原点出发还是从视觉对准位
-								 * 出发，滑台回程量都等于去程伸出量，因此
-								 * 到位后确实回到机械原点，同步位置基准。
-								 */
-								commit_slide_home_position();
-								enter_state(
-										MANIP_GROUND_TO_TRAY_ROTATE_TO_PLACE,
-										now_ms);
-						}
-						else if (motor_wait_failed(motor_result))
-						{
-								action_fail(now_ms);
-						}
-						break;						
+            if (slide_retract_hold_ms == 0U)
+            {
+                if (!Manipulator_Slide_MoveMm(
+                        active_pickup_slide_return_mm,
+                        MANIP_SLIDE_RPM,
+                        MANIP_SLIDE_ACC))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_SEND,
+                        MOTOR_SLIDE_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+            }
+
+            enter_state(
+                MANIP_GROUND_TO_TRAY_WAIT_RETURN_GIMBAL,
+                now_ms);
+            break;
+
+        case MANIP_GROUND_TO_TRAY_WAIT_RETURN_GIMBAL:
+            /*
+             * 地面取料：先只让电机5 上升，倒计时到半程再下发滑台回缩。
+             * 此间不做位置判定，只轮询电机5 状态防堵转。
+             */
+            if (slide_retract_hold_ms != 0U)
+            {
+                query_motor_feedback(MOTOR_GIMBAL_MASK, now_ms);
+
+                if (emm_any_stall_protect_after(
+                        MOTOR_GIMBAL_MASK,
+                        motor_start_ms))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_FAULT,
+                        MOTOR_GIMBAL_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+
+                if ((now_ms - motor_start_ms) <
+                    slide_retract_hold_ms)
+                {
+                    break;
+                }
+
+                /*
+                 * 已升过半程，此刻才回缩滑台。重起守卫窗，避免把电机6
+                 * 上一次伸出到位的旧标志误判成本次回缩到位。
+                 */
+                prepare_motor_feedback(MOTOR_SLIDE_MASK);
+                motor_start_ms = now_ms;
+                last_status_query_ms = now_ms;
+                slide_retract_hold_ms = 0U;
+
+                if (!Manipulator_Slide_MoveMm(
+                        active_pickup_slide_return_mm,
+                        MANIP_SLIDE_RPM,
+                        MANIP_SLIDE_ACC))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_SEND,
+                        MOTOR_SLIDE_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+            }
+
+            motor_result = wait_motor_position_task(
+                MOTOR_MANIPULATOR_MASK,
+                now_ms);
+
+            if (motor_result == MOTOR_REACHED)
+            {
+                /*
+                 * 上升与回缩都已到位：滑台回程量等于去程伸出量，
+                 * 到位即原点，同步位置基准。
+                 */
+                commit_slide_home_position();
+                enter_state(
+                    MANIP_GROUND_TO_TRAY_ROTATE_TO_PLACE,
+                    now_ms);
+            }
+            else if (motor_wait_failed(motor_result))
+            {
+                action_fail(now_ms);
+            }
+            break;
+
+        /*
+         * 保留的顺序回缩路径（电机5到位后电机6再后缩）。
+         * 主流程不再进入本状态，仅作实车干涉时的回退备用：
+         * 把 WAIT_RETURN_GIMBAL 到位后的下一步改回本状态即可。
+         */
+        case MANIP_GROUND_TO_TRAY_RETRACT_SLIDE:
+            prepare_motor_feedback(MOTOR_SLIDE_MASK);
+
+            motor_start_ms = now_ms;
+            last_status_query_ms = now_ms;
+
+            if (!Manipulator_Slide_MoveMm(
+                    active_pickup_slide_return_mm,
+                    MANIP_SLIDE_RPM,
+                    MANIP_SLIDE_ACC))
+            {
+                record_pending_fail(
+                    MANIP_FAIL_SEND,
+                    MOTOR_SLIDE_MASK);
+
+                action_fail(now_ms);
+                break;
+            }
+
+            enter_state(
+                MANIP_GROUND_TO_TRAY_WAIT_RETRACT_SLIDE,
+                now_ms);
+            break;
+
+        case MANIP_GROUND_TO_TRAY_WAIT_RETRACT_SLIDE:
+            motor_result = wait_motor_position_task(
+                MOTOR_SLIDE_MASK,
+                now_ms);
+
+            if (motor_result == MOTOR_REACHED)
+            {
+                /*
+                 * 滑台回到机械原点：回程量等于去程伸出量，
+                 * 到位即原点，同步位置基准。
+                 */
+                commit_slide_home_position();
+                enter_state(
+                    MANIP_GROUND_TO_TRAY_ROTATE_TO_PLACE,
+                    now_ms);
+            }
+            else if (motor_wait_failed(motor_result))
+            {
+                action_fail(now_ms);
+            }
+            break;
 				
         /*
          * 视觉对准后直接抓取：云台/滑台/夹爪已经由预置和视觉闭环摆好，
@@ -1184,7 +1401,7 @@ static void update_to_tray(uint32_t now_ms)
             break;
 
         case MANIP_GROUND_TO_TRAY_WAIT_DIRECT_DESCEND:
-            motor_result = wait_motor_position(
+            motor_result = wait_motor_position_task(
                 MOTOR_GIMBAL_MASK,
                 now_ms);
 
@@ -1210,11 +1427,15 @@ static void update_to_tray(uint32_t now_ms)
             break;
 
 
+        /*
+         * 云台舵机转到料盘方向、软件平滑走完且稳定后，先进入稳定延时，
+         * 之后才下降电机5。
+         */
         case MANIP_GROUND_TO_TRAY_WAIT_ROTATE:
             if (CarouselServo_IsDone())
             {
                 enter_state(
-                    MANIP_GROUND_TO_TRAY_MOVE_TO_TRAY,
+                    MANIP_GROUND_TO_TRAY_WAIT_ROTATE_SETTLE,
                     now_ms);
             }
             else if ((now_ms - state_start_ms) >=
@@ -1222,6 +1443,21 @@ static void update_to_tray(uint32_t now_ms)
             {
                 record_pending_fail(MANIP_FAIL_SERVO, 0U);
                 action_fail(now_ms);
+            }
+            break;
+
+        /*
+         * 舵机停稳余量：CarouselServo_IsDone() 只表示软件平滑轨迹已走完，
+         * 舵机本体还要一点时间才真正停住。这里停 MANIP_PLACE_SERVO_SETTLE_MS
+         * 再下发电机5，避免夹爪在舵机回弹时往下走。非阻塞倒计时。
+         */
+        case MANIP_GROUND_TO_TRAY_WAIT_ROTATE_SETTLE:
+            if ((now_ms - state_start_ms) >=
+                MANIP_PLACE_SERVO_SETTLE_MS)
+            {
+                enter_state(
+                    MANIP_GROUND_TO_TRAY_MOVE_TO_TRAY,
+                    now_ms);
             }
             break;
 
@@ -1249,7 +1485,7 @@ static void update_to_tray(uint32_t now_ms)
             break;
 
         case MANIP_GROUND_TO_TRAY_WAIT_TRAY:
-            motor_result = wait_motor_position(
+            motor_result = wait_motor_position_task(
                 MOTOR_GIMBAL_MASK,
                 now_ms);
 
@@ -1309,7 +1545,7 @@ static void update_to_tray(uint32_t now_ms)
             break;
 
         case MANIP_GROUND_TO_TRAY_WAIT_HOME:
-            motor_result = wait_motor_position(
+            motor_result = wait_motor_position_task(
                 MOTOR_GIMBAL_MASK,
                 now_ms);
 
@@ -1388,7 +1624,7 @@ static void update_from_tray(uint32_t now_ms)
             break;
 
         case MANIP_TRAY_TO_GROUND_WAIT_TRAY:
-            motor_result = wait_motor_position(
+            motor_result = wait_motor_position_task(
                 MOTOR_GIMBAL_MASK,
                 now_ms);
 
@@ -1453,7 +1689,7 @@ static void update_from_tray(uint32_t now_ms)
             break;
 
         case MANIP_TRAY_TO_GROUND_WAIT_HOME:
-            motor_result = wait_motor_position(
+            motor_result = wait_motor_position_task(
                 MOTOR_GIMBAL_MASK,
                 now_ms);
 
@@ -1508,9 +1744,12 @@ static void update_from_tray(uint32_t now_ms)
                 action_fail(now_ms);
             }
             break;
-						
+
+
+
  /*
-         * 5.2 舵机到位后，电机5下降、电机6前伸。
+         * 5.2 舵机到位后，电机6 先前伸；伸到半程后电机5 才开始下降。
+         * 时序与地面取料一致（见 MANIP_GROUND_TO_TRAY_MOVE_TO_GROUND）。
          */
         case MANIP_TRAY_TO_GROUND_MOVE_TO_GROUND:
             prepare_motor_feedback(
@@ -1519,20 +1758,34 @@ static void update_from_tray(uint32_t now_ms)
             motor_start_ms = now_ms;
             last_status_query_ms = now_ms;
 
-            if (!Manipulator_Gimbal_MoveMm(
-                    active_place_gimbal_mm,
-                    MANIP_GIMBAL_RPM,
-                    MANIP_GIMBAL_ACC) ||
-                !Manipulator_Slide_MoveMm(
+            if (!Manipulator_Slide_MoveMm(
                     active_place_slide_mm,
                     MANIP_SLIDE_RPM,
                     MANIP_SLIDE_ACC))
             {
                 record_pending_fail(
                     MANIP_FAIL_SEND,
-                    MOTOR_MANIPULATOR_MASK);
+                    MOTOR_SLIDE_MASK);
                 action_fail(now_ms);
                 break;
+            }
+
+            gimbal_down_hold_ms =
+                gimbal_down_delay_ms(active_place_slide_mm);
+
+            if (gimbal_down_hold_ms == 0U)
+            {
+                if (!Manipulator_Gimbal_MoveMm(
+                        active_place_gimbal_mm,
+                        MANIP_GIMBAL_RPM,
+                        MANIP_GIMBAL_ACC))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_SEND,
+                        MOTOR_GIMBAL_MASK);
+                    action_fail(now_ms);
+                    break;
+                }
             }
 
             enter_state(
@@ -1541,7 +1794,56 @@ static void update_from_tray(uint32_t now_ms)
             break;
 
         case MANIP_TRAY_TO_GROUND_WAIT_GROUND:
-            motor_result = wait_motor_position(
+            /*
+             * 分步去程：先只让电机6 伸出，倒计时到半程再下发电机5 下降。
+             * 此间不做位置判定，只轮询电机6 状态防堵转。
+             */
+            if (gimbal_down_hold_ms != 0U)
+            {
+                query_motor_feedback(MOTOR_SLIDE_MASK, now_ms);
+
+                if (emm_any_stall_protect_after(
+                        MOTOR_SLIDE_MASK,
+                        motor_start_ms))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_FAULT,
+                        MOTOR_SLIDE_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+
+                if ((now_ms - motor_start_ms) <
+                    gimbal_down_hold_ms)
+                {
+                    break;
+                }
+
+                /*
+                 * 已伸出过半，此刻才下降。重起守卫窗，避免把电机5
+                 * 上一次到位的旧应答误判成本次下降到位。
+                 */
+                prepare_motor_feedback(MOTOR_GIMBAL_MASK);
+                motor_start_ms = now_ms;
+                last_status_query_ms = now_ms;
+                gimbal_down_hold_ms = 0U;
+
+                if (!Manipulator_Gimbal_MoveMm(
+                        active_place_gimbal_mm,
+                        MANIP_GIMBAL_RPM,
+                        MANIP_GIMBAL_ACC))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_SEND,
+                        MOTOR_GIMBAL_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+            }
+
+            motor_result = wait_motor_position_task(
                 MOTOR_MANIPULATOR_MASK,
                 now_ms);
 
@@ -1581,124 +1883,172 @@ static void update_from_tray(uint32_t now_ms)
             }
             break;
 
-				/*
-				* 物料释放完成后，电机5上升回最高原点与电机6后缩回原点同时进行。
-				*
-				* 与夹取收尾（MANIP_GROUND_TO_TRAY_RETURN_GIMBAL）同一机制：两台
-				* 独立 CAN 地址、独立位置环，同一帧先后发两条 emm_pos 并行启动，
-				* WAIT_FINAL_RETURN_GIMBAL 用合并掩码等两台都到位才动作结束。
-				*
-				* 注意：轨迹变成“边升边收”的斜线，抓取爪此时已释放物料，但张开的
-				* 夹爪本体仍可能擦到圆环/料台外沿，改动后必须空载和带料各验证一次。
-				* 若实车干涉，把 WAIT_FINAL_RETURN_GIMBAL 的下一步改回
-				* FINAL_RETRACT_SLIDE 即恢复原来的串行顺序。
-				*/
-				case MANIP_TRAY_TO_GROUND_FINAL_RETURN_GIMBAL:
-						prepare_motor_feedback(MOTOR_MANIPULATOR_MASK);
-				
-						motor_start_ms = now_ms;
-						last_status_query_ms = now_ms;
-				
-						if (!Manipulator_Gimbal_MoveMm(
-										active_place_gimbal_return_mm,
-										MANIP_GIMBAL_RPM,
-										MANIP_GIMBAL_ACC))
-						{
-								record_pending_fail(
-										MANIP_FAIL_SEND,
-										MOTOR_GIMBAL_MASK);
-				
-								action_fail(now_ms);
-								break;
-						}
-				
-						/*
-						 * 同一帧紧接着发滑台回缩：两条 emm_pos 各自立即启动，
-						 * 上升与内收并行推进，不再等电机5到位。
-						 */
-						if (!Manipulator_Slide_MoveMm(
-										active_place_slide_return_mm,
-										MANIP_SLIDE_RPM,
-										MANIP_SLIDE_ACC))
-						{
-								record_pending_fail(
-										MANIP_FAIL_SEND,
-										MOTOR_SLIDE_MASK);
+        /*
+         * 物料释放后的收尾：电机5 一次升回最高原点，电机6 回缩到原点。
+         *
+         * 与夹取收尾同一机制，电机5 全程只发一条完整回程指令：
+         *   地面/粗加工/暂存区放料 —— 电机6 延后上升半程再回缩，避免张开的
+         *                            夹爪在低位擦到圆环/料台外沿；
+         *   浅层位姿 —— 同一帧下发，保持原来的“边升边收”。
+         */
+        case MANIP_TRAY_TO_GROUND_FINAL_RETURN_GIMBAL:
+            prepare_motor_feedback(MOTOR_MANIPULATOR_MASK);
 
-								action_fail(now_ms);
-								break;
-						}
+            motor_start_ms = now_ms;
+            last_status_query_ms = now_ms;
 
-						enter_state(
-								MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETURN_GIMBAL,
-								now_ms);
-						break;
-						
-				case MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETURN_GIMBAL:
-						motor_result = wait_motor_position(
-								MOTOR_MANIPULATOR_MASK,
-								now_ms);
+            if (!Manipulator_Gimbal_MoveMm(
+                    active_place_gimbal_return_mm,
+                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_ACC))
+            {
+                record_pending_fail(
+                    MANIP_FAIL_SEND,
+                    MOTOR_GIMBAL_MASK);
 
-						if (motor_result == MOTOR_REACHED)
-						{
-								/*
-								 * 上升与回缩都已到位：齿条回到机械原点、电机5回到
-								 * 最高原点，等同原串行收尾的结束条件，直接结束动作。
-								 */
-								enter_state(
-										MANIP_ACTION_DONE,
-										now_ms);
-						}
-						else if (motor_wait_failed(motor_result))
-						{
-								action_fail(now_ms);
-						}
-						break;				
+                action_fail(now_ms);
+                break;
+            }
 
-				/*
-				* 保留的顺序回缩路径（电机5到位后电机6再后缩）。
-				* 上升/回缩并行化后主流程不再进入本状态，仅作实车干涉时
-				* 回退备用：把 WAIT_FINAL_RETURN_GIMBAL 的下一步改回本状态即可。
-				*/
-				case MANIP_TRAY_TO_GROUND_FINAL_RETRACT_SLIDE:
-						prepare_motor_feedback(MOTOR_SLIDE_MASK);
-				
-						motor_start_ms = now_ms;
-						last_status_query_ms = now_ms;
-				
-						if (!Manipulator_Slide_MoveMm(
-										active_place_slide_return_mm,
-										MANIP_SLIDE_RPM,
-										MANIP_SLIDE_ACC))
-						{
-								record_pending_fail(
-										MANIP_FAIL_SEND,
-										MOTOR_SLIDE_MASK);
-				
-								action_fail(now_ms);
-								break;
-						}
-						enter_state(
-								MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETRACT_SLIDE,
-								now_ms);
-						break;						
+            slide_retract_hold_ms =
+                slide_retract_delay_ms(active_place_gimbal_return_mm);
 
-				case MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETRACT_SLIDE:
-						motor_result = wait_motor_position(
-								MOTOR_SLIDE_MASK,
-								now_ms);
-				
-						if (motor_result == MOTOR_REACHED)
-						{
-								enter_state(
-										MANIP_ACTION_DONE,
-										now_ms);
-						}
-						else if (motor_wait_failed(motor_result))
-						{
-								action_fail(now_ms);
-						}
-						break;						
+            if (slide_retract_hold_ms == 0U)
+            {
+                if (!Manipulator_Slide_MoveMm(
+                        active_place_slide_return_mm,
+                        MANIP_SLIDE_RPM,
+                        MANIP_SLIDE_ACC))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_SEND,
+                        MOTOR_SLIDE_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+            }
+
+            enter_state(
+                MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETURN_GIMBAL,
+                now_ms);
+            break;
+
+        case MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETURN_GIMBAL:
+            /*
+             * 地面放料：先只让电机5 上升，倒计时到半程再下发滑台回缩。
+             * 此间不做位置判定，只轮询电机5 状态防堵转。
+             */
+            if (slide_retract_hold_ms != 0U)
+            {
+                query_motor_feedback(MOTOR_GIMBAL_MASK, now_ms);
+
+                if (emm_any_stall_protect_after(
+                        MOTOR_GIMBAL_MASK,
+                        motor_start_ms))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_FAULT,
+                        MOTOR_GIMBAL_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+
+                if ((now_ms - motor_start_ms) <
+                    slide_retract_hold_ms)
+                {
+                    break;
+                }
+
+                /*
+                 * 已升过半程，此刻才回缩滑台。重起守卫窗，避免把电机6
+                 * 上一次伸出到位的旧标志误判成本次回缩到位。
+                 */
+                prepare_motor_feedback(MOTOR_SLIDE_MASK);
+                motor_start_ms = now_ms;
+                last_status_query_ms = now_ms;
+                slide_retract_hold_ms = 0U;
+
+                if (!Manipulator_Slide_MoveMm(
+                        active_place_slide_return_mm,
+                        MANIP_SLIDE_RPM,
+                        MANIP_SLIDE_ACC))
+                {
+                    record_pending_fail(
+                        MANIP_FAIL_SEND,
+                        MOTOR_SLIDE_MASK);
+
+                    action_fail(now_ms);
+                    break;
+                }
+            }
+
+            motor_result = wait_motor_position_task(
+                MOTOR_MANIPULATOR_MASK,
+                now_ms);
+
+            if (motor_result == MOTOR_REACHED)
+            {
+                /*
+                 * 上升与回缩都已到位：齿条回到机械原点、电机5 回到最高
+                 * 原点，动作结束。
+                 */
+                enter_state(
+                    MANIP_ACTION_DONE,
+                    now_ms);
+            }
+            else if (motor_wait_failed(motor_result))
+            {
+                action_fail(now_ms);
+            }
+            break;
+
+        /*
+         * 保留的顺序回缩路径（电机5到位后电机6再后缩）。
+         * 主流程不再进入本状态，仅作实车干涉时的回退备用：
+         * 把 WAIT_FINAL_RETURN_GIMBAL 到位后的下一步改回本状态即可。
+         */
+        case MANIP_TRAY_TO_GROUND_FINAL_RETRACT_SLIDE:
+            prepare_motor_feedback(MOTOR_SLIDE_MASK);
+
+            motor_start_ms = now_ms;
+            last_status_query_ms = now_ms;
+
+            if (!Manipulator_Slide_MoveMm(
+                    active_place_slide_return_mm,
+                    MANIP_SLIDE_RPM,
+                    MANIP_SLIDE_ACC))
+            {
+                record_pending_fail(
+                    MANIP_FAIL_SEND,
+                    MOTOR_SLIDE_MASK);
+
+                action_fail(now_ms);
+                break;
+            }
+
+            enter_state(
+                MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETRACT_SLIDE,
+                now_ms);
+            break;
+
+        case MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETRACT_SLIDE:
+            motor_result = wait_motor_position_task(
+                MOTOR_SLIDE_MASK,
+                now_ms);
+
+            if (motor_result == MOTOR_REACHED)
+            {
+                enter_state(
+                    MANIP_ACTION_DONE,
+                    now_ms);
+            }
+            else if (motor_wait_failed(motor_result))
+            {
+                action_fail(now_ms);
+            }
+            break;
 						
         default:
             record_pending_fail(MANIP_FAIL_STATE, 0U);
@@ -1833,6 +2183,96 @@ static bool slide_jog_start_vision_raise(bool then_home)
     }
 
     enter_jog_state(MANIP_JOG_RAISE, now_ms);
+    return true;
+}
+
+/*
+ * 视觉识别结束后的并行回收：电机5 抬回最高原点与电机6 回缩同一帧下发。
+ *
+ * 与 slide_jog_start_vision_raise(true) 的区别只在于时序：旧流程先等电机5
+ * 完全升到顶，再发齿条回缩；这里两条相对位移命令背靠背发出，驱动器各自
+ * 闭环，总时间取两者的较大值（通常由上升决定），省掉一整段回缩时间。
+ *
+ * 只等真正发过命令的电机：视觉预下降量为 0（原料区）或滑台本来就在原点
+ * 时，对应的电机不会产生新的到位标志，一起等只会白等到超时。
+ * 两路命令都不需要发时直接提交原点，不再进状态机。
+ */
+static bool slide_jog_start_vision_raise_and_home(void)
+{
+    uint32_t now_ms = HAL_GetTick();
+    uint8_t mask = 0U;
+
+    if (!jog_position_valid)
+    {
+        return false;
+    }
+
+    jog_home_after_raise = false;
+    jog_to_home = true;
+    jog_target_position_mm = 0.0f;
+    jog_delta_mm = -jog_current_position_mm;
+
+    if (jog_vision_drop_applied &&
+        ((jog_vision_drop_mm < -0.05f) || (jog_vision_drop_mm > 0.05f)))
+    {
+        mask |= MOTOR_GIMBAL_MASK;
+    }
+
+    if ((jog_delta_mm < -0.05f) || (jog_delta_mm > 0.05f))
+    {
+        mask |= MOTOR_SLIDE_MASK;
+    }
+
+    if (mask == 0U)
+    {
+        jog_vision_drop_target_mm = 0.0f;
+        jog_vision_drop_mm = 0.0f;
+        jog_vision_drop_applied = false;
+        jog_home_parallel_mask = 0U;
+        commit_slide_home_position();
+        manip_debug_jog_fail_reason = MANIP_FAIL_NONE;
+        enter_jog_state(MANIP_JOG_DONE, now_ms);
+        return true;
+    }
+
+    prepare_motor_feedback(mask);
+
+    motor_start_ms = now_ms;
+    last_status_query_ms = now_ms;
+
+    if (((mask & MOTOR_GIMBAL_MASK) != 0U) &&
+        !Manipulator_Gimbal_MoveMm(-jog_vision_drop_mm,
+                                   MANIP_GIMBAL_RPM,
+                                   MANIP_GIMBAL_ACC))
+    {
+        manip_debug_jog_fail_reason = MANIP_FAIL_SEND;
+        Manipulator_StopAll();
+        jog_position_valid = false;
+        robot_manip_slide_position_valid = 0U;
+        enter_jog_state(MANIP_JOG_ERROR, now_ms);
+        return false;
+    }
+
+    if (((mask & MOTOR_SLIDE_MASK) != 0U) &&
+        !Manipulator_Slide_MoveMm(jog_delta_mm,
+                                  MANIP_SLIDE_RPM,
+                                  MANIP_SLIDE_ACC))
+    {
+        /*
+         * 电机5 已经收到上升指令，这里必须停车并把位置基准作废，
+         * 不能只留下一个 ERROR 让两路电机继续跑。
+         */
+        manip_debug_jog_fail_reason = MANIP_FAIL_SEND;
+        Manipulator_StopAll();
+        jog_position_valid = false;
+        robot_manip_slide_position_valid = 0U;
+        enter_jog_state(MANIP_JOG_ERROR, now_ms);
+        return false;
+    }
+
+    jog_home_parallel_mask = mask;
+    manip_debug_jog_fail_reason = MANIP_FAIL_NONE;
+    enter_jog_state(MANIP_JOG_HOME_PARALLEL, now_ms);
     return true;
 }
 
@@ -2345,6 +2785,40 @@ static void update_slide_jog(uint32_t now_ms)
             }
             break;
 
+        case MANIP_JOG_HOME_PARALLEL:
+            /*
+             * 视觉识别后的并行回收：电机5 上升与电机6 回缩已经同一帧下发，
+             * 这里等两边都回读到这次的到位标志。共用的 motor_start_ms 就是
+             * 两路命令的同一时刻，守卫窗和超时对两者一致。
+             */
+            motor_result = wait_motor_position(jog_home_parallel_mask, now_ms);
+
+            if (motor_result == MOTOR_REACHED)
+            {
+                jog_home_parallel_mask = 0U;
+                jog_vision_drop_mm = 0.0f;
+                jog_vision_drop_target_mm = 0.0f;
+                jog_vision_drop_applied = false;
+
+                /* 齿条已回到机械原点，电机5 也已抬到最高点。 */
+                commit_slide_home_position();
+                enter_jog_state(MANIP_JOG_DONE, now_ms);
+            }
+            else if (motor_wait_failed(motor_result))
+            {
+                manip_debug_jog_fail_reason = pending_fail_reason;
+                pending_fail_reason = MANIP_FAIL_NONE;
+                pending_fail_motor = 0U;
+                jog_home_parallel_mask = 0U;
+
+                /* 半路停下：两路高度/长度都不可知，必须人工重新确认原点。 */
+                Manipulator_StopAll();
+                jog_position_valid = false;
+                robot_manip_slide_position_valid = 0U;
+                enter_jog_state(MANIP_JOG_ERROR, now_ms);
+            }
+            break;
+
         case MANIP_JOG_HEIGHT:
             /*
              * 只等待电机5到达新的累计下降量；滑台/云台保持当前标定位姿。
@@ -2380,18 +2854,6 @@ static void update_slide_jog(uint32_t now_ms)
     }
 }
 
-bool ManipulatorAction_SlideJogToAlignStart(void)
-{
-    /* 预伸只能从原点出发，否则按固定量前伸会冲过头。 */
-    if (!Manipulator_Slide_AtHome())
-    {
-        return false;
-    }
-
-    return slide_jog_start_target(MANIP_PICKUP_SLIDE_ALIGN_MM, true, 0.0f,
-                                  true, false);
-}
-
 bool ManipulatorAction_SlideJogToRoughAlignHighStart(void)
 {
     /* 保留旧标定：复现独立的旧高位相机长度，电机5保持最高点。 */
@@ -2401,18 +2863,6 @@ bool ManipulatorAction_SlideJogToRoughAlignHighStart(void)
     }
 
     return slide_jog_start_target(ROUGH_VISION_HIGH_SLIDE_POS2_MM,
-                                  true, 0.0f, true, true);
-}
-
-bool ManipulatorAction_SlideJogToStorageAlignHighStart(void)
-{
-    /* 保留旧标定：复现独立的旧高位相机长度，电机5保持最高点。 */
-    if (!Manipulator_Slide_AtHome())
-    {
-        return false;
-    }
-
-    return slide_jog_start_target(STORAGE_VISION_HIGH_SLIDE_POS2_MM,
                                   true, 0.0f, true, true);
 }
 
@@ -2440,20 +2890,20 @@ bool ManipulatorAction_SlideJogToRoughAlignStart(void)
      * （PrepositionForNextZoneWithDrop）里完成，这里只把齿条前伸到低位
      * 取像基准；如果预置失败或预下降仍在进行，slide_jog_start_target()
      * 会按原顺序补做下降。K230 底盘对位和航向复核结束后由
-     * SlideJogHomeStart() 先抬回最高点，再回缩滑台。
+     * SlideJogHomeStart() 把抬回最高点与回缩滑台并行执行。
      */
     return slide_jog_start_target(ROUGH_VISION_LOW_SLIDE_POS2_MM, true,
                                   ROUGH_VISION_PRE_DROP_MM, true, true);
 }
 
-bool ManipulatorAction_SlideJogToStorageAlignStart(void)
+/*
+ * 暂存区2号参考环预置的公共实现：齿条长度固定用暂存区独立标定的
+ * STORAGE_VISION_LOW_SLIDE_POS2_MM，只有电机5 的预下降量随轮次不同。
+ * 暂存区与粗加工区一样是“固定2号相机位姿 -> K230移动底盘”，
+ * 云台识别角固定为 CAROUSEL_PICKUP_POS2_DEG。
+ */
+static bool storage_align_start(float pre_drop_mm)
 {
-    /*
-     * 暂存区与粗加工区采用相同的“固定2号相机位姿 -> K230移动底盘”原则，
-     * 但两处圆环到节点的实际距离不同，绝不能继续共用一个齿条长度。
-     * 云台识别角仍固定为CAROUSEL_PICKUP_POS2_DEG（当前273.33 deg），
-     * 这里只换成暂存区独立标定得到的2号齿条绝对长度。
-     */
     if (!Manipulator_Slide_AtHome())
     {
         return false;
@@ -2461,19 +2911,34 @@ bool ManipulatorAction_SlideJogToStorageAlignStart(void)
 
     /*
      * 暂存区同样在行驶预置阶段就完成电机5的预下降，到站只前伸齿条；
-     * 预置未生效时 slide_jog_start_target() 仍按「前伸后下降」补做。
-     * K230 底盘对位完成后由 SlideJogHomeStart() 先抬回最高点，再回缩滑台。
+     * 预置未生效时 slide_jog_start_target() 仍按「前伸后下降」补做，
+     * 所以这里的 pre_drop_mm 必须与行驶预置用的宏完全一致。
+     * K230 底盘对位完成后由 SlideJogHomeStart() 把抬回最高点与回缩滑台并行执行。
      */
     return slide_jog_start_target(STORAGE_VISION_LOW_SLIDE_POS2_MM, true,
-                                  STORAGE_VISION_PRE_DROP_MM, true, true);
+                                  pre_drop_mm, true, true);
+}
+
+bool ManipulatorAction_SlideJogToStorageAlignStart(void)
+{
+    return storage_align_start(STORAGE_VISION_PRE_DROP_MM);
+}
+
+bool ManipulatorAction_SlideJogToStorageStackAlignStart(void)
+{
+    /*
+     * 第二轮叠放：物料已经压在上一层上，低位取像会贴得太近，
+     * 改为与原料区一致的最高原点识别（预下降量 0）。
+     */
+    return storage_align_start(STORAGE_STACK_VISION_PRE_DROP_MM);
 }
 
 bool ManipulatorAction_SlideJogToRawAlignStart(void)
 {
     /*
-     * 原料区停靠后用补偿过的较短预伸。底盘已经向圆盘靠近 40 mm，滑台
-     * 相对旧识别位少伸 40 mm，两项在世界坐标中基本抵消，因此第一次画面
-     * 仍落在已经跑通的旧取像距离附近，而不是突然把相机推进圆盘。
+     * 原料区取消底盘停靠后，原先 40 mm 的车体靠近量已经并入
+     * RAW_VISION_SLIDE_START_MM，滑台直接伸到旧停靠流程的等效取像距离，
+     * 相机相对圆盘的世界位置不变。
      */
     if (!Manipulator_Slide_AtHome() ||
         !jog_position_valid ||
@@ -2571,13 +3036,19 @@ bool ManipulatorAction_SlideJogHomeStart(void)
     }
 
     /*
-     * 暂存区/原料区在识别位额外下降过电机5：必须先抬回最高原点，再回缩
-     * 滑台，保持“滑台回零时电机5一定在最高点”的既有前提；否则后续固定
-     * 位姿动作会从错误高度继续下降。
+     * 暂存区/粗加工区在识别位额外下降过电机5：回缩滑台前必须把电机5抬回
+     * 最高原点，否则后续固定位姿动作会从错误高度继续下降。
+     *
+     * MANIP_HOME_PARALLEL_ENABLE=1 时抬升与回缩同一帧下发（并行回收），
+     * =0 时回退到“先抬到顶、再回缩”的串行流程。
      */
     if (jog_vision_drop_applied)
     {
+#if MANIP_HOME_PARALLEL_ENABLE
+        return slide_jog_start_vision_raise_and_home();
+#else
         return slide_jog_start_vision_raise(true);
+#endif
     }
 
     return slide_jog_start_target(0.0f, false, 0.0f, false, false);
@@ -2627,15 +3098,6 @@ float ManipulatorAction_SlideJogGetVisionDropMm(void)
     return jog_vision_drop_applied ? jog_vision_drop_mm : 0.0f;
 }
 
-void ManipulatorAction_SlideJogClearVisionDrop(void)
-{
-    jog_vision_drop_target_mm = 0.0f;
-    jog_vision_drop_mm = 0.0f;
-    jog_vision_drop_applied = false;
-    jog_vision_drop_pending = false;
-    jog_extend_after_drop_pending = false;
-}
-
 bool ManipulatorAction_SlideJogIsBusy(void)
 {
     return (jog_state == MANIP_JOG_ROTATE) ||
@@ -2644,7 +3106,8 @@ bool ManipulatorAction_SlideJogIsBusy(void)
            (jog_state == MANIP_JOG_LOWER) ||
            (jog_state == MANIP_JOG_RAISE) ||
            (jog_state == MANIP_JOG_HEIGHT) ||
-           (jog_state == MANIP_JOG_PRE_ROTATE);
+           (jog_state == MANIP_JOG_PRE_ROTATE) ||
+           (jog_state == MANIP_JOG_HOME_PARALLEL);
 }
 
 bool ManipulatorAction_SlideJogIsDone(void)
@@ -2721,12 +3184,6 @@ bool ManipulatorAction_PrepositionForNextZoneWithDrop(uint8_t tray_slot,
     return true;
 }
 
-bool ManipulatorAction_PrepositionForNextZone(uint8_t tray_slot)
-{
-    /* 兼容旧调用：只摆舵机，不预下降电机5（原料区/纯路线测试）。 */
-    return ManipulatorAction_PrepositionForNextZoneWithDrop(tray_slot, 0.0f);
-}
-
 void ManipulatorAction_Update(uint32_t now_ms)
 {
     /* 本帧不推进时也要刷镜像，断点停下看到的值才是最新的。 */
@@ -2778,9 +3235,11 @@ void ManipulatorAction_Abort(void)
         (jog_state == MANIP_JOG_LOWER) ||
         (jog_state == MANIP_JOG_RAISE) ||
         (jog_state == MANIP_JOG_HEIGHT) ||
-        (jog_state == MANIP_JOG_PRE_ROTATE))
+        (jog_state == MANIP_JOG_PRE_ROTATE) ||
+        (jog_state == MANIP_JOG_HOME_PARALLEL))
     {
         manip_debug_jog_fail_reason = MANIP_FAIL_ABORT;
+        jog_home_parallel_mask = 0U;
         jog_vision_drop_pending = false;
         /* 行驶预置的“下降后继续伸齿条”也不能留，否则恢复后会突然动作。 */
         jog_extend_after_drop_pending = false;

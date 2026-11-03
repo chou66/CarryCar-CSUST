@@ -9,36 +9,34 @@
 
 /**
  * @file raw_station_task.h
- * @brief 原料站完整事务：临时停靠、三次视觉抓取、撤回导航节点。
+ * @brief 原料站完整事务：三次视觉抓取（滑台在到站时预伸）。
  *
- * RobotApp 只启动并等待本任务，不再展开原料区的底盘与机械臂子状态。
- * 本任务完成时车体已经撤回 N8，但不宣称航向仍精确；RobotApp 随后必须
- * 重新执行任务航向校正，校正成功后才能进入下一段导航。
+ * RobotApp 只启动并等待本任务，不再展开原料区的机械臂子状态。
+ * 原料区不做底盘停靠平移；本任务完成时车体仍停在 N8，RobotApp 随后
+ * 重新执行任务航向校正作为离开前的安全检查，再进入下一段导航。
  */
 typedef enum
 {
     RAW_STATION_IDLE = 0,
-    RAW_STATION_DOCKING,       /* 车体 +X 靠近圆盘，同时开始滑台前伸 */
-    RAW_STATION_DOCK_SETTLE,   /* 底盘报告到位后的结构稳定时间 */
-    RAW_STATION_START_ZONE,    /* 启动本批次的三步原料 ZoneTask */
-    RAW_STATION_RUN_ZONE,      /* 等待三次视觉抓取与放入料盘 */
-    RAW_STATION_UNDOCKING,     /* 机械臂回 HOME 后车体 -X 返回 N8 */
-    RAW_STATION_UNDOCK_SETTLE, /* 返回到位后的稳定时间 */
-    RAW_STATION_DONE,          /* 已回 N8，等待 RobotApp 重新校正航向 */
-    RAW_STATION_ERROR,         /* 错误码见 RAW_STATION_ERROR_* */
-    /* 追加在末尾，保持前面所有枚举值不变：等停靠窗口里并行的滑台前伸到位。 */
-    RAW_STATION_WAIT_PRESLIDE
+    /* 1/2 原 DOCKING / DOCK_SETTLE 已删除；保留编号，避免 Keil Watch
+     * 与既有调试脚本的数值错位。 */
+    RAW_STATION_START_ZONE = 3,    /* 启动本批次的三步原料 ZoneTask */
+    RAW_STATION_RUN_ZONE = 4,      /* 等待三次视觉抓取与放入料盘 */
+    /* 5/6 原 UNDOCKING / UNDOCK_SETTLE 已删除。 */
+    RAW_STATION_DONE = 7,          /* 批次完成，等待 RobotApp 重新校正航向 */
+    RAW_STATION_ERROR = 8,         /* 错误码见 RAW_STATION_ERROR_* */
+    RAW_STATION_WAIT_PRESLIDE = 9  /* 等到站时启动的滑台预伸到位 */
 } RawStationTaskState_t;
 
 #define RAW_STATION_ERROR_NONE       0U
 #define RAW_STATION_ERROR_PARAM      1U
 #define RAW_STATION_ERROR_HOME       2U
-#define RAW_STATION_ERROR_DOCK       3U
+/* 3 原 DOCK 错误已删除。 */
 #define RAW_STATION_ERROR_ZONE_START 4U
 #define RAW_STATION_ERROR_ZONE       5U
-#define RAW_STATION_ERROR_UNDOCK     6U
+/* 6 原 UNDOCK 错误已删除。 */
 #define RAW_STATION_ERROR_ABORTED    7U
-#define RAW_STATION_ERROR_PRESLIDE   8U  /* 停靠窗口并行的滑台前伸失败 */
+#define RAW_STATION_ERROR_PRESLIDE   8U  /* 到站预伸的滑台前伸失败 */
 
 void RawStationTask_Init(Chassis *chassis);
 bool RawStationTask_Start(uint8_t batch, uint32_t now_ms);
@@ -48,7 +46,6 @@ void RawStationTask_Abort(void);
 bool RawStationTask_IsBusy(void);
 bool RawStationTask_IsDone(void);
 bool RawStationTask_HasError(void);
-uint8_t RawStationTask_GetError(void);
 
 extern volatile uint8_t robot_raw_station_state;
 extern volatile uint8_t robot_raw_station_error;

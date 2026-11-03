@@ -2,11 +2,6 @@
 #include "emm_adapter.h"
 #include "robot_config.h"
 
-static uint8_t sign_dir(float x)
-{
-    return (x >= 0.0f) ? 0U : 1U;
-}
-
 static float absf_local(float x)
 {
     return (x >= 0.0f) ? x : -x;
@@ -27,16 +22,6 @@ typedef enum
 static SlideRef_t slide_ref = SLIDE_REF_HOME;
 
 volatile uint8_t robot_slide_ref = (uint8_t)SLIDE_REF_HOME;
-
-HAL_StatusTypeDef Manipulator_Gimbal_Velocity(uint8_t dir, uint16_t rpm, uint8_t acc)
-{
-    return emm_vel(MOTOR_GIMBAL_ID, dir, rpm, acc, false);
-}
-
-HAL_StatusTypeDef Manipulator_Slide_Velocity(uint8_t dir, uint16_t rpm, uint8_t acc)
-{
-    return emm_vel(MOTOR_SLIDE_ID, dir, rpm, acc, false);
-}
 
 HAL_StatusTypeDef Manipulator_Gimbal_MovePulses(uint8_t dir, uint16_t rpm,
                                                 uint8_t acc, uint32_t pulses)

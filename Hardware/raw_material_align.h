@@ -64,7 +64,6 @@ bool RawMaterialAlign_HasError(void);
 float RawMaterialAlign_GetCarouselDeg(void);
 float RawMaterialAlign_GetSlideMm(void);
 uint16_t RawMaterialAlign_GetIteration(void);
-uint8_t RawMaterialAlign_GetError(void);
 
 /*
  * Keil Watch 诊断量：

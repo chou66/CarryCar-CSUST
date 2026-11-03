@@ -13,12 +13,11 @@
  *
  * 调用方式（每个作业点对一次，或由 zone_task 在每一步之前各对一次）：
  * @code
- * K230Align_Start(K230_ALIGN_MODE_DETECT, color_id, carousel_deg, now_ms);
+ * K230Align_StartPreset(K230_ALIGN_MODE_DETECT, color_id, now_ms);
  * @endcode
  * 随后由主循环持续调用 K230Align_Update()。
  *
- * 常规入口按「云台姿态由谁摆」二选一，不要混用：
- *   K230Align_Start()       本模块自己转云台并张开夹爪，再去取像。
+ * 云台姿态必须由上层先摆好，本模块不再动舵机：
  *   K230Align_StartPreset() 上层已经用 ManipulatorAction_SlideJogToXXXAlignStart()
  *                           把云台转到识别姿态并张开、滑台伸到识别位
  *                           （粗加工区/暂存区是「转向与前伸并行、都完成才就位」，
@@ -101,7 +100,7 @@ typedef enum
 
 /*
  * 本次对位是怎么结束的。Watch 只看 robot_k230_align_exit 就能定位 stop 的来源，
- * 不必再从 state/error/grab 几个量反推。由 K230Align_Start() 清成 NONE。
+ * 不必再从 state/error/grab 几个量反推。每次启动对位时清成 NONE。
  */
 #define K230_ALIGN_EXIT_NONE       0U  /* 尚未结束（对位进行中或刚启动） */
 #define K230_ALIGN_EXIT_TOLERANCE  1U  /* 完整双轴偏差连续稳定进入容差，正常收工 */
@@ -137,27 +136,11 @@ extern volatile uint8_t  robot_k230_align_stop_ack_received; /* 1=本次握手�
 void K230Align_Init(Chassis *chassis);
 
 /**
- * @brief 开始一次视觉对位。
- * @param mode        对位模式：原料区用 K230_ALIGN_MODE_DETECT，
- *                    粗加工区/第一轮暂存区用 K230_ALIGN_MODE_PLACE；
- *                    第二轮暂存区请使用K230Align_StartStackPreset
- * @param target_id   模式为 DETECT 时是颜色号 1~6；
- *                    模式为 PLACE/STACK 时是位置号 1~3
- * @param carousel_deg 对位时夹爪旋转舵机的目标角度。摄像头装在夹爪上，
- *                    这个值决定图像朝向；识别阶段一律传
- *                    CAROUSEL_PICKUP_POS2_DEG（取料位2），换掉必须重推
- *                    k230_align.c 的 offset_to_body()。
- * @return false 表示参数非法或当前正在对位；此时不改变任何状态。
- */
-bool K230Align_Start(K230AlignMode_t mode, uint8_t target_id,
-                     float carousel_deg, uint32_t now_ms);
-
-/**
  * @brief 云台已在识别姿态（夹爪已转好并张开）时开始一次视觉对位。
  *
  * 与 K230Align_Start() 的唯一区别是不再动舵机，直接从「清残帧 -> 发
  * detect/place」开始，省掉重复设定同一舵机目标带来的一个稳定期。
- * 姿态必须由调用方在此之前摆好（ManipulatorAction_SlideJogToAlignStart()），
+ * 姿态必须由调用方在此之前摆好（ManipulatorAction_SlideJogToXXXAlignStart()），
  * 否则相机朝向不对，w/a/s/d 的含义全是错的。
  *
  * @param mode       同 K230Align_Start
@@ -184,8 +167,7 @@ bool K230Align_IsBusy(void);
 bool K230Align_IsDone(void);
 bool K230Align_HasError(void);
 
-/* 诊断：已执行的微调次数与错误码。 */
+/* 诊断：已执行的微调次数。 */
 uint8_t K230Align_GetIteration(void);
-uint8_t K230Align_GetError(void);
 
 #endif

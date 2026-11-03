@@ -34,11 +34,6 @@ typedef enum
 void MaterialLoadTask_Init(void);
 
 /**
- * @brief Load three materials from ground or table into tray slots 1, 2 and 3.
- */
-bool MaterialLoadTask_Start(ManipulatorPickupSource_t source);
-
-/**
  * @brief Unload tray slots 1, 2 and 3 to ground positions 1, 2 and 3.
  */
 bool MaterialUnloadTask_Start(void);
@@ -47,11 +42,5 @@ void MaterialLoadTask_Update(uint32_t now_ms);
 void MaterialLoadTask_Abort(void);
 
 bool MaterialLoadTask_IsBusy(void);
-bool MaterialLoadTask_IsDone(void);
-bool MaterialLoadTask_HasError(void);
-
-MaterialTaskMode_t MaterialLoadTask_GetMode(void);
-MaterialTaskState_t MaterialLoadTask_GetState(void);
-uint8_t MaterialLoadTask_GetPickupIndex(void);
 
 #endif

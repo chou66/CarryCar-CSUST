@@ -34,5 +34,17 @@ void mecanum_inverse(const MecanumConfig *cfg, float vx_mps, float vy_mps,
                      float wz_radps, MecanumWheelCommand *out);
 
 /* 位置模式：根据给定绝对位移，等比例分配转速和脉冲，确保各轮同时到达 */
-void mecanum_inverse_pos(const MecanumConfig *cfg, float dx_m, float dy_m, 
+void mecanum_inverse_pos(const MecanumConfig *cfg, float dx_m, float dy_m,
                          float dtheta_rad, float speed_mps, MecanumWheelCommand *out);
+
+/*
+ * 有符号轮脉冲分配（不含方向位），单位：驱动器脉冲。
+ * 输出顺序固定为 [FL(id1), RL(id2), RR(id3), FR(id4)]，与 MecanumWheelCommand 一致。
+ *
+ * 速度模式的正弦加减速剖面用它得到各轮脉冲比例，再换算成轮速比例：
+ * 这样即使位置模式本身不再下发 0xFD，位移仍然沿用同一套实测脉冲标定，
+ * 不会因为改成速度模式而丢失距离精度。
+ */
+void mecanum_inverse_pulses(const MecanumConfig *cfg,
+                            float dx_m, float dy_m, float dtheta_rad,
+                            float pulses[4]);

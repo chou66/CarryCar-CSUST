@@ -65,9 +65,6 @@
 
 /* USER CODE BEGIN PV */
 
-//test 1
-static bool material_unload_test_started = false;//防止重复启动
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -129,9 +126,13 @@ int main(void)
 	Servo_Init();
 	ManipulatorAction_Init();
 	MaterialLoadTask_Init();
-	
+
+#if MISSION_CHASSIS_ONLY
+	/* 只跑底盘模式：上电不做任何夹爪动作，全部机械臂动作都留给占位延时。 */
+#else
 	GripperServo_Open_Small();
-	RobotApp_Init(); 	
+#endif
+	RobotApp_Init();
 
 //	K230_Init();
 

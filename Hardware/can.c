@@ -17,8 +17,8 @@ volatile uint32_t can_psr_tec     = 0;
 volatile uint32_t can_busoff_cnt  = 0;
 volatile uint8_t  can_rx_flag     = 0;
 
-FDCAN_RxHeaderTypeDef can_rx_header;
-uint8_t can_rx_data[8];
+static FDCAN_RxHeaderTypeDef can_rx_header;
+static uint8_t can_rx_data[8];
 
 static MotorStatusCache_t s_motor_status[CAN_MOTOR_MAX_ID + 1U];
 
@@ -212,14 +212,6 @@ uint8_t Emm_V5_Read_Status(uint8_t id, uint8_t *status, uint32_t timeout_ms)
     return 0U;
 }
 
-uint8_t Emm_V5_Is_Reached(uint8_t id)
-{
-    uint8_t status = 0U;
-    if (!Emm_V5_Read_Status(id, &status, 50U))
-        return 0U;
-    return (status & 0x02U) ? 1U : 0U;
-}
-
 void fdcan2_UserInit(void)
 {
     FDCAN_FilterTypeDef filter = {0};
@@ -263,16 +255,4 @@ void HAL_FDCAN_ErrorCallback(FDCAN_HandleTypeDef *hfdcan)
 
     if ((psr & FDCAN_PSR_BO) != 0U)
         can_busoff_cnt++;
-}
-
-uint8_t fdcan2_recover(void)
-{
-    if (HAL_FDCAN_Stop(&hfdcan2) != HAL_OK)
-        return 0U;
-    if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK)
-        return 0U;
-    if (HAL_FDCAN_ActivateNotification(&hfdcan2,
-            FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_BUS_OFF, 0U) != HAL_OK)
-        return 0U;
-    return 1U;
 }

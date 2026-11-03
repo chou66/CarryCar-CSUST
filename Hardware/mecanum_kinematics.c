@@ -37,8 +37,9 @@ void mecanum_inverse(const MecanumConfig *cfg, float vx, float vy, float wz,
     out->fr = make_command(cfg, 4U, fr, 0.0f);
 }
 
-void mecanum_inverse_pos(const MecanumConfig *cfg, float dx, float dy, float dtheta, 
-                         float speed_mps, MecanumWheelCommand *out)
+void mecanum_inverse_pulses(const MecanumConfig *cfg,
+                            float dx, float dy, float dtheta,
+                            float pulses[4])
 {
     const float k = cfg->half_length_m + cfg->half_width_m;
     const float theoretical_pulses_per_m = cfg->motor_pulses_per_rev * cfg->gear_ratio /
@@ -48,13 +49,30 @@ void mecanum_inverse_pos(const MecanumConfig *cfg, float dx, float dy, float dth
     const float strafe_pulses_per_m = (cfg->strafe_pulses_per_m > 0.0f) ?
                                       cfg->strafe_pulses_per_m : theoretical_pulses_per_m;
     const float rotate_pulses_per_rad = (cfg->rotate_pulses_per_rad > 0.0f) ?
-                                       cfg->rotate_pulses_per_rad : k * theoretical_pulses_per_m;
-    
+                                       cfg->rotate_pulses_per_rad :
+                                       k * theoretical_pulses_per_m;
+
+    if (!pulses) return;
+
     /* 坐标系：dx 向右为正(+X)，dy 向上/向前为正(+Y) */
-    float p_fl = dy * forward_pulses_per_m + dx * strafe_pulses_per_m - dtheta * rotate_pulses_per_rad;
-    float p_fr = dy * forward_pulses_per_m - dx * strafe_pulses_per_m + dtheta * rotate_pulses_per_rad;
-    float p_rl = dy * forward_pulses_per_m - dx * strafe_pulses_per_m - dtheta * rotate_pulses_per_rad;
-    float p_rr = dy * forward_pulses_per_m + dx * strafe_pulses_per_m + dtheta * rotate_pulses_per_rad;
+    pulses[0] = dy * forward_pulses_per_m + dx * strafe_pulses_per_m - dtheta * rotate_pulses_per_rad;
+    pulses[1] = dy * forward_pulses_per_m - dx * strafe_pulses_per_m - dtheta * rotate_pulses_per_rad;
+    pulses[2] = dy * forward_pulses_per_m + dx * strafe_pulses_per_m + dtheta * rotate_pulses_per_rad;
+    pulses[3] = dy * forward_pulses_per_m - dx * strafe_pulses_per_m + dtheta * rotate_pulses_per_rad;
+}
+
+void mecanum_inverse_pos(const MecanumConfig *cfg, float dx, float dy, float dtheta,
+                         float speed_mps, MecanumWheelCommand *out)
+{
+    float pulses[4];
+
+    mecanum_inverse_pulses(cfg, dx, dy, dtheta, pulses);
+
+    /* 顺序与 mecanum_inverse_pulses 一致：FL, RL, RR, FR。 */
+    float p_fl = pulses[0];
+    float p_rl = pulses[1];
+    float p_rr = pulses[2];
+    float p_fr = pulses[3];
 
     float peak_pulse = fmaxf(fmaxf(fabsf(p_fl), fabsf(p_fr)), fmaxf(fabsf(p_rl), fabsf(p_rr)));
     float rpm_fl = 0.0f, rpm_fr = 0.0f, rpm_rl = 0.0f, rpm_rr = 0.0f;

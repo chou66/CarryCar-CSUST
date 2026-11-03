@@ -10,7 +10,6 @@ void RobotApp_Init(void);
 void RobotApp_Update(uint32_t now_ms);
 
 uint8_t RobotApp_GotoNode(uint8_t target_node);
-uint8_t RobotApp_GotoReturnNode(void);
 void RobotApp_EStop(void);
 
 /*

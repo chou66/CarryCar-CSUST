@@ -13,13 +13,13 @@ MapNode_t g_nodes[NODE_NUM + 1] =
     {0},
     {0.35f, 0.35f, MAP_TASK_NONE,    0U,   0.0f},  /* N1 */
     {1.20f, 0.35f, MAP_TASK_ROUGH,   1U,  90.0f},  /* N2 粗加工：车头向右 */
-    {2.10f, 0.35f, MAP_TASK_NONE,    0U,   0.0f},  /* N3 右下车道交点 */
+    {2.20f, 0.35f, MAP_TASK_NONE,    0U,   0.0f},  /* N3 右下车道交点 */
     {0.35f, 1.20f, MAP_TASK_STORAGE, 1U, 180.0f},  /* N4 暂存区：车头向下，右侧机械臂朝左 */
     {1.20f, 1.20f, MAP_TASK_NONE,    0U,   0.0f},  /* N5 */
-    {2.10f, 1.20f, MAP_TASK_QR,      1U,   0.0f},  /* N6 扫码区：暂定车头向上 */
-    {0.35f, 2.10f, MAP_TASK_NONE,    0U,   0.0f},  /* N7 */
-    {1.20f, 2.10f, MAP_TASK_RAW,     1U, -90.0f},  /* N8 原料区：车头向左，右侧机械臂朝上 */
-    {2.10f, 2.10f, MAP_TASK_NONE,    0U,   0.0f}   /* N9 右上车道交点 */
+    {2.20f, 1.20f, MAP_TASK_QR,      1U,   0.0f},  /* N6 扫码区：暂定车头向上 */
+    {0.35f, 2.20f, MAP_TASK_NONE,    0U,   0.0f},  /* N7 */
+    {1.20f, 2.20f, MAP_TASK_RAW,     1U, -90.0f},  /* N8 原料区：车头向左，右侧机械臂朝上 */
+    {2.20f, 2.20f, MAP_TASK_NONE,    0U,   0.0f}   /* N9 右上车道交点 */
 };
 
 uint8_t MapGraph_GetParkingPose(uint8_t corner_node, float *x, float *y)
@@ -301,23 +301,4 @@ uint8_t MapGraph_IsConnected(uint8_t node_a, uint8_t node_b)
     }
 
     return (g_graph[node_a][node_b] < INF_COST);
-}
-
-
-//====================================================
-// 获取边代价
-//====================================================
-uint16_t MapGraph_GetCost(uint8_t node_a, uint8_t node_b)
-{
-    if(node_a == 0 || node_a > NODE_NUM)
-    {
-        return INF_COST;
-    }
-
-    if(node_b == 0 || node_b > NODE_NUM)
-    {
-        return INF_COST;
-    }
-
-    return g_graph[node_a][node_b];
 }

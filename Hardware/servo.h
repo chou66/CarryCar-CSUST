@@ -19,7 +19,6 @@ extern volatile float g_carousel_place_deg;       /* 云台抓取后转向物料
 extern volatile float g_tray_slot_deg[];          /* [0]/[1]/[2] 分别对应物料盘1/2/3号位 */
 
 void CarouselServo_Update(uint32_t now_ms);
-bool CarouselServo_IsBusy(void);
 bool CarouselServo_IsDone(void);
 
 void Servo_Init(void);
@@ -36,18 +35,15 @@ void GripperServo_Close(void);
 void GripperServo_Mid(void);
 
 void GripperServo_Update(uint32_t now_ms);
-bool GripperServo_IsBusy(void);
 bool GripperServo_IsDone(void);
 /*CarouselServo*/
 void CarouselServo_SetUs(uint16_t us);
 void CarouselServo_SetAngle(float angle_deg);
-void CarouselServo_ToPickupPos1(void);
 void CarouselServo_ToPickup(void);       /* 原函数继续代表夹取位2 */
-void CarouselServo_ToPickupPos3(void);
 void CarouselServo_ToPlace(void);
 void CarouselServo_ToMid(void);
 
-/*TraySelectorServo*/
+/*TraySelectorServo —— 板载PWM1 / TIM3_CH1*/
 void TraySelectorServo_SetUs(uint16_t us);
 void TraySelectorServo_SetAngle(float angle_deg);
 void TraySelectorServo_GotoSlot(uint8_t slot);

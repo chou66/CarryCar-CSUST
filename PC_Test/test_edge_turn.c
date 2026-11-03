@@ -30,6 +30,7 @@ int main(void)
     options.reverse_min_turn_saving_deg = 5.0f;
     options.arrival_yaw_valid = 0U;
     options.arrival_world_yaw_deg = 0.0f;
+    options.allow_merged_edge = 0U;
 
     check(EdgeTurn_Plan(5U, 8U, 0.4f, 0.8f, &options, &plan) &&
           nearf(plan.target_world_yaw_deg, 0.0f, 0.01f) &&

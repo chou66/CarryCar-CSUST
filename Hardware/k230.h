@@ -137,7 +137,6 @@ void K230_Process(void);
 /* 取出并清除尚未处理的事件。 */
 uint32_t K230_TakeEvents(void);
 
-uint8_t K230_GetStatus(K230_Status_t *out);
 uint8_t K230_IsOnline(uint32_t now_ms);
 
 /* 通用字符串发送。 */
@@ -150,18 +149,8 @@ HAL_StatusTypeDef K230_StartPlace(uint8_t position_id);
 HAL_StatusTypeDef K230_StartStack(uint8_t position_id, uint8_t anchor_color_id);
 HAL_StatusTypeDef K230_Stop(void);
 
-/* 一次非阻塞视觉任务：Start只调用一次，Update需要在主循环持续调用。 */
-uint8_t K230_TaskStartDetect(uint8_t color_id);
-uint8_t K230_TaskStartPlace(uint8_t position_id);
+/* 一次非阻塞视觉任务：Update需要在主循环持续调用。 */
 void K230_TaskUpdate(uint32_t now_ms);
 void K230_TaskAbort(void);
-
-uint8_t K230_TaskIsBusy(void);
-uint8_t K230_TaskIsDone(void);
-uint8_t K230_TaskHasError(void);
-
-/* 取出一条新偏差并清除offset_pending；不会清除最终任务结果。 */
-uint8_t K230_TaskTakeOffset(char *direction, int32_t *offset_px);
-uint8_t K230_TaskGetResult(K230_TaskResult_t *out);
 
 #endif

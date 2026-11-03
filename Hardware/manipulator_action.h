@@ -50,12 +50,6 @@
  *     MANIP_PICKUP_POSITION_1);
  * @endcode
  *
- * 旧接口继续保留，并默认使用夹取位置2：
- * @code
- * ManipulatorAction_StartGroundToTray();
- * ManipulatorAction_StartTableToTray();
- * @endcode
- *
  * 注意：
  * - Start函数只调用一次，用于启动动作。
  * - 主循环必须持续调用ManipulatorAction_Update()。
@@ -118,20 +112,22 @@ typedef enum
     MANIP_GROUND_TO_TRAY_CLOSE,
     MANIP_GROUND_TO_TRAY_WAIT_CLOSE,
 
-		/* 电机5上升回最高原点，同时电机6后缩回原点（并行）。 */
+		/*
+		 * 电机5 一次升回最高原点，电机6 回缩到原点。地面取料时电机6
+		 * 延后到电机5 升过半程再回缩（时间戳延时），原料台/物料盘同帧回缩。
+		 */
 		MANIP_GROUND_TO_TRAY_RETURN_GIMBAL,
 		MANIP_GROUND_TO_TRAY_WAIT_RETURN_GIMBAL,
 
-		/*
-		 * 保留顺序回缩状态值：并行化后不再进入，仅作实车干涉时的回退路径。
-		 * 进入本状态仍是“电机5到位后电机6再后缩”。
-		 */
+		/* 保留的顺序回缩路径：电机5 到位后电机6 再后缩，仅作实车干涉回退用。 */
 		MANIP_GROUND_TO_TRAY_RETRACT_SLIDE,
 		MANIP_GROUND_TO_TRAY_WAIT_RETRACT_SLIDE,
 
     /* 夹爪旋转到料盘放置方向。 */
     MANIP_GROUND_TO_TRAY_ROTATE_TO_PLACE,
     MANIP_GROUND_TO_TRAY_WAIT_ROTATE,
+    /* 舵机到位后再等 MANIP_PLACE_SERVO_SETTLE_MS 让机械稳住。 */
+    MANIP_GROUND_TO_TRAY_WAIT_ROTATE_SETTLE,
 
     /* 电机5下降到料盘高度。 */
     MANIP_GROUND_TO_TRAY_MOVE_TO_TRAY,
@@ -164,7 +160,7 @@ typedef enum
 		/* 夹爪单独旋转到地面夹取方向。 */
 		MANIP_TRAY_TO_GROUND_ROTATE_TO_GROUND,
 		MANIP_TRAY_TO_GROUND_WAIT_ROTATE_TO_GROUND,
-		
+
 		/* 舵机到位后，电机5下降、电机6前伸。 */
 		MANIP_TRAY_TO_GROUND_MOVE_TO_GROUND,
 		MANIP_TRAY_TO_GROUND_WAIT_GROUND,
@@ -173,14 +169,14 @@ typedef enum
     MANIP_TRAY_TO_GROUND_OPEN,
     MANIP_TRAY_TO_GROUND_WAIT_OPEN,
 
-		/* 电机5上升回最高原点，同时电机6后缩回原点（并行）。 */
+		/*
+		 * 电机5 一次升回最高原点，电机6 回缩到原点。地面/粗加工/暂存区
+		 * 放料时电机6 延后到电机5 升过半程再回缩，浅层位姿同帧回缩。
+		 */
 		MANIP_TRAY_TO_GROUND_FINAL_RETURN_GIMBAL,
 		MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETURN_GIMBAL,
 
-		/*
-		 * 保留顺序回缩状态值：并行化后不再进入，仅作实车干涉时的回退路径。
-		 * 进入本状态仍是“电机5到位后电机6再后缩”。
-		 */
+		/* 保留的顺序回缩路径：电机5 到位后电机6 再后缩，仅作实车干涉回退用。 */
 		MANIP_TRAY_TO_GROUND_FINAL_RETRACT_SLIDE,
 		MANIP_TRAY_TO_GROUND_WAIT_FINAL_RETRACT_SLIDE,
 
@@ -218,8 +214,9 @@ typedef enum
  *     电机6和舵机同时动；WAIT 除了等滑台到位，还要等两路舵机 DONE
  *     （或 K230_ALIGN_ROTATE_TIMEOUT_MS 兜底），两件事都完成才算 DONE，
  *     因此上层 IsDone() 之后才发 K230 detect，识别不会提前。
- *   - 串行（原料区/通用点动）：先走 ROTATE（云台先转、滑台后伸）。原料区
- *     的串行开销已被停靠平移窗口掩盖，且“先转再伸”是那里验证过的安全次序。
+ *   - 串行（原料区/通用点动）：先走 ROTATE（云台先转、滑台后伸）。
+ *     原料区取消底盘停靠后滑台要伸得更远，“先转再伸”仍是那里验证过的
+ *     安全次序。
  * 「退回原点」不动云台，直接从 MOVE 开始。
  * 粗加工区/暂存区带 ROUGH_/STORAGE_VISION_PRE_DROP_MM 时，WAIT 到位后
  * 再走 LOWER；带预下降的回原点则先走 RAISE 抬回最高点，再回缩滑台。
@@ -243,7 +240,13 @@ typedef enum
      * 行驶预置专用：料盘/云台/夹爪目标已经下发，先等云台与夹爪转到位，
      * 再把电机5下降到视觉取像高度，避免“边转边降”造成扫掠干涉。
      */
-    MANIP_JOG_PRE_ROTATE
+    MANIP_JOG_PRE_ROTATE,
+    /*
+     * 视觉识别结束后的并行回收：电机5 抬回最高原点与电机6 回缩同一帧
+     * 下发，等两路都到位才 DONE。仅在做过视觉预下降时与 RAISE 二选一，
+     * 由 MANIP_HOME_PARALLEL_ENABLE 决定；串行回退仍走 MANIP_JOG_RAISE。
+     */
+    MANIP_JOG_HOME_PARALLEL
 } ManipulatorSlideJogState_t;
 
 /*
@@ -284,15 +287,17 @@ extern volatile uint8_t robot_manip_active_flow;
  */
 extern volatile uint8_t manip_debug_confirm_src;
 
+/*
+ * 夹取/放置任务中，超过 MANIP_MOTOR_IGNORE_TIMEOUT_MS（默认 2 s）仍未
+ * 回读到到位标志、被按“已到位”放行的电机位掩码（每段开始时清零）：
+ *   bit4 = 电机5（云台升降）
+ *   bit5 = 电机6（滑台）
+ * 非 0 表示本次动作有电机是靠超时放行推进的，可据此判断 CAN 回读是否
+ * 丢包；堵转保护故障不受该放行影响，仍会直接报错。
+ */
+extern volatile uint8_t manip_debug_ignored_mask;
+
 void ManipulatorAction_Init(void);
-bool ManipulatorAction_StartToTray(ManipulatorPickupSource_t source);
-
-/* 地面/原料台取料，然后放入物料托盘。 */
-bool ManipulatorAction_StartTableToTray(void);
-bool ManipulatorAction_StartGroundToTray(void);
-
-/* 从物料托盘取料，然后放到地面目标位置。 */
-bool ManipulatorAction_StartTrayToGround(void);
 
 /*从当前物料托盘位置取料，然后放到指定的地面位置*/
 bool ManipulatorAction_StartTrayToGroundAt( ManipulatorPickupPosition_t position);
@@ -367,8 +372,8 @@ void ManipulatorAction_Abort(void);
  *      比在伸出 95mm 后再转更不容易和外围干涉。
  *      粗加工区/暂存区改成并行：云台/夹爪与滑台前伸同一帧下发，
  *      两件事都完成才算就位（详见 ManipulatorSlideJogState_t 的说明）。
- *   2) 滑台后伸——通用识别伸到 POS2 的伸出量；原料区停靠后使用
- *      RAW_VISION_SLIDE_START_MM（已扣除底盘靠近量），
+ *   2) 滑台后伸——通用识别伸到 POS2 的伸出量；原料区使用
+ *      RAW_VISION_SLIDE_START_MM（已并入原 40 mm 底盘靠近量），
  *      让取像距离与识别姿态自洽。
  *   3) 粗加工区/暂存区在滑台到位后，再下降电机5
  *      ROUGH_/STORAGE_VISION_PRE_DROP_MM，让相机靠近圆环后再发 place。
@@ -377,8 +382,9 @@ void ManipulatorAction_Abort(void);
  * 识别结束后：
  *   - 原料区由 RawMaterialAlign 动态调整云台/滑台，对准完成后调用
  *     StartToTrayFromAlignedPose() 从最高原点直接下降抓取，不再退回原点；
- *   - 粗加工区/暂存区仍由调用方退回原点：带预下降时先 RAISE 抬回最高点，
- *     再回缩滑台，然后从最高原点执行固定位姿动作。
+ *   - 粗加工区/暂存区仍由调用方退回原点：带预下降时电机5 抬回最高点与
+ *     滑台回缩同一帧下发（MANIP_HOME_PARALLEL_ENABLE=1），两者都到位后
+ *     从最高原点执行固定位姿动作；置0 则回退为「先抬到顶、再回缩」。
  * 动作引擎里「伸出=发相对位移、回程=发负值」的假设因此保持不变。
  *
  * 模块会在每次电机到位确认后记录滑台绝对位置。原料视觉位置环可反复调用
@@ -387,43 +393,47 @@ void ManipulatorAction_Abort(void);
  *
  * 用法与主动作相同：Start 一次，主循环持续调用 ManipulatorAction_Update()。
  * 启动条件不满足时返回 false 且不改变任何状态：
- *   SlideJogToAlignStart —— 暂存区通用识别预置
  *   SlideJogToRoughAlignStart —— 粗加工区2号参考环预置，使用实车标定的
  *                                ROUGH_VISION_LOW_SLIDE_POS2_MM；云台转向与滑台前伸
  *                                同时开始，两者都完成后预下降 ROUGH_VISION_PRE_DROP_MM
- *   SlideJogToStorageAlignStart —— 暂存区2号参考环预置，使用独立的
+ *   SlideJogToStorageAlignStart —— 暂存区第一轮2号参考环预置，使用独立的
  *                                  STORAGE_VISION_LOW_SLIDE_POS2_MM；云台转向与滑台前伸
  *                                  同时开始，两者都完成后预下降 STORAGE_VISION_PRE_DROP_MM
- *   SlideJogToRawAlignStart —— 原料停靠后的补偿预伸
+ *   SlideJogToStorageStackAlignStart —— 暂存区第二轮叠放（STACK-2）的同一位姿
+ *                                  取像，但电机5 与原料区一样保持最高原点识别，
+ *                                  预下降量取 STORAGE_STACK_VISION_PRE_DROP_MM（0）
+ *   SlideJogToRawAlignStart —— 原料区识别预伸（含原底盘靠近量）
  *   SlideJogToPositionStart —— 当前位置可信，走到新的绝对目标
  *   SlideJogHomeStart       —— 从当前可信的非零位置回原点；若此前做过
- *                              视觉预下降，先抬回最高原点，再回缩滑台
+ *                              视觉预下降，默认把电机5抬回最高原点与滑台
+ *                              回缩同一帧下发（MANIP_HOME_PARALLEL_ENABLE），
+ *                              置0则回退为「先抬到顶、再回缩」
  *
- * 名字里的 "Jog" 是沿用旧的滑台点动叫法：这两个入口都以「滑台挪一段」
- * 为目的，ToAlignStart 额外承担了上面第 1 步的云台预转。
+ * 名字里的 "Jog" 是沿用旧的滑台点动叫法：这些入口都以「滑台挪一段」
+ * 为目的，带 Align 的入口额外承担了云台预转。
  *
  * 到位后由本模块调用 Manipulator_Slide_SetAlign()/SetHome() 更新基准；
  * 预置/点动失败会 Manipulator_StopAll()，位置基准随之作废（须人工归零）。
  * 主动作与本状态机互斥：预置进行中 start 主动作会返回 false，反之亦然。
  */
-bool ManipulatorAction_SlideJogToAlignStart(void);
 
 /*
  * ==================== 高位识别兼容接口 ====================
  * 仅供保留的旧VOFA标定流程使用：云台转到2号参考角、滑台伸到对应区域的
  * 2号长度，但电机5保持在最高原点，不执行视觉预下降。
- * 正式比赛流程不要调用这两个接口，正式流程继续使用下面不带High的低位接口。
+ * 正式比赛流程不要调用这个接口，正式流程继续使用下面不带High的低位接口。
  */
 bool ManipulatorAction_SlideJogToRoughAlignHighStart(void);
-bool ManipulatorAction_SlideJogToStorageAlignHighStart(void);
 
 /*
  * ==================== 低位识别正式接口 ====================
  * 云台/夹爪就位、滑台伸到2号参考长度后，再让电机5下降到预取像高度。
- * 下降量分别取ROUGH_VISION_PRE_DROP_MM和STORAGE_VISION_PRE_DROP_MM。
+ * 下降量分别取ROUGH_VISION_PRE_DROP_MM和STORAGE_VISION_PRE_DROP_MM；
+ * 暂存区第二轮叠放改用STORAGE_STACK_VISION_PRE_DROP_MM（0，最高点识别）。
  */
 bool ManipulatorAction_SlideJogToRoughAlignStart(void);
 bool ManipulatorAction_SlideJogToStorageAlignStart(void);
+bool ManipulatorAction_SlideJogToStorageStackAlignStart(void);
 bool ManipulatorAction_SlideJogToRawAlignStart(void);
 
 /*
@@ -460,7 +470,8 @@ bool ManipulatorAction_SlideJogToPositionStart(float target_mm);
  *   RetractSlideOnlyStart：只把电机6齿条收回软件0 mm，要求电机5已经
  *                          位于最高原点。
  *
- * 原SlideJogHomeStart仍保留，表示“先抬丝杆、再收齿条”的组合安全回收。
+ * 原SlideJogHomeStart仍保留为组合回收：做过视觉预下降时默认“边抬丝杆边收
+ * 齿条”（MANIP_HOME_PARALLEL_ENABLE=1），置0 时回退为“先抬丝杆、再收齿条”。
  * 分轴接口用于实车标定时逐步验证动作，不能绕过位置可信和忙状态互锁。
  */
 bool ManipulatorAction_SlideJogRaiseGimbalOnlyStart(void);
@@ -483,7 +494,6 @@ bool ManipulatorAction_SlideJogPositionKnown(void);
  * 未预下降或已由后续动作接管时返回 0。
  */
 float ManipulatorAction_SlideJogGetVisionDropMm(void);
-void ManipulatorAction_SlideJogClearVisionDrop(void);
 
 bool ManipulatorAction_SlideJogIsBusy(void);
 bool ManipulatorAction_SlideJogIsDone(void);
@@ -511,8 +521,7 @@ extern volatile uint8_t robot_manip_vision_drop_applied;
  * 作业要用的料盘槽位、云台识别角、夹爪张开量和（粗加工区/暂存区的）电机5
  * 视觉预下降提前做好，让这些动作与底盘转向、行驶并行：
  *
- *   ManipulatorAction_PrepositionForNextZone()          只动三路舵机
- *   ManipulatorAction_PrepositionForNextZoneWithDrop()  舵机转到位后再下降电机5
+ *   ManipulatorAction_PrepositionForNextZoneWithDrop()  摆三路舵机，舵机转到位后再下降电机5
  *
  * 预下降不会和云台旋转同时进行：MANIP_JOG_PRE_ROTATE 先等云台与夹爪 DONE
  * （或 K230_ALIGN_ROTATE_TIMEOUT_MS 兜底），再发电机5命令，避免夹爪一边
@@ -537,8 +546,6 @@ extern volatile uint8_t robot_manip_vision_drop_applied;
  * 启动条件不满足时返回 false 且不改变任何状态；预置失败绝不让任务失败——
  * 到站后的原有流程本身会把同样的姿态摆好，只是慢一些。
  */
-bool ManipulatorAction_PrepositionForNextZone(uint8_t tray_slot);
-
 /*
  * @param gimbal_pre_drop_mm 电机5视觉预下降量（正数=向下），0 表示不下降。
  *        粗加工区传 ROUGH_VISION_PRE_DROP_MM，暂存区传

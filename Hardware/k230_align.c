@@ -18,7 +18,7 @@
  * 斜向平移。k230.c 已按轴分别缓存（g_k230_status.axis_*_dir/_px/_ms），
  * 本模块直接按时间戳取本轮的那一对，因此不依赖 K230 的任务层，也不怕
  * 两行落在同一个主循环周期里互相覆盖。
- * （对位不使用 K230_TaskStartDetect 的“等 grab”模型：那条路径在
+ * （对位不使用 k230.c 任务层的“等 grab”模型：那条路径在
  *  grab 之后就不再消费新事件，拿不到后续的偏差帧。）
  */
 
@@ -366,8 +366,12 @@ static void handle_offset_pair(int32_t px_x, int32_t px_y, uint32_t now_ms)
         return;
     }
 
-    chassis_motion_translate(s_chassis, dx_m, dy_m,
-                             K230_ALIGN_SPEED_MPS, now_ms);
+    /*
+     * 视觉微调是 mm 级位移，必须走位置模式：速度剖面的总时长短于刷新
+     * 周期时会被时间量化截断，轮子只收到一帧速度就 STOP，停在原地抖。
+     */
+    chassis_motion_translate_precise(s_chassis, dx_m, dy_m,
+                                     K230_ALIGN_SPEED_MPS, now_ms);
 
     s_iteration++;
     robot_k230_align_iteration = s_iteration;
@@ -519,12 +523,6 @@ static bool align_start(K230AlignMode_t mode, uint8_t target_id,
 
     enter_state(K230_ALIGN_ROTATE, now_ms);
     return true;
-}
-
-bool K230Align_Start(K230AlignMode_t mode, uint8_t target_id,
-                     float carousel_deg, uint32_t now_ms)
-{
-    return align_start(mode, target_id, 0U, carousel_deg, false, now_ms);
 }
 
 bool K230Align_StartPreset(K230AlignMode_t mode, uint8_t target_id,
@@ -930,9 +928,4 @@ bool K230Align_HasError(void)
 uint8_t K230Align_GetIteration(void)
 {
     return s_iteration;
-}
-
-uint8_t K230Align_GetError(void)
-{
-    return robot_k230_align_error;
 }

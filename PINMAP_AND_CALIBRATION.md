@@ -8,8 +8,10 @@
 | K230 | UART4 | PC10 TX / PC11 RX |
 | 无刷/扩展 | UART5 | PC12 TX / PD2 RX |
 | CAN 电机 | FDCAN2 | PB13 TX / PB12 RX |
-| 抓夹舵机 | TIM3_CH1 | PB4 |
-| 三工位圆盘舵机 | TIM3_CH2 | PE3 |
+| 料盘选择舵机 | TIM3_CH1 | PB4 |
+| 云台旋转舵机 | TIM3_CH2 | PE3 |
+| 夹爪开合舵机 | TIM3_CH3 | PE4 |
+| 预留舵机通道 | TIM3_CH4 | PB7 |
 | 蜂鸣器 | GPIO | PE0 |
 | SWD | SYS | PA13 / PA14 |
 

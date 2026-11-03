@@ -99,6 +99,10 @@ static uint8_t s_mission_align_saved_acceleration = 0U;
 static uint8_t s_mission_align_acceleration_saved = 0U;
 static uint32_t s_mission_align_last_sample_ms = 0U;
 static uint8_t s_mission_align_last_sample_valid = 0U;
+/* 1=本次任务航向对准走 EMM 位置模式（粗加工区/暂存区）。 */
+static uint8_t s_mission_align_position_mode = 0U;
+/* 位置模式连续失败次数：达到上限才把任务锁死，避免偶发一次超时直接弃赛。 */
+static uint8_t s_mission_align_pos_fail_count = 0U;
 static MissionTaskCode_t s_mission_task_code;
 static uint8_t s_hmi_last_color = 0xFFU;
 
@@ -127,6 +131,7 @@ volatile uint8_t robot_mission_vision_iteration = 0U;
 #define MISSION_ERROR_TASK                  10U
 #define MISSION_ERROR_VISION                11U
 #define MISSION_ERROR_RAW_STATION           12U
+#define MISSION_ERROR_ALIGN                 13U  /* 位置模式任务航向转失败 */
 #define MISSION_DEG_TO_RAD_F     0.01745329251994329577f
 #define MISSION_TWO_PI_F         6.28318530717958647692f
 
@@ -319,6 +324,13 @@ static const char *mission_stage_text(uint8_t stage)
     }
 }
 
+/*
+ * 段执行失败：记录错误码、锁死任务并停车。
+ *
+ * 注意 Navigation 的 current_node 只会被 EdgeReached() 推进，失败时车通常
+ * 停在某条边的中途；因此这里保持“整场任务停在 MISSION_ERROR”的旧行为，
+ * 不允许在位置未知的情况下继续规划下一段。
+ */
 static void mission_fail(uint8_t error_code)
 {
     robot_mission_error = error_code;
@@ -439,19 +451,21 @@ static void mission_enter_task_hold(uint32_t now_ms)
     HMI_Race_SetResult("RUNNING");
 }
 
-/* Chassis-only route test: keep the normal mission scheduler and navigation
- * path, but replace every work-area action with a non-blocking two-second hold.
- * This deliberately lives in RobotApp rather than main.c so it still covers
- * HMI obstacles, Dijkstra, EdgeMotion, parking exit, and parking entry. */
+#if MISSION_CHASSIS_ONLY
+/* 只跑底盘模式(MISSION_CHASSIS_ONLY=1)：保留完整的任务调度器、导航、
+ * 任务航向对准、启停区进出，只把每个作业点的视觉对位与机械臂抓放换成
+ * 一个不阻塞的两秒等待，作为机械臂任务的占位。放在 RobotApp 而不是
+ * main.c，是为了仍然覆盖 HMI 障碍、Dijkstra、EdgeMotion 和启停区进出。 */
 static void mission_enter_chassis_hold(uint32_t now_ms)
 {
     chassis_motion_stop(&s_chassis);
-    s_mission_deadline_ms = now_ms + MISSION_TASK_HOLD_MS;
+    s_mission_deadline_ms = now_ms + MISSION_CHASSIS_HOLD_MS;
     robot_mission_state = MISSION_TASK_HOLD;
 
     HMI_Race_SetAction("CHASSIS HOLD");
     HMI_Race_SetResult("SKIP TASK");
 }
+#endif /* MISSION_CHASSIS_ONLY */
 
 #if K230_ALIGN_ENABLE
 /*
@@ -517,8 +531,8 @@ static void mission_begin_vision_align(uint32_t now_ms)
     if (zone == ZONE_RAW)
     {
         /*
-         * 原料区的底盘停靠、三轮视觉抓取和固定距离撤回全部由
-         * RawStationTask 管理。RobotApp 不展开这些子状态，只保留一个
+         * 原料区的滑台预伸和三轮视觉抓取全部由 RawStationTask 管理；
+         * 车体到站后不再停靠平移。RobotApp 不展开这些子状态，只保留一个
          * MISSION_RAW_STATION 等待点，避免全流程状态机与机械细节耦合。
          */
         if (!RawStationTask_Start(batch, now_ms))
@@ -546,13 +560,29 @@ static void mission_begin_vision_align(uint32_t now_ms)
      * 固定夹爪位姿（2号当前90 mm），不把相机对准用的95 mm带进放料动作。
      * 暂存区使用独立的STORAGE_VISION_LOW_SLIDE_POS2_MM；它会由专用VOFA流程在经过
      * 粗加工2号环校准底盘后标定，因而不会再借用原料区的旧通用距离。
+     *
+     * 暂存区第二轮叠放（batch 1）的物料已压在上一层上，低位取像贴得太近，
+     * 改用与原料区一致的“最高原点识别”，齿条长度仍是同一组2号参考量。
      */
-    if (!((zone == ZONE_ROUGH) ?
-          ManipulatorAction_SlideJogToRoughAlignStart() :
-          ManipulatorAction_SlideJogToStorageAlignStart()))
+    if (zone == ZONE_ROUGH)
     {
-        mission_fail(MISSION_ERROR_VISION);
-        return;
+        if (!ManipulatorAction_SlideJogToRoughAlignStart())
+        {
+            mission_fail(MISSION_ERROR_VISION);
+            return;
+        }
+    }
+    else
+    {
+        bool storage_ok = (batch == 1U) ?
+                          ManipulatorAction_SlideJogToStorageStackAlignStart() :
+                          ManipulatorAction_SlideJogToStorageAlignStart();
+
+        if (!storage_ok)
+        {
+            mission_fail(MISSION_ERROR_VISION);
+            return;
+        }
     }
 
     robot_mission_state = MISSION_VISION_PRESET;
@@ -573,6 +603,19 @@ static void mission_begin_vision_align(uint32_t now_ms)
  */
 static void mission_continue_after_alignment(uint32_t now_ms)
 {
+#if MISSION_CHASSIS_ONLY
+    /*
+     * 只跑底盘模式：导航、任务航向对准、启停区进出都照常执行（这些都属于
+     * 底盘任务），到站对好航向后跳过视觉对位和机械臂抓放，用
+     * MISSION_CHASSIS_HOLD_MS 原地等待占位，然后继续下一段路径。
+     */
+    if (robot_mission_stage < 7U)
+    {
+        mission_enter_chassis_hold(now_ms);
+        return;
+    }
+#endif
+
     if (s_mission_advance_after_alignment)
     {
         s_mission_advance_after_alignment = 0U;
@@ -621,6 +664,23 @@ static void mission_continue_after_alignment(uint32_t now_ms)
     mission_begin_vision_align(now_ms);
 }
 
+/*
+ * 粗加工区（N2）/暂存区（N4）到站后的任务航向改用 EMM 位置模式：
+ * 角度差一次换算成轮脉冲，由驱动器闭环到位，不再逐帧下发速度环 PD。
+ * 其它任务点（扫码 N6、原料 N8）继续用速度环 PD。
+ */
+#define MISSION_ALIGN_POS_MAX_FAIL          3U
+
+static uint8_t mission_align_uses_position_mode(uint8_t node)
+{
+#if MISSION_ALIGN_POS_ENABLE
+    return (node == MISSION_ROUGH_NODE || node == MISSION_STORAGE_NODE) ? 1U : 0U;
+#else
+    (void)node;
+    return 0U;
+#endif
+}
+
 static void mission_begin_alignment(uint32_t now_ms)
 {
     Hwt101 *imu = AppUart_GetImu();
@@ -629,16 +689,9 @@ static void mission_begin_alignment(uint32_t now_ms)
     float world_gyro_dps;
     float wz_cmd;
 
-#if MISSION_CHASSIS_ONLY
-    /* Stages 0..6 are work-area stops. Stage 7 enters the return parking bay
-     * directly from MISSION_NAVIGATING and never reaches this function. */
-    if (robot_mission_stage < 7U)
-    {
-        mission_align_restore_acceleration();
-        mission_enter_chassis_hold(now_ms);
-        return;
-    }
-#endif
+    /* SETTLE 里的重试不算“重新开始”，别把连续失败计数清掉。 */
+    if (robot_mission_state != MISSION_ALIGN_SETTLE)
+        s_mission_align_pos_fail_count = 0U;
 
     if (!mission_node_valid(robot_mission_target))
     {
@@ -673,6 +726,35 @@ static void mission_begin_alignment(uint32_t now_ms)
 
     if (chassis_motion_busy(&s_chassis))
         return;
+
+    s_mission_align_position_mode =
+        mission_align_uses_position_mode(robot_mission_target);
+
+    if (s_mission_align_position_mode)
+    {
+        /*
+         * 位置模式：把整段角度差一次下发（0xFD 相对位置 + 0x3A 到位）。
+         * 世界航向顺时针为正、底盘 theta 逆时针为正，所以这里取反。
+         * 停稳后仍走 SETTLE 的 IMU 验角，残余误差超限就再下发一次。
+         */
+        mission_align_save_acceleration();
+        s_chassis.acceleration = MISSION_ALIGN_POS_ACC;
+        s_mission_align_start_sign = mission_signf(error_world_deg);
+        s_mission_align_velocity_active = 1U;
+        robot_mission_align_wz_radps = 0.0f;
+        if (robot_mission_align_attempt < 255U)
+            robot_mission_align_attempt++;
+        if (robot_mission_pose_lock_active)
+            robot_mission_pose_lock_yaw_changed = 1U;
+
+        chassis_motion_rotate_deg(&s_chassis, -error_world_deg,
+                                  MISSION_ALIGN_POS_SPEED_MPS, now_ms);
+
+        robot_mission_state = MISSION_ALIGNING;
+        HMI_Race_SetAction("ALIGN");
+        HMI_Race_SetResult("RUNNING");
+        return;
+    }
 
     /*
      * 与行驶边末纠偏共用 heading_control：世界角顺时针为正，底盘 wz
@@ -749,8 +831,10 @@ static uint8_t mission_plan_current_stage(void)
      * 任务点带固定 task_yaw 时，到达后 mission 会立即做任务航向 PD。
      * 告知 EdgeMotion 不要先在边末单独纠到当前边航向，直接提交节点，
      * 由任务航向一次转到目标角度。返回节点(N3/N9)没有任务航向，保持原
-     * 边末纠偏，确保入库平移方向准确；仅底盘测试(CHASSIS_ONLY)也不会
-     * 执行任务航向，必须继续纠偏。
+     * 边末纠偏，确保入库平移方向准确。
+     *
+     * 只跑底盘模式(MISSION_CHASSIS_ONLY=1)同样由 mission 做任务航向对准，
+     * 所以这里的到达前预对齐保持关闭，避免到站后转两次。
      */
     EdgeMotion_SetArrivalAlign(&s_edge,
         ((MISSION_CHASSIS_ONLY == 0U) &&
@@ -806,8 +890,10 @@ static void mission_preposition_next_stage(void)
 
     /*
      * 只有粗加工区/暂存区在识别前降低电机5；原料区要贴着物料做多轮
-     * 旋转微调，必须保持最高点。数值与到站流程使用的宏一致，保证
-     * slide_jog_start_target() 能识别出“这次下降已经由预置完成”。
+     * 旋转微调，必须保持最高点。暂存区第二轮叠放的识别高度与原料区
+     * 一致（最高点），只有第一轮才做低位取像。
+     * 数值与到站流程使用的宏一致，保证 slide_jog_start_target() 能
+     * 识别出“这次下降已经由预置完成”。
      */
     if (zone == ZONE_ROUGH)
     {
@@ -815,7 +901,9 @@ static void mission_preposition_next_stage(void)
     }
     else if (zone == ZONE_STORAGE)
     {
-        pre_drop_mm = STORAGE_VISION_PRE_DROP_MM;
+        pre_drop_mm = (batch == 1U) ?
+                      STORAGE_STACK_VISION_PRE_DROP_MM :
+                      STORAGE_VISION_PRE_DROP_MM;
     }
 
     (void)ManipulatorAction_PrepositionForNextZoneWithDrop(slot, pre_drop_mm);
@@ -975,6 +1063,35 @@ static void mission_update(uint32_t now_ms)
         float error_world_deg;
         int8_t error_sign;
 
+        /*
+         * 位置模式由 EMM 按脉冲闭环到位，IMU 只负责停稳后的复验，
+         * 所以这里先看驱动器状态；偶发一次超时/堵转不锁死任务，
+         * 停车重验后按残余角度差再下发一次，连续失败才报错。
+         */
+        if (s_mission_align_position_mode)
+        {
+            if (chassis_motion_failed(&s_chassis))
+            {
+                if (s_mission_align_pos_fail_count < 255U)
+                    s_mission_align_pos_fail_count++;
+
+                if (s_mission_align_pos_fail_count >= MISSION_ALIGN_POS_MAX_FAIL)
+                {
+                    mission_fail(MISSION_ERROR_ALIGN);
+                    return;
+                }
+
+                mission_enter_align_settle();
+                return;
+            }
+
+            if (chassis_motion_busy(&s_chassis))
+                return;
+
+            mission_enter_align_settle();
+            return;
+        }
+
         /* IMU 暂时断帧只停车等待；不再把任务锁死到 ERROR。 */
         if (!hwt101_is_fresh(imu, now_ms, MISSION_ALIGN_IMU_TIMEOUT_MS) ||
             !hwt101_world_zero_ready(imu))
@@ -1105,8 +1222,9 @@ static void mission_update(uint32_t now_ms)
         if (!RawStationTask_IsDone())
             return;
 
-        /* 停靠往返可能带来少量航向漂移：回到 N8 后重新跑现有 PD，
-         * 对准成功才允许规划下一条边。 */
+        /* 离开原料区前重新跑现有航向 PD 作为安全检查（车体虽未停靠
+         * 平移，机械臂动作仍可能带来少量扰动），对准成功才允许规划
+         * 下一条边。 */
         HMI_Race_SetResult("OK");
         s_mission_advance_after_alignment = 1U;
         robot_mission_align_attempt = 0U;
@@ -1443,12 +1561,6 @@ uint8_t RobotApp_GotoNode(uint8_t target_node)
 
     HMI_Navigation_UpdateDebugDisplay(&s_nav);
     return 1U;
-}
-
-uint8_t RobotApp_GotoReturnNode(void)
-{
-    uint8_t n = HMI_Navigation_GetReturnNode(&s_nav);
-    return n ? RobotApp_GotoNode(n) : 0U;
 }
 
 void RobotApp_EStop(void)

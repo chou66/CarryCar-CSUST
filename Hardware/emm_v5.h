@@ -45,7 +45,6 @@ void Emm_V5_Origin_Trigger_Return(uint8_t addr, uint8_t o_mode, bool snF); // ??
 void Emm_V5_Origin_Interrupt(uint8_t addr); // ????§Ø?????????
 
 uint8_t Emm_V5_Read_Status(uint8_t id, uint8_t *status, uint32_t timeout_ms);
-uint8_t Emm_V5_Is_Reached(uint8_t id);
 
 #endif
 
