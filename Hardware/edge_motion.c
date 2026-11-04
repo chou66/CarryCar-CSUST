@@ -82,6 +82,7 @@ static int8_t edge_signf(float x)
  *
  * 另外 ROUTE_CENTER_INPLACE_TURN：本次导航的规划路径经过中央路口 N5
  * 时关闭圆滑拐角，改走原地直角转弯（N4->N8 走廊除外）。
+ * ROUTE_RETURN_INPLACE_TURN：返回启停区的整段导航不看路线，一律原地直角转弯。
  *========================================================================*/
 typedef struct
 {
@@ -189,6 +190,29 @@ static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
 
         if (!keep_smooth &&
             edge_path_contains_node(path, (uint8_t)ROUTE_CENTER_NODE))
+        {
+            tuning->arc_enable = 0U;
+        }
+    }
+#endif
+
+#if ROUTE_RETURN_INPLACE_TURN
+    /*
+     * 返回段（-> 启停区 N3/N9）：路线由规划器自动选择，可能经 N7->N8->N9，
+     * 也可能经中央路口 N5，这里不关心走哪条，一律关闭圆滑拐角，全部走
+     * “到节点停车 + 原地直角转弯”。按目标节点判定，因为返回段是每次从
+     * 当前确认节点重新规划的，起点不一定还是暂存区 N4。
+     */
+    if (em && em->hmi_nav)
+    {
+        const PathResult_t *path;
+        uint8_t target;
+
+        path = Navigation_GetPath(&em->hmi_nav->nav);
+        target = Navigation_GetTargetNode(&em->hmi_nav->nav);
+
+        if (path && path->valid && path->length > 0U &&
+            MISSION_IS_RETURN_NODE(target))
         {
             tuning->arc_enable = 0U;
         }
