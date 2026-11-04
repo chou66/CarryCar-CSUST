@@ -50,4 +50,11 @@ void TraySelectorServo_GotoSlot(uint8_t slot);
 
 void Pwm1Servo_SetUs(uint16_t us);
 
+/*QrServo —— 板载PWM3 / TIM3_CH4（扫码模块转向，SG90）*/
+void QrServo_SetUs(uint16_t us);
+void QrServo_SetAngle(float angle_deg);
+void QrServo_ScanStart(uint32_t now_ms);  /* 从下边界开始往返扫描 */
+void QrServo_ScanStop(void);              /* 停止扫描并回 QR_SERVO_CENTER_DEG */
+void QrServo_Update(uint32_t now_ms);     /* 扫描节拍，主循环周期调用 */
+
 #endif

@@ -9,11 +9,8 @@
 #define MOTOR_GIMBAL_ID             5U  /* 云台升降轴 */
 #define MOTOR_SLIDE_ID              6U  /* 滑台前伸轴 */
 
-/* ---------- 路网几何 ---------- */
-#define ROUTE_GRID_STEP_M           0.850f  /* 相邻导航节点中心间距（m），实测值 */
-
-/*
- * 导航直线速度（m/s）。轮径 77 mm、1:1 直连：v = rpm × 2π × 0.0385 / 60，
+/* ---------- 导航直线速度 ----------
+ * 轮径 77 mm、1:1 直连：v = rpm × 2π × 0.0385 / 60，
  * 即 1 rpm ≈ 0.00403 m/s，所以 0.70 m/s ≈ 174 rpm、1.00 m/s ≈ 248 rpm。
  */
 #define ROUTE_EDGE_SPEED_MPS        0.70f
@@ -24,42 +21,25 @@
 #define ROUTE_REVERSE_MIN_TURN_SAVING_DEG         5.00f  /* 倒车至少少转该角度才采用（deg） */
 #define ROUTE_TURN_SETTLE_MS            50U  /* 原地转到位后的稳停时间（ms） */
 #define ROUTE_TURN_MAX_ATTEMPTS        100U  /* 单次转向最多重试次数 */
-#define ROUTE_TURN_SPEED_MPS           0.40f  /* 转向时线速度（m/s） */
+#define ROUTE_TURN_SPEED_MPS           0.50f  /* 转向时线速度（m/s） */
 /* 原地转向走 EMM 位置模式，本值是驱动器 acc 档位：
  *   acc=0   直接按设定转速启动（无斜坡）；
  *   acc!=0  每 (256-acc)*50 us 增/减 1 RPM，130 约 6.3 ms/RPM。
  * 位置模式不再有软件正弦剖面，所以必须给非 0 值，否则 90° 原地转起步/停车很硬。 */
-#define ROUTE_TURN_ACC                  130U  /* 转向加速度档位（Emm 语义） */
+#define ROUTE_TURN_ACC                  170U  /* 转向加速度档位（Emm 语义） */
 
 /* ---------- 拐弯方式：圆滑拐角（直线 → 圆弧 → 直线） ----------
- * 置 1 时，路径上需要拐弯的中间节点不再停车原地转，而是提前 R 米开始
- * 走圆弧：本段直线末尾保持满速，按半径 ROUTE_CORNER_ARC_RADIUS_M 走一段
- * 圆弧转过拐角，再以满速接着走下一条边的直线，像汽车过弯一样连续。
- *
- * 圆弧的切线方向就是拓扑边方向，车体中心始终贴着圆角切线走；航向由底盘
- * 航向 PD 在弧线中跟随切线。ROUTE_ALLOW_REVERSE=1 时拐角最大 90°。
- *
- * 不能圆滑通过的情况仍回退到“停车 + 原地转向”：
- *   - 转角超过 ROUTE_CORNER_ARC_MAX_DEG（例如关闭倒车后的 180° 掉头）；
- *   - 当前边是倒车边，或圆弧前后的直线不足以容纳半径；
- *   - 拐角节点就是本次导航的目标节点（必须在节点停车执行任务）。
- *
- * 半径越小转得越急（角速度 = 车速 / 半径）：0.35 m、0.7 m/s 约 115°/s。 */
+ * 需要拐弯的中间节点不停车，按半径 R 走圆弧，进出弯都保持满速。
+ * 以下情况回退“停车 + 原地转向”：转角超过 MAX_DEG、前后直线不足以
+ * 容纳半径、拐角节点就是本次导航的目标节点。 */
 #define ROUTE_CORNER_ARC_ENABLE         1U
-#define ROUTE_CORNER_ARC_RADIUS_M   0.35f
+#define ROUTE_CORNER_ARC_RADIUS_M   0.4f  /* 越小转得越急：0.35 m、0.7 m/s 约 115°/s */
 #define ROUTE_CORNER_ARC_MAX_DEG    95.0f
 #define ROUTE_CORNER_ARC_MIN_MARGIN_M 0.10f  /* 圆弧前后直线至少要比半径多出的余量 */
 
 /* ---------- 区段专用转弯参数：N2（粗加工）-> N4（暂存） ----------
- * 该区段固定走 N2->N1->N4，两段都是倒车（车头保持 +X 不变），到 N1 时
- * 一边倒车一边走圆弧。倒车入弯的曲率、最大转角、倒车阈值与普通前进
- * 拐角差别较大，这里单独给一组参数，改这里不会影响其他区段。
- *
- * 识别规则（运行期自动判断，无需调用方传参）：
- *   本次导航路径的起点是 MISSION_ROUGH_NODE，且目标节点是
- *   MISSION_STORAGE_NODE。封路回退到 N2->N5->N4 时同样生效。
- * 置 0 关闭覆盖，全部回退到上面的全局 ROUTE_* 参数。
- * ------------------------------------------------------------------ */
+ * 该区段两段都倒车，转弯参数单独一组；导航起点 N2、目标 N4 时生效，
+ * 封路走 N2->N5->N4 同样生效。置 ROUTE_SEG_TURN_N2_N4_ENABLE=0 回退全局值。 */
 #define ROUTE_SEG_TURN_N2_N4_ENABLE                 1U
 #define ROUTE_SEG_N2_N4_CORNER_ARC_ENABLE           1U  /* 1=该区段仍走圆滑拐角 */
 #define ROUTE_SEG_N2_N4_ALLOW_REVERSE               1U  /* 1=允许倒车走该区段（N2->N4 必须为 1） */
@@ -75,72 +55,35 @@
 #define ROUTE_CENTER_TIE_BREAK       1U  /* 1=距离相同时优先走中央节点 */
 
 /* ---------- 路径偏好：固定区段绕行节点 ----------
- * 这些起终点对各有两条等长路线（6-5-8 与 6-9-8、2-5-4 与 2-1-4、
- * 4-5-8 与 4-7-8），单纯比距离和转弯数分不出来，按现场动线强制走
- * 指定绕行节点。
- * 规划器先尝试 起点->绕行节点->终点：任何一段被障碍切断（节点或边封路）
- * 就自动回退到普通最短路，所以 HMI 封路后不会卡死在偏好的路线上。
- * 置 0 表示该区段不设偏好。节点号含义见 MISSION_*_NODE。
- * 返回段（暂存区 N4 -> 启停区 N3/N9）的偏好见下面单独一节。 */
+ * 这些起终点对的两条路线等长，按现场动线强制经过指定节点；
+ * 任一段被封路切断就回退最短路。置 0 表示不设偏好。 */
 #define ROUTE_VIA_QR_TO_RAW_NODE          9U  /* 扫码区 N6->原料区 N8：优先 N6->N9->N8 */
 #define ROUTE_VIA_ROUGH_TO_STORAGE_NODE   1U  /* 粗加工 N2->暂存区 N4：优先 N2->N1->N4 */
 #define ROUTE_VIA_STORAGE_TO_RAW_NODE     7U  /* 暂存区 N4->原料区 N8：优先 N4->N7->N8 */
 
-/* 返回段（暂存区 N4 -> 启停区 N3/N9）：优先走左侧车道 N4->N7->N8->N9。
- * 这条路线与经中央路口的 4-5-6-9 等长，但在 N7 用圆弧一次过弯，
- * 不需要在中央路口 N5 停车转向（转弯方式见下面的 ROUTE_RETURN_INPLACE_TURN）。
- * 绕行节点必须取 N7 而不是 N8：4->8 有 4-7-8 与 4-5-8 两条等长路线，
- * 规划器的中央路口 tie-break 会选中 4-5-8，拼出来变成 4-5-8-9。
- * 取 N7 时 4->7 直达，7->9 的最短路就是 7-8-9，拼出 4-7-8-9。
- * 返回节点是 N3 时该路线多绕一整圈，必然超过 ROUTE_VIA_MAX_EXTRA_MM
- * 门限而回退最短路，因此这里不需要按返回节点分别配置。
- * 置 0 表示返回段不设偏好。 */
+/* 返回段 N4->N3/N9：优先 N4->N7->N8->N9，与 4-5-6-9 等长但 N7 圆弧过弯。
+ * 绕行节点必须取 N7：4->8 有两条等长路线，取 8 会被 tie-break 成 4-5-8-9。
+ * 返回 N3 时多绕一圈，由 ROUTE_VIA_MAX_EXTRA_MM 门限自动回退最短路。 */
 #define ROUTE_VIA_STORAGE_TO_RETURN_NODE  7U  /* 返回段 N4->N3/N9：优先经 N7->N8 */
 
 /* 偏好绕行路线最多允许比普通最短路长多少（mm）。
- * 各条偏好路线与最短路等长，正常情况差值恒为 0；一旦封路迫使绕行，
- * 绕行代价会多出一整条边（≥850），必然超过此门限而回退到普通最短路。 */
+ * 正常差值为 0；封路绕行会多出一整条边（≥850），必然超过门限而回退。 */
 #define ROUTE_VIA_MAX_EXTRA_MM          100U
 
 /* ---------- 经过中央路口时改走原地直角转弯 ----------
- * 任意一段导航只要封路后绕到中央路口 N5，就说明这一段必须在十字路口
- * 换向：中央路口附近余量紧，拉圆弧容易切到场地边界，而且封路本身说明
- * 现场动线和标定时不同，所以这一段所有拐角都关闭圆滑拐角，恢复
- * “到节点停车 + 原地直角转弯”。
- * 判定方式：本次导航的规划路径里包含中央节点 ROUTE_CENTER_NODE。
- * 不含 N5 的拐角仍按 ROUTE_CORNER_ARC_* 走圆弧（返回段见下面的
- * ROUTE_RETURN_INPLACE_TURN）。
- *
- * 注意：路径含 N5 不等于在 N5 拐弯。N2(1.20,0.35)、N5(1.20,1.20)、
- * N8(1.20,2.20) 三点共线，N8->N2 的 8-5-2 会被直线合并成一次不停车的
- * 平移，N5 处根本没有拐角；到 N2 后再由任务航向对准原地转 90°
- * （N2 的 task_yaw = 90 deg）。这条区段不受本策略影响。
- *
- * 例外：N4->N8 走廊（原料往返）不受本策略影响，始终保留圆滑拐弯 ——
- * 偏好路线 N4->N7->N8 走 N7 圆弧，封路退化到 N4->N5->N8 时同样走圆弧。
- *
- * 置 0 关闭该策略，所有区段一律按 ROUTE_CORNER_ARC_* 执行。 */
+ * 规划路径包含 N5 时整段关闭圆弧（N4->N8 走廊除外），避免在余量紧的
+ * 路口拉圆弧。注意 8-5-2 三点共线，含 N5 不等于在 N5 拐弯。
+ * 置 0 关闭该策略。 */
 #define ROUTE_CENTER_INPLACE_TURN           1U
 
 /* ---------- 返回段：只有偏好路线保留圆滑拐弯 ----------
- * 返回启停区（暂存区 N4 -> 启停区 N3/N9）优先走 ROUTE_VIA_STORAGE_TO_RETURN_NODE
- * 指定的 N4->N7->N8 路线，这一条继续按 ROUTE_CORNER_ARC_* 走圆弧，
- * 由 N7 一次平滑过弯。
- * 其它情况一律关闭圆滑拐角，恢复“到节点停车 + 原地直角转弯”：
- * 规划器因封路或余量门限回退到普通最短路（如 4-5-6-9）时，说明现场
- * 动线与标定不同，不在返回段拉圆弧；返回节点是 N3 时本来就会回退。
- * 判定方式：本次导航的目标节点是启停区返回节点（N3/N9），且规划路径
- * 包含绕行节点 ROUTE_VIA_STORAGE_TO_RETURN_NODE。返回段每次都从当前
- * 确认节点重新规划，所以按目标节点判定，不依赖起点一定是暂存区 N4。
- * 置 0 关闭该策略，返回段一律按 ROUTE_CORNER_ARC_* / ROUTE_CENTER_INPLACE_TURN 执行。 */
+ * 目标为 N3/N9 时，路径包含绕行节点 N7 才保留圆弧，其余一律原地直角
+ * 转弯（按目标节点判定，不依赖起点是 N4）。置 0 关闭该策略。 */
 #define ROUTE_RETURN_INPLACE_TURN           1U
 
 /* ---------- 扫码区 <-> 原料区往返：不走圆滑拐角 ----------
- * 扫码区 N6 与原料区 N8 之间的往返（6->9->8 与 8->9->6）在 N9 的 90°
- * 拐角改为“到节点停车 + 原地直角转弯”，这一段不使用圆弧。
- * 判定方式：本次导航的起点/终点正好是 MISSION_QR_NODE 与 MISSION_RAW_NODE
- * （任一方向），整段所有拐角关闭圆滑拐角。
- * 置 0 关闭该策略，该往返恢复 ROUTE_CORNER_ARC_* 圆弧。 */
+ * 起终点为 N6/N8（任一方向）时整段关闭圆弧，N9 拐角改原地直角转弯。
+ * 置 0 关闭该策略。 */
 #define ROUTE_QR_RAW_INPLACE_TURN           1U
 
 /* ---------- 路径偏好：直线优先 ---------- */
@@ -157,7 +100,7 @@
 /* ---------- 舵机通道映射 ----------
  * PWM1: PB4 / TIM3_CH1 = 料盘选择
  * PWM2: PE3 / TIM3_CH2 = 云台旋转
- * PWM3: PB7 / TIM3_CH4 = 预留
+ * PWM3: PB7 / TIM3_CH4 = 扫码模块转向
  * PWM4: PE4 / TIM3_CH3 = 夹爪开合
  */
 
@@ -172,6 +115,20 @@
 #define GRIPPER_TRAVEL_DEG          270.0f  /* 夹爪开合舵机行程（deg） */
 #define CAROUSEL_TRAVEL_DEG         360.0f  /* 云台旋转舵机行程（deg） */
 #define TRAY_SELECTOR_TRAVEL_DEG    360.0f  /* 料盘选择舵机行程（deg） */
+
+/* ---------- 扫码模块转向舵机 PWM3 / TIM3_CH4 ----------
+ * SG90 行程 180°：1500 us 对应 QR_SERVO_CENTER_DEG。上电保持 90°；
+ * 到 N6 后 QR_SCAN_WAIT_CODE_MS 内没收到任务码，就从 MIN 开始按 STEP
+ * 一档一档向 MAX 摆动，到顶后反向，每档停 QR_SERVO_HOLD_MS；
+ * 收到任务码立刻回 90°，继续后续任务。
+ */
+#define QR_SERVO_TRAVEL_DEG        180.0f  /* SG90 满行程（deg） */
+#define QR_SERVO_CENTER_DEG         90.0f  /* 上电/扫描结束的停留角（deg） */
+#define QR_SERVO_MIN_DEG            30.0f  /* 扫描下边界（deg） */
+#define QR_SERVO_MAX_DEG           150.0f  /* 扫描上边界（deg） */
+#define QR_SERVO_STEP_DEG           30.0f  /* 每档角度（deg） */
+#define QR_SERVO_HOLD_MS          1000U    /* 每档停留时间（ms） */
+#define QR_SCAN_WAIT_CODE_MS      1000U    /* 到 N6 后先等码的时间（ms） */
 
 /* ---------- 夹爪开合舵机 PWM4 ---------- */
 #define GRIPPER_OPEN_SMALL_DEG      147.0f  /* 小开口*/
@@ -396,7 +353,7 @@
  * 不必改本文件。
  */
 #ifndef MISSION_CHASSIS_ONLY
-#define MISSION_CHASSIS_ONLY                 1U  /* 0=全流程，1=只跑底盘（机械臂任务延时2s占位） */
+#define MISSION_CHASSIS_ONLY                 0U  /* 0=全流程，1=只跑底盘（机械臂任务延时2s占位） */
 #endif
 /* 只跑底盘模式：每个作业点替代机械臂任务的占位延时。 */
 #define MISSION_CHASSIS_HOLD_MS           2000U
@@ -408,7 +365,10 @@
  * 分别对应右下角 N3 和右上角 N9，两者都有 MapGraph_GetParkingPose() 的车位。 */
 #define MISSION_IS_RETURN_NODE(node) \
     (((node) == 3U) || ((node) == 9U))
-#define MISSION_START_DELAY_MS            1500U  /* 启动后等待时间（ms） */
+#define MISSION_START_DELAY_MS             500U  /* 按键确认后到起步的等待时间（ms） */
+/* PC6 发车按键：内部上拉，按下接地。串口屏下发任务后原地等待，
+ * 按键消抖后的下降沿才会进入 MISSION_START_DELAY 起步。 */
+#define START_BUTTON_DEBOUNCE_MS            30U  /* 按键消抖时间（ms） */
 #define MISSION_TASK_HOLD_MS              2000U  /* 任务码保持/显示时间（ms） */
 
 /* 任务点航向对准参数。世界 yaw 顺时针为正，底盘旋转逆时针为正。 */
@@ -435,7 +395,7 @@
  * 其它任务点（扫码 N6、原料 N8）继续走上面的航向 PD。 */
 #define MISSION_ALIGN_POS_ENABLE                1U  /* 0=所有任务点都回退到 PD */
 #define MISSION_ALIGN_POS_SPEED_MPS          0.50f  /* 位置模式转速对应的轮线速度（m/s） */
-#define MISSION_ALIGN_POS_ACC                 180U  /* EMM 位置模式 acc 档位 */
+#define MISSION_ALIGN_POS_ACC                 200U  /* EMM 位置模式 acc 档位 */
 
 /* ---------- 原料区识别预伸 ----------
  * N8 不再做车体停靠平移：原先 40 mm 的车体靠近量并入滑台伸出量，

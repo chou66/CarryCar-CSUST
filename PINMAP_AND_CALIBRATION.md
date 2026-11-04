@@ -11,7 +11,8 @@
 | 料盘选择舵机 | TIM3_CH1 | PB4 |
 | 云台旋转舵机 | TIM3_CH2 | PE3 |
 | 夹爪开合舵机 | TIM3_CH3 | PE4 |
-| 预留舵机通道 | TIM3_CH4 | PB7 |
+| 扫码模块转向舵机（SG90） | TIM3_CH4 | PB7 |
+| 发车确认按键 | GPIO 输入（内部上拉，按下接地） | PC6 |
 | 蜂鸣器 | GPIO | PE0 |
 | SWD | SYS | PA13 / PA14 |
 
@@ -29,7 +30,6 @@ SN65HVD230 R(pin4) -> CAN_RX -> PB12/FDCAN2_RX
 - `CAROUSEL_REVERSE`
 - `GIMBAL_PULSES_PER_DEG`
 - `SLIDE_PULSES_PER_MM`
-- `ROUTE_GRID_STEP_M`
 - `ROUTE_EDGE_SPEED_MPS`
 
 `Hardware/chassis_config.h`

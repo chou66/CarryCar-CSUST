@@ -72,7 +72,9 @@ typedef enum
     /* 原料区内部流程由 raw_station_task 封装。 */
     MISSION_RAW_STATION,
     /* N6等待并解析真实二维码；追加在末尾以保持既有状态值不变。 */
-    MISSION_QR_SCAN
+    MISSION_QR_SCAN,
+    /* 串口屏任务已下发，原地等 PC6 按键确认后发车；追加在末尾。 */
+    MISSION_WAIT_KEY
 } MissionState_t;
 
 volatile uint8_t robot_mission_state = MISSION_WAIT_MAP;
@@ -105,6 +107,16 @@ static uint8_t s_mission_align_position_mode = 0U;
 static uint8_t s_mission_align_pos_fail_count = 0U;
 static MissionTaskCode_t s_mission_task_code;
 static uint8_t s_hmi_last_color = 0xFFU;
+
+/* 扫码舵机：到 N6 后先等 QR_SCAN_WAIT_CODE_MS，仍没码才启动往返摆动。 */
+static uint32_t s_qr_scan_enter_ms = 0U;
+static uint8_t s_qr_scan_servo_started = 0U;
+
+/* PC6 发车按键的消抖状态。s_start_key_pressed_event 是待取走的按下沿。 */
+static uint8_t s_start_key_raw = 0U;
+static uint8_t s_start_key_stable = 0U;
+static uint32_t s_start_key_change_ms = 0U;
+static uint8_t s_start_key_pressed_event = 0U;
 
 /* 二维码解析镜像：Keil Watch 可直接检查两批颜色/粗加工位/暂存位。 */
 volatile uint8_t robot_task_code_valid = 0U;
@@ -325,6 +337,83 @@ static const char *mission_stage_text(uint8_t stage)
 }
 
 /*
+ * PC6 发车按键
+ * -------------
+ * 硬件：PC6 内部上拉，另一端接 GND，按下读到低电平。
+ * 串口屏下发任务后进入 MISSION_WAIT_KEY，进入后出现消抖按下（下降沿，
+ * 或进入时已经按住）才放行；进入之前残留的按下沿会被清掉。
+ */
+static void start_key_init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    gpio.Pin = GPIO_PIN_6;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &gpio);
+
+    s_start_key_raw = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_6) == GPIO_PIN_RESET) ? 1U : 0U;
+    s_start_key_stable = s_start_key_raw;
+    s_start_key_change_ms = HAL_GetTick();
+    s_start_key_pressed_event = 0U;
+}
+
+static void start_key_update(uint32_t now_ms)
+{
+    uint8_t raw = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_6) == GPIO_PIN_RESET) ? 1U : 0U;
+
+    if (raw != s_start_key_raw)
+    {
+        /* 抖动中：重新计时，等电平稳定 START_BUTTON_DEBOUNCE_MS 再确认。 */
+        s_start_key_raw = raw;
+        s_start_key_change_ms = now_ms;
+        return;
+    }
+
+    if (raw == s_start_key_stable)
+        return;
+
+    if ((int32_t)(now_ms - s_start_key_change_ms) < (int32_t)START_BUTTON_DEBOUNCE_MS)
+        return;
+
+    s_start_key_stable = raw;
+
+    if (raw != 0U)
+        s_start_key_pressed_event = 1U;
+}
+
+/* 取走一次按下沿；没有新按下时返回 0。 */
+static uint8_t start_key_take_pressed(void)
+{
+    if (s_start_key_pressed_event == 0U)
+        return 0U;
+
+    s_start_key_pressed_event = 0U;
+    return 1U;
+}
+
+/* 丢弃进入等待前残留的按下沿（例如上电调试时误触）。 */
+static void start_key_clear_event(void)
+{
+    s_start_key_pressed_event = 0U;
+}
+
+/*
+ * 发车确认：消抖后的下降沿，或进入等待时按键已经被按住，都算确认。
+ * 后者兼顾“屏幕下发的同时就按住按键”的现场操作。
+ */
+static uint8_t start_key_confirm(void)
+{
+    uint8_t pressed = start_key_take_pressed();
+
+    if ((pressed == 0U) && (s_start_key_stable != 0U))
+        pressed = 1U;
+
+    return pressed;
+}
+
+/*
  * 段执行失败：记录错误码、锁死任务并停车。
  *
  * 注意 Navigation 的 current_node 只会被 EdgeReached() 推进，失败时车通常
@@ -415,8 +504,6 @@ static void mission_enter_task_hold(uint32_t now_ms)
     ZoneId_t zone;
     uint8_t batch;
 
-    (void)now_ms;
-
     chassis_motion_stop(&s_chassis);
 
     if (!mission_zone_for_stage(robot_mission_stage, &zone, &batch))
@@ -425,6 +512,8 @@ static void mission_enter_task_hold(uint32_t now_ms)
         if (robot_mission_stage == 0U)
         {
             robot_mission_state = MISSION_QR_SCAN;
+            s_qr_scan_enter_ms = now_ms;
+            s_qr_scan_servo_started = 0U;
             HMI_Race_SetAction("SCAN QR");
             HMI_Race_SetResult("WAIT CODE");
             return;
@@ -984,6 +1073,13 @@ static void mission_update(uint32_t now_ms)
     Hwt101 *imu = AppUart_GetImu();
     float park_x, park_y;
 
+    /* 每帧先更新按键消抖，任何状态下都保持按下沿可被取到。 */
+    start_key_update(now_ms);
+
+    /* 离开扫码等待状态（含出错/完成）时兜底回中，避免舵机停在偏角。 */
+    if (robot_mission_state != MISSION_QR_SCAN)
+        QrServo_ScanStop();
+
     if (hwt101_world_zero_ready(imu))
     {
         robot_world_zero_ready = 1U;
@@ -1042,15 +1138,37 @@ static void mission_update(uint32_t now_ms)
         robot_mission_target = 0U;
         robot_mission_error = 0U;
         robot_mission_align_attempt = 0U;
-        s_mission_deadline_ms = now_ms + MISSION_START_DELAY_MS;
-        robot_mission_state = MISSION_START_DELAY;
+        /*
+         * 串口屏任务已收到：不立即发车，原地停在 MISSION_WAIT_KEY，
+         * 等 PC6 按键确认。
+         */
+        s_mission_deadline_ms = 0U;
+        start_key_clear_event();
+        robot_mission_state = MISSION_WAIT_KEY;
 
         HMI_Race_SetTaskCode("--");
         HMI_Debug_SetTaskCode("--");
         HMI_Race_SetColor("--");
         HMI_Race_SetStage("MISSION");
         HMI_Race_SetAction("READY");
-        HMI_Race_SetResult("WAIT");
+        HMI_Race_SetResult("PRESS KEY");
+        return;
+    }
+
+    if (robot_mission_state == MISSION_WAIT_KEY)
+    {
+        /*
+         * 原地等待 PC6 按键。进入本状态之前的误触已在 WAIT_MAP 末尾清掉；
+         * 按下后走原来的起步延时。
+         */
+        if (!start_key_confirm())
+            return;
+
+        s_mission_deadline_ms = now_ms + MISSION_START_DELAY_MS;
+        robot_mission_state = MISSION_START_DELAY;
+
+        HMI_Race_SetAction("START");
+        HMI_Race_SetResult("GO");
         return;
     }
 
@@ -1380,6 +1498,18 @@ static void mission_update(uint32_t now_ms)
         char qr_text[QR_CODE_MAX + 1U];
         MissionTaskCode_t parsed;
 
+        /*
+         * 停车后先给扫码模块 QR_SCAN_WAIT_CODE_MS 的静默等待；仍没有任务码
+         * 就驱动 PWM3 舵机在 30°..150° 之间摆动找码。摆动期间任务码照常
+         * 接收，收到合法码立即停止摆动并回 90°。
+         */
+        if (!s_qr_scan_servo_started &&
+            ((int32_t)(now_ms - s_qr_scan_enter_ms) >= (int32_t)QR_SCAN_WAIT_CODE_MS))
+        {
+            s_qr_scan_servo_started = 1U;
+            QrServo_ScanStart(now_ms);
+        }
+
         if (!QRScanner_GetNewCode(qr_text, sizeof(qr_text)))
             return;
 
@@ -1409,6 +1539,9 @@ static void mission_update(uint32_t now_ms)
             mission_fail(MISSION_ERROR_TASK);
             return;
         }
+
+        /* 任务码到手：扫码结束，舵机立即回 90° 再推进任务。 */
+        QrServo_ScanStop();
 
         s_mission_task_code = parsed;
         mission_sync_task_debug(&s_mission_task_code);
@@ -1465,6 +1598,8 @@ void RobotApp_Init(void)
     K230Align_Init(&s_chassis);
 
 #if MISSION_ENABLE
+    start_key_init();
+
     robot_mission_state = MISSION_WAIT_MAP;
     robot_mission_stage = 0U;
     robot_mission_target = 0U;
@@ -1521,6 +1656,7 @@ void RobotApp_Update(uint32_t now_ms)
     /* Smooth-servo services must keep running even during VOFA takeover. */
     CarouselServo_Update(now_ms);
     GripperServo_Update(now_ms);
+    QrServo_Update(now_ms);
 
     events = HMI_Navigation_Process(&s_nav);
 

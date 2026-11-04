@@ -94,12 +94,21 @@ static uint32_t gripper_last_step_ms = 0U;
 static uint32_t gripper_settle_start_ms = 0U;
 static GripperServoState_t gripper_state =GRIPPER_STATE_IDLE;
 
+/* 扫码模块转向舵机（PWM3 / TIM3_CH4）的扫描状态。
+ * 直接写比较寄存器，不做脉宽平滑：SG90 自带减速，每档停 1 s 足够稳定。 */
+static uint8_t  qr_servo_scan_active = 0U;
+static uint8_t  qr_servo_scan_dir = 1U;     /* 1=向 MAX，0=向 MIN */
+static float    qr_servo_angle_deg = QR_SERVO_CENTER_DEG;
+static uint32_t qr_servo_hold_until_ms = 0U;
+
 void Servo_Init(void)
 {
     uint16_t carousel_poweron_us =
         Servo_AngleToUs(CAROUSEL_POWERON_DEG, CAROUSEL_TRAVEL_DEG);
     uint16_t tray_poweron_us =
         Servo_AngleToUs(TRAY_SELECTOR_POWERON_DEG, TRAY_SELECTOR_TRAVEL_DEG);
+    uint16_t qr_center_us =
+        Servo_AngleToUs(QR_SERVO_CENTER_DEG, QR_SERVO_TRAVEL_DEG);
 
     /* 料盘上电直接输出 TRAY_SELECTOR_POWERON_DEG（TraySelectorServo 无软件
      * 状态跟踪，SetUs 直接写寄存器，无需同步其他变量）。 */
@@ -108,8 +117,8 @@ void Servo_Init(void)
      * 否则第一次 SetAngle 会从 1500 us 突跳到 carousel_current_us。 */
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, carousel_poweron_us);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, SERVO_CENTER_US);
-    /* CH4 已不承载料盘，固定输出中点。 */
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, SERVO_CENTER_US);
+    /* CH4 扫码模块转向舵机：上电默认 90°（1500 us），扫描结束后也回这里。 */
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, qr_center_us);
 	
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
@@ -129,12 +138,89 @@ void Servo_Init(void)
 		gripper_settle_start_ms = 0U;
 		gripper_state = GRIPPER_STATE_IDLE;
 
+		qr_servo_scan_active = 0U;
+		qr_servo_scan_dir = 1U;
+		qr_servo_angle_deg = QR_SERVO_CENTER_DEG;
+		qr_servo_hold_until_ms = 0U;
+
 }
 
 /*TraySelectorServo_SetUs() → TIM3_CH1 → 板载PWM1  （料盘选择）
 CarouselServo_SetUs()     → TIM3_CH2 → 板载PWM2  （云台旋转）
 GripperServo_SetUs()      → TIM3_CH3 → 板载PWM4  （夹爪开合）
-TIM3_CH4 / 板载PWM3       → 预留，固定输出中点 1500 us*/
+QrServo_SetUs()           → TIM3_CH4 → 板载PWM3  （扫码模块转向）*/
+
+/*扫码模块转向舵机：SG90，上电与扫描结束后停在 QR_SERVO_CENTER_DEG。*/
+void QrServo_SetUs(uint16_t us)
+{
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, clamp_us(us));
+}
+
+void QrServo_SetAngle(float angle_deg)
+{
+    qr_servo_angle_deg = angle_deg;
+    QrServo_SetUs(Servo_AngleToUs(angle_deg, QR_SERVO_TRAVEL_DEG));
+}
+
+/* 从扫描下边界开始；先在这里停 QR_SERVO_HOLD_MS 再向 MAX 走第一档。 */
+void QrServo_ScanStart(uint32_t now_ms)
+{
+    qr_servo_scan_active = 1U;
+    qr_servo_scan_dir = 1U;
+    QrServo_SetAngle(QR_SERVO_MIN_DEG);
+    qr_servo_hold_until_ms = now_ms + QR_SERVO_HOLD_MS;
+}
+
+/* 幂等：未在扫描时不重复写脉宽，避免收到任务码后每次都重新抖动一次。 */
+void QrServo_ScanStop(void)
+{
+    if (qr_servo_scan_active == 0U)
+    {
+        return;
+    }
+
+    qr_servo_scan_active = 0U;
+    QrServo_SetAngle(QR_SERVO_CENTER_DEG);
+}
+
+/* 每档停满 QR_SERVO_HOLD_MS 后走下一档；到达 MIN/MAX 后反向。 */
+void QrServo_Update(uint32_t now_ms)
+{
+    float next_deg;
+
+    if (qr_servo_scan_active == 0U)
+    {
+        return;
+    }
+
+    if ((int32_t)(now_ms - qr_servo_hold_until_ms) < 0)
+    {
+        return;
+    }
+
+    if (qr_servo_scan_dir != 0U)
+    {
+        next_deg = qr_servo_angle_deg + QR_SERVO_STEP_DEG;
+    }
+    else
+    {
+        next_deg = qr_servo_angle_deg - QR_SERVO_STEP_DEG;
+    }
+
+    if (next_deg >= QR_SERVO_MAX_DEG)
+    {
+        next_deg = QR_SERVO_MAX_DEG;
+        qr_servo_scan_dir = 0U;
+    }
+    else if (next_deg <= QR_SERVO_MIN_DEG)
+    {
+        next_deg = QR_SERVO_MIN_DEG;
+        qr_servo_scan_dir = 1U;
+    }
+
+    QrServo_SetAngle(next_deg);
+    qr_servo_hold_until_ms = now_ms + QR_SERVO_HOLD_MS;
+}
 
 /* PWM1 与料盘共用 TIM3_CH1，本函数等价于 TraySelectorServo_SetUs()，
  * 保留给 VOFA 0x22 命令里 p1=0 的老用法。 */
