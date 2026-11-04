@@ -22,7 +22,7 @@
 #define ROUTE_TURN_TOLERANCE_DEG                 0.80f  /* 航向到位容差（deg） */
 #define ROUTE_ALLOW_REVERSE                         1U  /* 1=允许倒车走边，减少无谓掉头 */
 #define ROUTE_REVERSE_MIN_TURN_SAVING_DEG         5.00f  /* 倒车至少少转该角度才采用（deg） */
-#define ROUTE_TURN_SETTLE_MS           100U  /* 原地转到位后的稳停时间（ms） */
+#define ROUTE_TURN_SETTLE_MS            50U  /* 原地转到位后的稳停时间（ms） */
 #define ROUTE_TURN_MAX_ATTEMPTS        100U  /* 单次转向最多重试次数 */
 #define ROUTE_TURN_SPEED_MPS           0.40f  /* 转向时线速度（m/s） */
 /* 原地转向走 EMM 位置模式，本值是驱动器 acc 档位：
@@ -46,7 +46,7 @@
  *
  * 半径越小转得越急（角速度 = 车速 / 半径）：0.35 m、0.7 m/s 约 115°/s。 */
 #define ROUTE_CORNER_ARC_ENABLE         1U
-#define ROUTE_CORNER_ARC_RADIUS_M   0.40f
+#define ROUTE_CORNER_ARC_RADIUS_M   0.35f
 #define ROUTE_CORNER_ARC_MAX_DEG    95.0f
 #define ROUTE_CORNER_ARC_MIN_MARGIN_M 0.10f  /* 圆弧前后直线至少要比半径多出的余量 */
 
@@ -81,10 +81,21 @@
  * 规划器先尝试 起点->绕行节点->终点：任何一段被障碍切断（节点或边封路）
  * 就自动回退到普通最短路，所以 HMI 封路后不会卡死在偏好的路线上。
  * 置 0 表示该区段不设偏好。节点号含义见 MISSION_*_NODE。
- * 返回段（暂存区 N4 -> 启停区 N3/N9）不设偏好，完全按最短路算法选路。 */
+ * 返回段（暂存区 N4 -> 启停区 N3/N9）的偏好见下面单独一节。 */
 #define ROUTE_VIA_QR_TO_RAW_NODE          9U  /* 扫码区 N6->原料区 N8：优先 N6->N9->N8 */
 #define ROUTE_VIA_ROUGH_TO_STORAGE_NODE   1U  /* 粗加工 N2->暂存区 N4：优先 N2->N1->N4 */
 #define ROUTE_VIA_STORAGE_TO_RAW_NODE     7U  /* 暂存区 N4->原料区 N8：优先 N4->N7->N8 */
+
+/* 返回段（暂存区 N4 -> 启停区 N3/N9）：优先走左侧车道 N4->N7->N8->N9。
+ * 这条路线与经中央路口的 4-5-6-9 等长，但在 N7 用圆弧一次过弯，
+ * 不需要在中央路口 N5 停车转向（转弯方式见下面的 ROUTE_RETURN_INPLACE_TURN）。
+ * 绕行节点必须取 N7 而不是 N8：4->8 有 4-7-8 与 4-5-8 两条等长路线，
+ * 规划器的中央路口 tie-break 会选中 4-5-8，拼出来变成 4-5-8-9。
+ * 取 N7 时 4->7 直达，7->9 的最短路就是 7-8-9，拼出 4-7-8-9。
+ * 返回节点是 N3 时该路线多绕一整圈，必然超过 ROUTE_VIA_MAX_EXTRA_MM
+ * 门限而回退最短路，因此这里不需要按返回节点分别配置。
+ * 置 0 表示返回段不设偏好。 */
+#define ROUTE_VIA_STORAGE_TO_RETURN_NODE  7U  /* 返回段 N4->N3/N9：优先经 N7->N8 */
 
 /* 偏好绕行路线最多允许比普通最短路长多少（mm）。
  * 各条偏好路线与最短路等长，正常情况差值恒为 0；一旦封路迫使绕行，
@@ -111,16 +122,26 @@
  * 置 0 关闭该策略，所有区段一律按 ROUTE_CORNER_ARC_* 执行。 */
 #define ROUTE_CENTER_INPLACE_TURN           1U
 
-/* ---------- 返回段：一律原地直角转弯，不走圆弧 ----------
- * 返回启停区（暂存区 N4 -> 启停区 N3/N9）不设绕行偏好，路线完全由
- * Dijkstra 按距离 + 转弯代价自动选择，封路、现场动线变化都不需要额外配置。
- * 但这一段所有拐角一律关闭圆滑拐角，恢复“到节点停车 + 原地直角转弯”：
- * 返回时车上已无搬运任务，不需要为了节省时间牺牲转弯余量，原地转
- * 也不会切到场地边界。
- * 判定方式：本次导航的目标节点是启停区返回节点（N3/N9）。返回段每次都从
- * 当前确认节点重新规划，所以按目标节点判定，不依赖起点一定是暂存区 N4。
- * 置 0 关闭该策略，返回段退回 ROUTE_CORNER_ARC_* / ROUTE_CENTER_INPLACE_TURN。 */
+/* ---------- 返回段：只有偏好路线保留圆滑拐弯 ----------
+ * 返回启停区（暂存区 N4 -> 启停区 N3/N9）优先走 ROUTE_VIA_STORAGE_TO_RETURN_NODE
+ * 指定的 N4->N7->N8 路线，这一条继续按 ROUTE_CORNER_ARC_* 走圆弧，
+ * 由 N7 一次平滑过弯。
+ * 其它情况一律关闭圆滑拐角，恢复“到节点停车 + 原地直角转弯”：
+ * 规划器因封路或余量门限回退到普通最短路（如 4-5-6-9）时，说明现场
+ * 动线与标定不同，不在返回段拉圆弧；返回节点是 N3 时本来就会回退。
+ * 判定方式：本次导航的目标节点是启停区返回节点（N3/N9），且规划路径
+ * 包含绕行节点 ROUTE_VIA_STORAGE_TO_RETURN_NODE。返回段每次都从当前
+ * 确认节点重新规划，所以按目标节点判定，不依赖起点一定是暂存区 N4。
+ * 置 0 关闭该策略，返回段一律按 ROUTE_CORNER_ARC_* / ROUTE_CENTER_INPLACE_TURN 执行。 */
 #define ROUTE_RETURN_INPLACE_TURN           1U
+
+/* ---------- 扫码区 <-> 原料区往返：不走圆滑拐角 ----------
+ * 扫码区 N6 与原料区 N8 之间的往返（6->9->8 与 8->9->6）在 N9 的 90°
+ * 拐角改为“到节点停车 + 原地直角转弯”，这一段不使用圆弧。
+ * 判定方式：本次导航的起点/终点正好是 MISSION_QR_NODE 与 MISSION_RAW_NODE
+ * （任一方向），整段所有拐角关闭圆滑拐角。
+ * 置 0 关闭该策略，该往返恢复 ROUTE_CORNER_ARC_* 圆弧。 */
+#define ROUTE_QR_RAW_INPLACE_TURN           1U
 
 /* ---------- 路径偏好：直线优先 ---------- */
 /* 规划层把一次拐弯折算为额外路程，参与 Dijkstra 比较。值越大路线越直、越少拐弯。 */

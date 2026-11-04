@@ -388,8 +388,11 @@ static PathResult_t pp_dijkstra_core(uint8_t start_node,
 //   N2(粗加工) -> N4(暂存) 优先 N2->N1->N4（左侧车道先西行）
 //   N4(暂存) -> N8(原料)   优先 N4->N7->N8（左侧车道先北上，
 //                          在 N7 用圆弧拐角通过，不在拐角节点停车）
-// 返回段（N4 -> N3/N9 启停区）不设偏好，由 Dijkstra 按距离 + 转弯代价
-// 自动选路；转弯方式由 edge_motion.c 的 ROUTE_RETURN_INPLACE_TURN 处理。
+//   N4(暂存) -> N3/N9(启停) 优先 N4->N7->N8->N9：返回段沿用左侧车道，
+//                          与经中央路口的 4-5-6-9 等长，但 N7 圆弧一次过弯；
+//                          该路线被封路切断或余量超限时回退最短路（一般经
+//                          中央路口），转弯方式由 edge_motion.c 的
+//                          ROUTE_RETURN_INPLACE_TURN 按路线区分。
 // 具体节点号由 robot_config.h 的 ROUTE_VIA_* 配置，0 表示不设偏好。
 //====================================================
 static uint8_t pp_preferred_via(uint8_t start_node, uint8_t target_node)
@@ -415,6 +418,21 @@ static uint8_t pp_preferred_via(uint8_t start_node, uint8_t target_node)
        (target_node == MISSION_RAW_NODE))
     {
         return (uint8_t)ROUTE_VIA_STORAGE_TO_RAW_NODE;
+    }
+#endif
+
+#if (ROUTE_VIA_STORAGE_TO_RETURN_NODE != 0)
+    /*
+     * 返回启停区：N4->N3/N9 优先走 N7->N8 这条左侧车道。
+     * 返回节点是 N9 时与经中央路口的 4-5-6-9 等长；是 N3 时这条路线
+     * 会多绕一整圈，由下面的 ROUTE_VIA_MAX_EXTRA_MM 门限自动回退最短路。
+     * 起点只在暂存区 N4 时套用：返回段从其它节点重新规划时，绕经 N8
+     * 属于折返，交给最短路处理。
+     */
+    if((start_node == MISSION_STORAGE_NODE) &&
+       MISSION_IS_RETURN_NODE(target_node))
+    {
+        return (uint8_t)ROUTE_VIA_STORAGE_TO_RETURN_NODE;
     }
 #endif
 

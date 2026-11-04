@@ -23,7 +23,7 @@
 #define EDGE_MOTION_YAW_CORRECT_MAX_RPM         80U
 #define EDGE_MOTION_YAW_CORRECT_MIN_RPM          2U
 #define EDGE_MOTION_YAW_CORRECT_ACC             10U
-#define EDGE_MOTION_YAW_SETTLE_MS              150U
+#define EDGE_MOTION_YAW_SETTLE_MS               50U
 #define EDGE_MOTION_IMU_TIMEOUT_MS             300U
 
 /*
@@ -82,7 +82,9 @@ static int8_t edge_signf(float x)
  *
  * 另外 ROUTE_CENTER_INPLACE_TURN：本次导航的规划路径经过中央路口 N5
  * 时关闭圆滑拐角，改走原地直角转弯（N4->N8 走廊除外）。
- * ROUTE_RETURN_INPLACE_TURN：返回启停区的整段导航不看路线，一律原地直角转弯。
+ * ROUTE_RETURN_INPLACE_TURN：返回启停区时只有经偏好节点的路线（4-7-8-9）
+ * 保留圆弧，其余路线改走原地直角转弯。
+ * ROUTE_QR_RAW_INPLACE_TURN：扫码区 N6 <-> 原料区 N8 往返整段不用圆弧。
  *========================================================================*/
 typedef struct
 {
@@ -96,8 +98,9 @@ typedef struct
     float arc_min_margin_m;
 } EdgeTurnTuning_t;
 
-/* 本次导航路径里是否经过某个拓扑节点（返回段用来判定是否经中央路口）。 */
-#if ROUTE_CENTER_INPLACE_TURN
+/* 本次导航路径里是否经过某个拓扑节点（中央路口 / 返回段绕行节点判定）。 */
+#if (ROUTE_CENTER_INPLACE_TURN) || \
+    ((ROUTE_RETURN_INPLACE_TURN) && (ROUTE_VIA_STORAGE_TO_RETURN_NODE != 0))
 static uint8_t edge_path_contains_node(const PathResult_t *path, uint8_t node)
 {
     uint8_t i;
@@ -198,10 +201,12 @@ static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
 
 #if ROUTE_RETURN_INPLACE_TURN
     /*
-     * 返回段（-> 启停区 N3/N9）：路线由规划器自动选择，可能经 N7->N8->N9，
-     * 也可能经中央路口 N5，这里不关心走哪条，一律关闭圆滑拐角，全部走
-     * “到节点停车 + 原地直角转弯”。按目标节点判定，因为返回段是每次从
-     * 当前确认节点重新规划的，起点不一定还是暂存区 N4。
+     * 返回段（-> 启停区 N3/N9）：只有经绕行节点的偏好路线
+     * （N4->N7->N8->N9）保留圆滑拐角，由 N7 一次圆弧过弯。
+     * 规划器回退到其它路线（如经中央路口的 4-5-6-9）时，一律改走
+     * “到节点停车 + 原地直角转弯”。按目标节点 + 路径是否包含绕行节点
+     * 判定，因为返回段是每次从当前确认节点重新规划的，起点不一定还是
+     * 暂存区 N4。
      */
     if (em && em->hmi_nav)
     {
@@ -214,7 +219,42 @@ static void edge_turn_tuning(const EdgeMotion_t *em, EdgeTurnTuning_t *tuning)
         if (path && path->valid && path->length > 0U &&
             MISSION_IS_RETURN_NODE(target))
         {
-            tuning->arc_enable = 0U;
+#if (ROUTE_VIA_STORAGE_TO_RETURN_NODE != 0)
+            if (!edge_path_contains_node(
+                    path, (uint8_t)ROUTE_VIA_STORAGE_TO_RETURN_NODE))
+#endif
+            {
+                tuning->arc_enable = 0U;
+            }
+        }
+    }
+#endif
+
+#if ROUTE_QR_RAW_INPLACE_TURN
+    /*
+     * 扫码区 N6 <-> 原料区 N8 往返（6->9->8 与 8->9->6）：
+     * 整段关闭圆滑拐角，N9 的 90° 拐角走“到节点停车 + 原地直角转弯”。
+     */
+    if (em && em->hmi_nav)
+    {
+        const PathResult_t *path;
+        uint8_t target;
+        uint8_t start;
+
+        path = Navigation_GetPath(&em->hmi_nav->nav);
+        target = Navigation_GetTargetNode(&em->hmi_nav->nav);
+
+        if (path && path->valid && path->length > 0U)
+        {
+            start = path->node[0];
+
+            if (((start == (uint8_t)MISSION_QR_NODE) &&
+                 (target == (uint8_t)MISSION_RAW_NODE)) ||
+                ((start == (uint8_t)MISSION_RAW_NODE) &&
+                 (target == (uint8_t)MISSION_QR_NODE)))
+            {
+                tuning->arc_enable = 0U;
+            }
         }
     }
 #endif
