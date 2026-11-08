@@ -1,10 +1,21 @@
 #include "hmi_display.h"
 #include "hmi_protocol.h"
+#include "task_code.h"
 #include "usart.h"
 #include <string.h>
 
 #define HMI_TX_TIMEOUT_MS 50U
 #define HMI_FAST_UPDATE_MS 200U
+
+/*
+ * 串口屏上的任务码分两行显示：在 CCC+PPP+CCC+PPP 的第8个字符（下标7，
+ * 即两批之间的 '+'）之后插入换行分隔符，也就是 CCC+PPP+<break>CCC+PPP，
+ * 原来的 '+' 保留不删。
+ *
+ * 默认发 TJC/Nextion 的文本转义 "\r"（反斜杠+r 两个字节，控件的 isbr
+ * 属性打开后才会换行）。若屏端要求直接收裸回车 0x0D，把本宏改成 "\r"。
+ */
+#define HMI_TASK_CODE_LINE_BREAK "\\r"
 
 static uint32_t s_last_fast_update;
 
@@ -82,6 +93,43 @@ static void send_float1(const char *object, float value)
     HMI_SendCommand(cmd);
 }
 
+/*
+ * 任务码在串口屏上按两行排版：只对结构完整（15字符、第8字符是'+'）的
+ * 任务码在第8个字符之后插入换行分隔符（'+' 本身保留）；"--"等其它文本
+ * 原样发送，不影响复位/提示显示。
+ */
+static void send_task_code(const char *object, const char *code)
+{
+    char text[24];
+    uint16_t p = 0U;
+    uint16_t len;
+    uint8_t i;
+
+    if (!code)
+    {
+        send_text(object, "");
+        return;
+    }
+
+    len = (uint16_t)strlen(code);
+    if ((len != TASK_CODE_TEXT_LEN) || (code[7] != '+'))
+    {
+        send_text(object, code);
+        return;
+    }
+
+    memset(text, 0, sizeof(text));
+    /* 前8个字符连同两批之间的 '+' 一起原样保留。 */
+    for (i = 0U; i < 8U; ++i)
+    {
+        append_char(text, sizeof(text), &p, code[i]);
+    }
+    append_str(text, sizeof(text), &p, HMI_TASK_CODE_LINE_BREAK);
+    append_str(text, sizeof(text), &p, &code[8]);
+
+    send_text(object, text);
+}
+
 void HMI_SendCommand(const char *cmd)
 {
     static const uint8_t end[3] = {0xFFU, 0xFFU, 0xFFU};
@@ -107,13 +155,13 @@ void HMI_Page_ModeSelect(void) { HMI_SendCommand("page page3"); }
 void HMI_Page_Race(void)       { HMI_SendCommand("page page4"); }
 void HMI_Page_Debug(void)      { HMI_SendCommand("page page5"); }
 
-void HMI_Race_SetTaskCode(const char *code) { send_text("page4.tTaskCode", code); }
+void HMI_Race_SetTaskCode(const char *code) { send_task_code("page4.tTaskCode", code); }
 void HMI_Race_SetStage(const char *stage)   { send_text("page4.tStage", stage); }
 void HMI_Race_SetAction(const char *action) { send_text("page4.tAction", action); }
 void HMI_Race_SetColor(const char *color)   { send_text("page4.tColor", color); }
 void HMI_Race_SetResult(const char *result) { send_text("page4.tResult", result); }
 
-void HMI_Debug_SetTaskCode(const char *code) { send_text("page5.tDbgTask", code); }
+void HMI_Debug_SetTaskCode(const char *code) { send_task_code("page5.tDbgTask", code); }
 void HMI_Debug_SetTargetYaw(float yaw_deg)   { send_float1("page5.tTargetYaw", yaw_deg); }
 void HMI_Debug_SetCurrentYaw(float yaw_deg)  { send_float1("page5.tCurrentYaw", yaw_deg); }
 void HMI_Debug_SetCurrentNode(uint8_t node)  { send_u8("page5.tCurrentNode", node); }

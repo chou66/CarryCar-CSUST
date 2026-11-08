@@ -956,7 +956,7 @@ static uint32_t slide_retract_delay_ms(float gimbal_return_mm)
 
     hold_ms = gimbal_return_mm *
               MANIP_SLIDE_RETRACT_HOLD_RATIO *
-              MANIP_GIMBAL_MS_PER_MM;
+              MANIP_GIMBAL_UP_MS_PER_MM;
 
     if (hold_ms < 1.0f)
     {
@@ -1072,7 +1072,7 @@ static void update_to_tray(uint32_t now_ms)
             {
                 if (!Manipulator_Gimbal_MoveMm(
                         active_pickup_gimbal_mm,
-                        MANIP_GIMBAL_RPM,
+                        MANIP_GIMBAL_RPM_FOR(active_pickup_gimbal_mm),
                         MANIP_GIMBAL_ACC))
                 {
                     record_pending_fail(MANIP_FAIL_SEND,
@@ -1125,7 +1125,7 @@ static void update_to_tray(uint32_t now_ms)
 
                 if (!Manipulator_Gimbal_MoveMm(
                         active_pickup_gimbal_mm,
-                        MANIP_GIMBAL_RPM,
+                        MANIP_GIMBAL_RPM_FOR(active_pickup_gimbal_mm),
                         MANIP_GIMBAL_ACC))
                 {
                     record_pending_fail(
@@ -1193,7 +1193,7 @@ static void update_to_tray(uint32_t now_ms)
 
             if (!Manipulator_Gimbal_MoveMm(
                     active_pickup_gimbal_return_mm,
-                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_RPM_FOR(active_pickup_gimbal_return_mm),
                     MANIP_GIMBAL_ACC))
             {
                 record_pending_fail(
@@ -1386,7 +1386,7 @@ static void update_to_tray(uint32_t now_ms)
 
             if (!Manipulator_Gimbal_MoveMm(
                     active_pickup_gimbal_mm,
-                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_RPM_FOR(active_pickup_gimbal_mm),
                     MANIP_GIMBAL_ACC))
             {
                 record_pending_fail(MANIP_FAIL_SEND,
@@ -1470,7 +1470,7 @@ static void update_to_tray(uint32_t now_ms)
 
             if (!Manipulator_Gimbal_MoveMm(
                     MANIP_PICKUP_TRAY_MM,
-                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_RPM_FOR(MANIP_PICKUP_TRAY_MM),
                     MANIP_GIMBAL_ACC))
             {
                 record_pending_fail(MANIP_FAIL_SEND,
@@ -1530,7 +1530,7 @@ static void update_to_tray(uint32_t now_ms)
 
             if (!Manipulator_Gimbal_MoveMm(
                     (-MANIP_PICKUP_TRAY_MM),
-                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_RPM_FOR((-MANIP_PICKUP_TRAY_MM)),
                     MANIP_GIMBAL_ACC))
             {
                 record_pending_fail(MANIP_FAIL_SEND,
@@ -1608,7 +1608,7 @@ static void update_from_tray(uint32_t now_ms)
 
             if (!Manipulator_Gimbal_MoveMm(
                     MANIP_PICKUP_TRAY_MM,
-                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_RPM_FOR(MANIP_PICKUP_TRAY_MM),
                     MANIP_GIMBAL_ACC))
             {
                 record_pending_fail(
@@ -1673,7 +1673,7 @@ static void update_from_tray(uint32_t now_ms)
 
             if (!Manipulator_Gimbal_MoveMm(
                     (-MANIP_PICKUP_TRAY_MM),
-                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_RPM_FOR((-MANIP_PICKUP_TRAY_MM)),
                     MANIP_GIMBAL_ACC))
             {
                 record_pending_fail(
@@ -1777,7 +1777,7 @@ static void update_from_tray(uint32_t now_ms)
             {
                 if (!Manipulator_Gimbal_MoveMm(
                         active_place_gimbal_mm,
-                        MANIP_GIMBAL_RPM,
+                        MANIP_GIMBAL_RPM_FOR(active_place_gimbal_mm),
                         MANIP_GIMBAL_ACC))
                 {
                     record_pending_fail(
@@ -1831,7 +1831,7 @@ static void update_from_tray(uint32_t now_ms)
 
                 if (!Manipulator_Gimbal_MoveMm(
                         active_place_gimbal_mm,
-                        MANIP_GIMBAL_RPM,
+                        MANIP_GIMBAL_RPM_FOR(active_place_gimbal_mm),
                         MANIP_GIMBAL_ACC))
                 {
                     record_pending_fail(
@@ -1899,7 +1899,7 @@ static void update_from_tray(uint32_t now_ms)
 
             if (!Manipulator_Gimbal_MoveMm(
                     active_place_gimbal_return_mm,
-                    MANIP_GIMBAL_RPM,
+                    MANIP_GIMBAL_RPM_FOR(active_place_gimbal_return_mm),
                     MANIP_GIMBAL_ACC))
             {
                 record_pending_fail(
@@ -2106,7 +2106,7 @@ static bool slide_jog_start_vision_drop(uint32_t now_ms)
 
     if (!Manipulator_Gimbal_MoveMm(
             jog_vision_drop_target_mm,
-            MANIP_GIMBAL_RPM,
+            MANIP_GIMBAL_RPM_FOR(jog_vision_drop_target_mm),
             MANIP_GIMBAL_ACC))
     {
         /* 指令没发出去，电机5没有移动，位置假设仍然成立。 */
@@ -2174,7 +2174,7 @@ static bool slide_jog_start_vision_raise(bool then_home)
 
     if (!Manipulator_Gimbal_MoveMm(
             -jog_vision_drop_mm,
-            MANIP_GIMBAL_RPM,
+            MANIP_GIMBAL_RPM_FOR(-jog_vision_drop_mm),
             MANIP_GIMBAL_ACC))
     {
         manip_debug_jog_fail_reason = MANIP_FAIL_SEND;
@@ -2242,7 +2242,7 @@ static bool slide_jog_start_vision_raise_and_home(void)
 
     if (((mask & MOTOR_GIMBAL_MASK) != 0U) &&
         !Manipulator_Gimbal_MoveMm(-jog_vision_drop_mm,
-                                   MANIP_GIMBAL_RPM,
+                                   MANIP_GIMBAL_RPM_FOR(-jog_vision_drop_mm),
                                    MANIP_GIMBAL_ACC))
     {
         manip_debug_jog_fail_reason = MANIP_FAIL_SEND;
@@ -2326,7 +2326,7 @@ static bool slide_jog_start_vision_height(float target_drop_mm)
     last_status_query_ms = now_ms;
 
     if (!Manipulator_Gimbal_MoveMm(delta_mm,
-                                   MANIP_GIMBAL_RPM,
+                                   MANIP_GIMBAL_RPM_FOR(delta_mm),
                                    MANIP_GIMBAL_ACC))
     {
         /* 指令未发出，保留原来已经确认的电机5高度。 */

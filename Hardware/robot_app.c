@@ -101,7 +101,7 @@ static uint8_t s_mission_align_saved_acceleration = 0U;
 static uint8_t s_mission_align_acceleration_saved = 0U;
 static uint32_t s_mission_align_last_sample_ms = 0U;
 static uint8_t s_mission_align_last_sample_valid = 0U;
-/* 1=本次任务航向对准走 EMM 位置模式（粗加工区/暂存区）。 */
+/* 1=本次任务航向对准走 EMM 位置模式（所有任务点）。 */
 static uint8_t s_mission_align_position_mode = 0U;
 /* 位置模式连续失败次数：达到上限才把任务锁死，避免偶发一次超时直接弃赛。 */
 static uint8_t s_mission_align_pos_fail_count = 0U;
@@ -147,7 +147,7 @@ volatile uint8_t robot_mission_vision_iteration = 0U;
 #define MISSION_DEG_TO_RAD_F     0.01745329251994329577f
 #define MISSION_TWO_PI_F         6.28318530717958647692f
 
-/* 原料区退回 N8 后，复用任务航向 PD；对准后应推进 stage 而非再次进任务。 */
+/* 原料区退回 N8 后，复用任务航向对准流程；对准后应推进 stage 而非再次进任务。 */
 static uint8_t s_mission_advance_after_alignment = 0U;
 
 /*
@@ -157,7 +157,7 @@ static uint8_t s_mission_advance_after_alignment = 0U;
  * 校正航向时，相机又会绕车体中心走一小段圆弧，使刚对准的圆心再次偏掉。
  * 因此正式任务不能只执行一次“航向 -> K230”，必须循环执行：
  *
- *   K230 对圆心 -> IMU 复核航向 -> 若 PD 真的转过车，再 K230 对圆心
+ *   K230 对圆心 -> IMU 复核航向 -> 若航向对准真的转过车，再 K230 对圆心
  *
  * 直到最新一次 K230 完成后无需再转车，才能收回齿条并开始区域抓放。
  */
@@ -722,7 +722,7 @@ static void mission_begin_vision_align(uint32_t now_ms)
 }
 
 /*
- * 航向 PD 对准后的分流：
+ * 任务航向对准后的分流：
  *   1. 原料区撤离复核完成：直接进入下一 stage；
  *   2. 圆环联合锁定中：若刚才转过车则保持机械预置并再跑一次 K230，
  *      若完全没有转车则说明“最新圆心 + 当前航向”同时合格，收回齿条；
@@ -742,7 +742,7 @@ static void mission_continue_after_alignment(uint32_t now_ms)
         if (robot_mission_pose_lock_yaw_changed)
         {
             /*
-             * 航向 PD 已改变车体姿态，旧的圆心结果随相机绕车体中心转动而
+             * 航向对准已改变车体姿态，旧的圆心结果随相机绕车体中心转动而
              * 失效。保持云台205 deg和当前齿条预伸量，立即重新跑本区域视觉；
              * 第二轮暂存区仍是带颜色身份锚点的STACK-2，绝不降级为普通PLACE-2。
              * 不允许中间收齿条或开始机械抓放。
@@ -803,18 +803,20 @@ static void mission_continue_after_alignment(uint32_t now_ms)
 }
 
 /*
- * 粗加工区（N2）/暂存区（N4）到站后的任务航向改用 EMM 位置模式：
+ * 所有任务点到站后的任务航向统一走 EMM 位置模式：
  * 角度差一次换算成轮脉冲，由驱动器闭环到位，不再逐帧下发速度环 PD。
- * 其它任务点（扫码 N6、原料 N8）继续用速度环 PD。
+ * 停稳后仍用 IMU 复验，残余误差超限时按剩余角度再下发一次。
+ *
+ * MISSION_ALIGN_POS_ENABLE=0 时整体回退到速度环 PD（保留作对照/应急）。
  */
 #define MISSION_ALIGN_POS_MAX_FAIL          3U
 
 static uint8_t mission_align_uses_position_mode(uint8_t node)
 {
-#if MISSION_ALIGN_POS_ENABLE
-    return (node == MISSION_ROUGH_NODE || node == MISSION_STORAGE_NODE) ? 1U : 0U;
-#else
     (void)node;
+#if MISSION_ALIGN_POS_ENABLE
+    return 1U;
+#else
     return 0U;
 #endif
 }
@@ -966,7 +968,8 @@ static uint8_t mission_plan_current_stage(void)
     }
 
     /*
-     * 任务点带固定 task_yaw 时，到达后 mission 会立即做任务航向 PD。
+     * 任务点带固定 task_yaw 时，到达后 mission 会立即做任务航向对准
+     * （默认 EMM 位置模式，见 MISSION_ALIGN_POS_ENABLE）。
      * 告知 EdgeMotion 不要先在边末单独纠到当前边航向，直接提交节点，
      * 由任务航向一次转到目标角度。返回节点(N3/N9)没有任务航向，保持原
      * 边末纠偏，确保入库平移方向准确。
@@ -1389,7 +1392,7 @@ static void mission_update(uint32_t now_ms)
         if (!RawStationTask_IsDone())
             return;
 
-        /* 离开原料区前重新跑现有航向 PD 作为安全检查（车体虽未停靠
+        /* 离开原料区前重新跑任务航向对准作为安全检查（车体虽未停靠
          * 平移，机械臂动作仍可能带来少量扰动），对准成功才允许规划
          * 下一条边。 */
         HMI_Race_SetResult("OK");
@@ -1444,8 +1447,8 @@ static void mission_update(uint32_t now_ms)
         {
             /*
              * K230 只证明此刻圆心像素正确，并不能证明平移过程中航向没有
-             * 漂移。先保留云台/齿条的识别位姿，进入现有 STOP->稳定->PD
-             * 验角链；如果PD真的转过，mission_continue_after_alignment()
+             * 漂移。先保留云台/齿条的识别位姿，进入现有 STOP->稳定->航向
+             * 验角链；如果确实转过车，mission_continue_after_alignment()
              * 会自动再跑K230。两项同时合格以后才允许收齿条。
              */
             robot_mission_pose_lock_active = 1U;

@@ -13,27 +13,27 @@
  * 轮径 77 mm、1:1 直连：v = rpm × 2π × 0.0385 / 60，
  * 即 1 rpm ≈ 0.00403 m/s，所以 0.70 m/s ≈ 174 rpm、1.00 m/s ≈ 248 rpm。
  */
-#define ROUTE_EDGE_SPEED_MPS        0.70f
+#define ROUTE_EDGE_SPEED_MPS        0.77f
 
 /* 拓扑边行驶与航向控制。边只走纵向运动，前后方向由 edge_turn 按“少转”原则选择。 */
 #define ROUTE_TURN_TOLERANCE_DEG                 0.80f  /* 航向到位容差（deg） */
 #define ROUTE_ALLOW_REVERSE                         1U  /* 1=允许倒车走边，减少无谓掉头 */
 #define ROUTE_REVERSE_MIN_TURN_SAVING_DEG         5.00f  /* 倒车至少少转该角度才采用（deg） */
-#define ROUTE_TURN_SETTLE_MS            50U  /* 原地转到位后的稳停时间（ms） */
+#define ROUTE_TURN_SETTLE_MS             0U  /* 原地转到位后的稳停时间（ms） */
 #define ROUTE_TURN_MAX_ATTEMPTS        100U  /* 单次转向最多重试次数 */
 #define ROUTE_TURN_SPEED_MPS           0.50f  /* 转向时线速度（m/s） */
 /* 原地转向走 EMM 位置模式，本值是驱动器 acc 档位：
  *   acc=0   直接按设定转速启动（无斜坡）；
  *   acc!=0  每 (256-acc)*50 us 增/减 1 RPM，130 约 6.3 ms/RPM。
  * 位置模式不再有软件正弦剖面，所以必须给非 0 值，否则 90° 原地转起步/停车很硬。 */
-#define ROUTE_TURN_ACC                  170U  /* 转向加速度档位（Emm 语义） */
+#define ROUTE_TURN_ACC                  200U  /* 转向加速度档位（Emm 语义） */
 
 /* ---------- 拐弯方式：圆滑拐角（直线 → 圆弧 → 直线） ----------
  * 需要拐弯的中间节点不停车，按半径 R 走圆弧，进出弯都保持满速。
  * 以下情况回退“停车 + 原地转向”：转角超过 MAX_DEG、前后直线不足以
  * 容纳半径、拐角节点就是本次导航的目标节点。 */
-#define ROUTE_CORNER_ARC_ENABLE         1U
-#define ROUTE_CORNER_ARC_RADIUS_M   0.4f  /* 越小转得越急：0.35 m、0.7 m/s 约 115°/s */
+#define ROUTE_CORNER_ARC_ENABLE         0U
+#define ROUTE_CORNER_ARC_RADIUS_M   0.35f  /* 越小转得越急：0.35 m、0.7 m/s 约 115°/s */
 #define ROUTE_CORNER_ARC_MAX_DEG    95.0f
 #define ROUTE_CORNER_ARC_MIN_MARGIN_M 0.10f  /* 圆弧前后直线至少要比半径多出的余量 */
 
@@ -41,7 +41,7 @@
  * 该区段两段都倒车，转弯参数单独一组；导航起点 N2、目标 N4 时生效，
  * 封路走 N2->N5->N4 同样生效。置 ROUTE_SEG_TURN_N2_N4_ENABLE=0 回退全局值。 */
 #define ROUTE_SEG_TURN_N2_N4_ENABLE                 1U
-#define ROUTE_SEG_N2_N4_CORNER_ARC_ENABLE           1U  /* 1=该区段仍走圆滑拐角 */
+#define ROUTE_SEG_N2_N4_CORNER_ARC_ENABLE           0U  /* 1=该区段仍走圆滑拐角 */
 #define ROUTE_SEG_N2_N4_ALLOW_REVERSE               1U  /* 1=允许倒车走该区段（N2->N4 必须为 1） */
 #define ROUTE_SEG_N2_N4_TURN_TOLERANCE_DEG       0.80f  /* 航向到位容差（deg） */
 #define ROUTE_SEG_N2_N4_REVERSE_MIN_TURN_SAVING_DEG 5.00f /* 倒车至少少转该角度才采用（deg） */
@@ -165,11 +165,18 @@
 #define SLIDE_PULSES_PER_MM         20.0f  /* 电机6 脉冲/mm */
 
 /* 电机5（升降）与电机6（前伸）各自独立的转速与加速度，便于按轴单独标定。
- * rpm：电机输出轴转速；acc：Emm 加速度档位，0=不做加减速。 */
-#define MANIP_GIMBAL_RPM            2500U  /* 电机5 升降转速 */
+ * rpm：电机输出轴转速；acc：Emm 加速度档位，0=不做加减速。
+ * 电机5 的上升、下降分开标定：下降通常要比上升慢，减小落位冲击。 */
+#define MANIP_GIMBAL_UP_RPM          3000U  /* 电机5 上升转速 */
+#define MANIP_GIMBAL_DOWN_RPM        2500U  /* 电机5 下降转速 */
 #define MANIP_GIMBAL_ACC               0U  /* 电机5 加速度档位 */
 #define MANIP_SLIDE_RPM              120U  /* 电机6 前伸转速 */
 #define MANIP_SLIDE_ACC              230U  /* 电机6 加速度档位 */
+
+/* 按带符号位移选择电机5 转速：mm >= 0 为上升，mm < 0 为下降，
+ * 与 Manipulator_Gimbal_MoveMm() 内部的方向判定保持一致。 */
+#define MANIP_GIMBAL_RPM_FOR(mm) \
+    (((mm) >= 0.0f) ? MANIP_GIMBAL_UP_RPM : MANIP_GIMBAL_DOWN_RPM)
 
 /* 机械臂放置时序参数 */
 #define MANIP_PLACE_TRAY_WAIT_MS         800U  /* 放料前托盘等待时间（ms） */
@@ -203,10 +210,13 @@
  * 首次上机请低速确认一遍。原料区本来就没有视觉预下降，两种设置等价。 */
 #define MANIP_HOME_PARALLEL_ENABLE          1U
 
-/* 电机5 匀速上升耗时换算：rpm × 3200 脉冲/圈 ÷ 60 → 脉冲/秒，再折算每毫米。
- * 3000rpm、400 脉冲/mm 时为 2.5 ms/mm。加减速造成的偏差由比例宏留余量。 */
-#define MANIP_GIMBAL_MS_PER_MM \
-    (60000.0f * GIMBAL_PULSES_PER_MM / ((float)MANIP_GIMBAL_RPM * 3200.0f))
+/* 电机5 匀速段耗时换算：rpm × 3200 脉冲/圈 ÷ 60 → 脉冲/秒，再折算每毫米。
+ * 3000rpm、400 脉冲/mm 时为 2.5 ms/mm。加减速造成的偏差由比例宏留余量。
+ * 上升、下降转速不同，耗时也分开算。 */
+#define MANIP_GIMBAL_UP_MS_PER_MM \
+    (60000.0f * GIMBAL_PULSES_PER_MM / ((float)MANIP_GIMBAL_UP_RPM * 3200.0f))
+#define MANIP_GIMBAL_DOWN_MS_PER_MM \
+    (60000.0f * GIMBAL_PULSES_PER_MM / ((float)MANIP_GIMBAL_DOWN_RPM * 3200.0f))
 
 /* 去程“先伸出、再下降”的分步时序（与上面的延时回缩互为镜像）：
  * 电机6 先伸出，伸到该比例行程后电机5 才开始下降，避免齿条带着夹爪在
@@ -257,13 +267,13 @@
 #define ROUGH_VISION_HIGH_SLIDE_POS2_MM    90.0f  /* 旧高位识别的2号环滑台伸出量，仅历史对照 */
 #define ROUGH_VISION_LOW_SLIDE_POS2_MM     90.0f  /* 低位 K230 取像基准（2号环），用于底盘视觉纠偏 */
 
-#define ROUGH_CAROUSEL_POS1_DEG          295.0f  /* 1号环云台角（2193 us） */
-#define ROUGH_CAROUSEL_POS2_DEG         262.00f  /* 2号环云台角，K230 方向映射基准（2019 us） */
-#define ROUGH_CAROUSEL_POS3_DEG          228.0f  /* 3号环云台角（1841 us） */
+#define ROUGH_CAROUSEL_POS1_DEG          294.0f  /* 1号环云台角（2193 us） */
+#define ROUGH_CAROUSEL_POS2_DEG          261.3f  /* 2号环云台角，K230 方向映射基准（2019 us） */
+#define ROUGH_CAROUSEL_POS3_DEG          227.5f  /* 3号环云台角（1841 us） */
 
 #define ROUGH_SLIDE_POS1_MM              130.0f  /* 1号环夹爪落点伸出量（绝对） */
-#define ROUGH_SLIDE_POS2_MM               83.0f  /* 2号环夹爪落点伸出量（绝对） */
-#define ROUGH_SLIDE_POS3_MM              117.0f  /* 3号环夹爪落点伸出量（绝对） */
+#define ROUGH_SLIDE_POS2_MM               82.5f  /* 2号环夹爪落点伸出量（绝对） */
+#define ROUGH_SLIDE_POS3_MM              118.7f  /* 3号环夹爪落点伸出量（绝对） */
 
 /* VOFA 手工标定命令 0x86 的云台安全角度窗口，两端预留调整余量 */
 #define ROUGH_CAROUSEL_CAL_MIN_DEG       213.33f  /* 窗口下限（deg） */
@@ -276,13 +286,13 @@
 #define STORAGE_VISION_HIGH_SLIDE_POS2_MM  90.0f  /* 旧高位识别的2号环伸出量，仅历史对照 */
 #define STORAGE_VISION_LOW_SLIDE_POS2_MM   90.0f  /* 低位 K230 取像基准（2号环） */
 
-#define STORAGE_CAROUSEL_POS1_DEG        295.0f  /* 1号位云台角（2193 us） */
-#define STORAGE_CAROUSEL_POS2_DEG        262.0f  /* 2号位云台角（2019 us） */
-#define STORAGE_CAROUSEL_POS3_DEG        228.0f  /* 3号位云台角（1841 us） */
+#define STORAGE_CAROUSEL_POS1_DEG        294.0f  /* 1号位云台角（2193 us） */
+#define STORAGE_CAROUSEL_POS2_DEG        261.3f  /* 2号位云台角（2019 us） */
+#define STORAGE_CAROUSEL_POS3_DEG        227.5f  /* 3号位云台角（1841 us） */
 
 #define STORAGE_SLIDE_POS1_MM            130.0f  /* 1号位夹爪落点伸出量（绝对） */
-#define STORAGE_SLIDE_POS2_MM             83.0f  /* 2号位夹爪落点伸出量（绝对） */
-#define STORAGE_SLIDE_POS3_MM            120.0f  /* 3号位夹爪落点伸出量（绝对） */
+#define STORAGE_SLIDE_POS2_MM             82.5f  /* 2号位夹爪落点伸出量（绝对） */
+#define STORAGE_SLIDE_POS3_MM            118.7f  /* 3号位夹爪落点伸出量（绝对） */
 
 /* VOFA 暂存区手工角度命令的安全窗口 */
 #define STORAGE_CAROUSEL_CAL_MIN_DEG     213.33f  /* 窗口下限（deg） */
@@ -373,7 +383,7 @@
 
 /* 任务点航向对准参数。世界 yaw 顺时针为正，底盘旋转逆时针为正。 */
 #define MISSION_ALIGN_TOLERANCE_DEG         0.50f  /* 最终航向容差（deg） */
-#define MISSION_ALIGN_SETTLE_MS              100U  /* STOP 后稳定时间（ms） */
+#define MISSION_ALIGN_SETTLE_MS               50U  /* STOP 后稳定时间（ms） */
 #define MISSION_ALIGN_IMU_TIMEOUT_MS          300U  /* IMU 数据超时（ms） */
 #define MISSION_ALIGN_STABLE_SAMPLES            3U  /* STOP 后需连续合格的 IMU 帧数 */
 
@@ -385,15 +395,15 @@
 #define MISSION_ALIGN_KD                     0.35f  /* 微分增益 */
 #define MISSION_ALIGN_REFRESH_MS               40U  /* 控制刷新周期（ms） */
 
-/* ---------- 粗加工区/暂存区任务航向：位置模式 ----------
- * N2（粗加工）和 N4（暂存）到站后的任务航向不再用速度环 PD 逐帧逼近，
+/* ---------- 任务航向：位置模式 ----------
+ * 所有任务点到站后的任务航向都不再用速度环 PD 逐帧逼近，
  * 而是把当前角度差一次性换算成轮脉冲，交给 EMM 位置模式（0xFD）闭环到位。
  * 停稳后仍用同样的 IMU 验角流程：残余误差超过容差就按新角度差再下发一次。
  *
  * 位置模式下 acc 是驱动器档位（0=直接按设定转速启动），和速度环的
  * MISSION_ALIGN_ACC 语义不同，所以单独给值。
- * 其它任务点（扫码 N6、原料 N8）继续走上面的航向 PD。 */
-#define MISSION_ALIGN_POS_ENABLE                1U  /* 0=所有任务点都回退到 PD */
+ * 置 0 时全部任务点回退到上面的航向 PD（保留作对照/应急）。 */
+#define MISSION_ALIGN_POS_ENABLE                1U  /* 1=所有任务点走位置模式；0=全部回退 PD */
 #define MISSION_ALIGN_POS_SPEED_MPS          0.50f  /* 位置模式转速对应的轮线速度（m/s） */
 #define MISSION_ALIGN_POS_ACC                 200U  /* EMM 位置模式 acc 档位 */
 
@@ -407,7 +417,7 @@
 #define RAW_VISION_SLIDE_MIN_MM                 0.0f  /* 视觉调节下限（mm） */
 
 /* 滑台软件绝对位置上限：视觉追踪、VOFA 标定、绝对点动都必须遵守（软件保护，非机械限位） */
-#define MANIP_SLIDE_SOFT_MAX_MM                210.0f
+#define MANIP_SLIDE_SOFT_MAX_MM                160.0f
 
 #define RAW_VISION_SLIDE_MAX_MM                MANIP_SLIDE_SOFT_MAX_MM  /* 原料区视觉上限，与统一上限同值 */
 #define RAW_VISION_CAROUSEL_MIN_DEG   CAROUSEL_PICKUP_POS3_DEG  /* 原料视觉云台角下限 */
